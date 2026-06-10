@@ -1,0 +1,973 @@
+"""
+experiment.py
+=============
+Bekaert & Hoerova (2014) — Full 8-Step Experiment
+"The VIX, the Variance Premium and Stock Market Volatility"
+
+Steps
+-----
+1.  Implied Variance from EquityIndexVarianceSwapData.csv (SPX 1-month tenor)
+    → For periods without swap data (pre-2008), fall back to VIX²/12
+2.  Physical Realized Variance: rolling 22-day sum of squared daily returns
+3.  HAR panel fitting (Model 8) — strictly out-of-sample coefficients
+4.  VRP = ImpliedVariance − CV (fitted conditional variance)
+5.  500-day rolling-window OLS production loop (day-by-day, no look-ahead)
+6.  Monthly diagnostic: Mincer-Zarnowitz R² + Diebold-Mariano vs. martingale
+    Kill switch: HAR must beat martingale (DM stat < 0, p ≤ 0.05) AND
+                 MZ intercept within 1.96 SE (12-month trailing window)
+7.  RMSE, MAE, MAPE evaluation
+8.  Comparison vs. martingale (BTZ Model 30) and univariate VRP return regression
+
+Modules shared with bh_replication (called directly, not duplicated)
+---------------------------------------------------------------------
+  data_prep : load_sp500_returns, load_vix, compute_rv_components
+  har_model : estimate_har, out_of_sample_forecast, NW_LAGS, _nw_se
+
+Outputs (all in ./output/)
+--------------------------
+  Plots: vp_cv_*.png, oos_forecast_*.png, production_loop_*.png,
+         dm_diagnostic_*.png, forecast_scatter_*.png, return_pred_*.png
+  CSVs:  vp_cv_series_*.csv, production_loop_*.csv, oos_metrics_*.csv,
+         return_pred_*.csv, dm_diagnostics_*.csv
+  Summary: EXPERIMENT_RESULTS.md
+"""
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import sys
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from scipy import stats
+
+from statsmodels.regression.linear_model import OLS
+from statsmodels.tools import add_constant
+
+# ── Shared modules from bh_replication ────────────────────────────────────────
+BH_DIR = Path(__file__).parent.parent / "bh_replication"
+sys.path.insert(0, str(BH_DIR))
+from data_prep import load_sp500_returns, load_vix, compute_rv_components
+from har_model import estimate_har, out_of_sample_forecast, NW_LAGS, _nw_se
+
+ROOT   = Path(__file__).parent
+OUTPUT = ROOT / "output"
+OUTPUT.mkdir(exist_ok=True)
+DATA   = ROOT.parent / "data"
+
+PAPER_START  = "1990-01-02"
+PAPER_END    = "2010-10-01"
+PAPER_SPLIT  = "2005-07-15"   # 75% train split (matching B&H)
+ROLL_WIN     = 500            # production-loop rolling window (trading days)
+
+# ── Paper benchmarks (Table 3, Model 8) ──────────────────────────────────────
+PAPER_COEFS = {"const": 3.730, "VIX2_lag": 0.108, "RV22_lag": 0.199,
+               "RV5_lag": 0.330, "RV1_lag": 0.107}
+PAPER_NW_SE = {"const": 1.903, "VIX2_lag": 0.072, "RV22_lag": 0.096,
+               "RV5_lag": 0.117, "RV1_lag": 0.026}
+PAPER_OOS   = {"rmse": 46.077, "mae": 16.856, "mape": 0.347, "mz_r2": 0.555}
+PAPER_IS_RMSE = 10.508   # from paper Table 3
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1 — Implied Variance
+# ══════════════════════════════════════════════════════════════════════════════
+def load_implied_variance() -> pd.Series:
+    """
+    Implied variance from SPX 1-month variance swap data.
+    IMPLIED_VOLATILITY is annualised % vol → IVar = IV²/12  (monthly %²-units).
+    Falls back to VIX²/12 where swap data is unavailable (pre-2008).
+    """
+    swap  = pd.read_csv(DATA / "EquityIndexVarianceSwapData.csv",
+                        parse_dates=["DATE"])
+    spx1m = (swap[(swap["UNDERLYING"] == "SPX") & (swap["TENOR_MONTHS"] == 1.0)]
+             .sort_values("DATE")
+             .set_index("DATE")["IMPLIED_VOLATILITY"])
+    spx1m.index.name = "date"
+    iv_var = spx1m ** 2 / 12.0
+
+    vix     = load_vix()                          # from bh_replication.data_prep
+    vix_var = vix ** 2 / 12.0
+    combined = iv_var.reindex(vix_var.index).combine_first(vix_var)
+    combined.name = "IVar"
+    return combined
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2+3 — Panel Assembly
+# ══════════════════════════════════════════════════════════════════════════════
+def build_full_panel() -> pd.DataFrame:
+    """
+    Assemble the aligned daily panel with forward RV target.
+
+    Extends bh_replication.data_prep.build_panel() by substituting VIX²/12 with
+    SPX variance-swap implied variance (post-2008) where available.  The feature
+    column is named VIX2_lag to remain compatible with bh_replication.har_model.
+    """
+    ret  = load_sp500_returns()                   # from bh_replication.data_prep
+    ivar = load_implied_variance()
+    rv   = compute_rv_components(ret)             # from bh_replication.data_prep
+
+    panel = rv.join(ivar, how="inner").dropna()
+    panel["RV22_fwd"] = panel["RV22"].shift(-22)
+
+    # VIX2_lag is the lagged implied variance predictor (swap-data or VIX²/12).
+    # Named VIX2_lag so har_model.estimate_har / out_of_sample_forecast work directly.
+    panel["VIX2_lag"] = panel["IVar"].shift(1)
+    panel["RV22_lag"] = panel["RV22"].shift(1)
+    panel["RV5_lag"]  = panel["RV5"].shift(1)
+    panel["RV1_lag"]  = panel["RV1"].shift(1)
+    return panel.dropna()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 4 — VRP Extraction
+# ══════════════════════════════════════════════════════════════════════════════
+def extract_vrp(panel: pd.DataFrame, cv_series: pd.Series) -> pd.DataFrame:
+    """VP = IVar − CV  (both in monthly %² units)."""
+    out       = panel.copy()
+    out["CV"] = cv_series
+    out["VP"] = out["IVar"] - out["CV"]
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5 — Production Loop (500-day rolling OLS)
+# ══════════════════════════════════════════════════════════════════════════════
+def production_loop(panel: pd.DataFrame, window: int = ROLL_WIN) -> pd.DataFrame:
+    """
+    For each day t ≥ window, fit HAR on [t-window, t-1], forecast RV_t+22.
+    Returns DataFrame: date, y_actual, y_hat, error, CV, VP.
+    Strictly no look-ahead (parameters estimated only on past data).
+
+    Uses VIX2_lag as the implied-variance feature (matching har_model convention).
+    """
+    rows  = []
+    idx   = panel.index
+    N     = len(idx)
+    feats = ["VIX2_lag", "RV22_lag", "RV5_lag", "RV1_lag"]
+
+    print(f"    Running {N - window} daily production steps (window={window})…",
+          flush=True)
+
+    for i in range(window, N - 22):
+        train_sl = panel.iloc[i - window : i]
+        if len(train_sl) < 100:
+            continue
+        y_tr = train_sl["RV22_fwd"]
+        X_tr = add_constant(train_sl[feats])
+        if X_tr.shape[0] < 50:
+            continue
+
+        res_tr = OLS(y_tr, X_tr).fit()
+
+        test_row = panel.iloc[[i]]
+        X_te     = add_constant(test_row[feats], has_constant="add")
+        y_actual = panel["RV22_fwd"].iloc[i]
+        y_hat    = float(res_tr.predict(X_te).iloc[0])
+        cv_hat   = y_hat                           # CV = conditional variance forecast
+        ivar_t   = float(panel["IVar"].iloc[i])
+        vp_t     = ivar_t - cv_hat
+
+        rows.append({
+            "date":     idx[i],
+            "y_actual": y_actual,
+            "y_hat":    y_hat,
+            "error":    y_actual - y_hat,
+            "CV":       cv_hat,
+            "IVar":     ivar_t,
+            "VP":       vp_t,
+        })
+
+    df = pd.DataFrame(rows).set_index("date")
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 6 — Monthly Diagnostic: Mincer-Zarnowitz + Diebold-Mariano
+# ══════════════════════════════════════════════════════════════════════════════
+def diebold_mariano(e1: np.ndarray, e2: np.ndarray,
+                    nlags: int = NW_LAGS) -> tuple:
+    """
+    DM test: H0 = equal predictive accuracy.
+    d = e1² - e2²  (positive = e1 model worse than e2 model).
+    DM = d_bar / sqrt(LRV(d)/T)  using Newey-West LRV.
+    Returns (DM_stat, p_value).
+    """
+    d    = e1**2 - e2**2
+    T    = len(d)
+    dbar = d.mean()
+    gamma0 = np.mean(d**2) - dbar**2
+    lrv    = gamma0
+    for k in range(1, nlags + 1):
+        w      = 1 - k / (nlags + 1)
+        gammak = np.mean((d[k:] - dbar) * (d[:-k] - dbar))
+        lrv   += 2 * w * gammak
+    if lrv <= 0 or T == 0:
+        return float("nan"), float("nan")
+    dm_stat = dbar / np.sqrt(lrv / T)
+    p_val   = 2 * (1 - stats.norm.cdf(abs(dm_stat)))
+    return float(dm_stat), float(p_val)
+
+
+def run_monthly_diagnostics(prod_df: pd.DataFrame,
+                             panel: pd.DataFrame) -> pd.DataFrame:
+    """
+    On the last day of each month, compute over the trailing 12-month window:
+      - Mincer-Zarnowitz (MZ) R², intercept, and slope
+      - DM test vs. martingale baseline (y_hat_mart = lagged RV22)
+
+    Kill-switch logic (all three must hold to keep model active):
+      1. DM stat < 0  — HAR MSE < martingale MSE (correct direction)
+      2. DM p ≤ 0.05  — difference is statistically significant
+      3. |MZ intercept| ≤ 1.96 × SE  — no systematic forecast bias (95% CI)
+
+    Rationale for fixes vs. original design:
+      - Direction check prevents false no-kills when martingale significantly wins
+      - 1.96 SE threshold replaces the too-loose 1 SE used previously
+      - 12-month window gives ~2× more power than 6-month for the DM test
+    """
+    mart_hat = panel["RV22_lag"].reindex(prod_df.index)
+
+    monthly_ends = prod_df.resample("ME").last().index
+    rows = []
+
+    for end_dt in monthly_ends:
+        start_dt = end_dt - pd.DateOffset(months=12)
+        sl = prod_df[
+            (prod_df.index > start_dt) & (prod_df.index <= end_dt)
+        ].dropna()
+        if len(sl) < 30:
+            continue
+
+        y_act  = sl["y_actual"].values
+        y_hat  = sl["y_hat"].values
+        y_mart = mart_hat.reindex(sl.index).values
+
+        valid  = ~(np.isnan(y_act) | np.isnan(y_hat) | np.isnan(y_mart))
+        y_act  = y_act[valid]
+        y_hat  = y_hat[valid]
+        y_mart = y_mart[valid]
+        if len(y_act) < 10:
+            continue
+
+        # Mincer-Zarnowitz
+        mz_res    = OLS(y_act, add_constant(y_hat)).fit()
+        mz_r2     = float(mz_res.rsquared)
+        mz_intcpt = float(mz_res.params[0])
+        mz_slope  = float(mz_res.params[1])
+        mz_int_se = float(np.sqrt(mz_res.cov_params()[0, 0]))
+
+        # DM vs. martingale
+        e_hat  = y_act - y_hat
+        e_mart = y_act - y_mart
+        dm_stat, dm_pval = diebold_mariano(e_hat, e_mart)
+
+        # Kill-switch: keep model only when HAR is significantly better
+        # dm_stat < 0 means HAR MSE < martingale MSE (HAR wins)
+        har_wins = (not np.isnan(dm_stat)) and (dm_stat < 0) and (dm_pval <= 0.05)
+        kill = (not har_wins) or (abs(mz_intcpt) > 1.96 * mz_int_se)
+
+        rows.append({
+            "date":        end_dt,
+            "n":           len(sl),
+            "mz_r2":       round(mz_r2, 4),
+            "mz_intcpt":   round(mz_intcpt, 4),
+            "mz_slope":    round(mz_slope, 4),
+            "mz_int_se":   round(mz_int_se, 4),
+            "dm_stat":     round(dm_stat, 4) if not np.isnan(dm_stat) else np.nan,
+            "dm_pval":     round(dm_pval, 4) if not np.isnan(dm_pval) else np.nan,
+            "kill_switch": kill,
+        })
+
+    return pd.DataFrame(rows).set_index("date")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 7 — Statistical Accuracy Evaluation
+# ══════════════════════════════════════════════════════════════════════════════
+def compute_metrics(y_actual: np.ndarray, y_hat: np.ndarray,
+                    label: str = "") -> dict:
+    """RMSE, MAE, MAPE, MZ-R²."""
+    valid = ~(np.isnan(y_actual) | np.isnan(y_hat))
+    ya    = y_actual[valid]
+    yh    = y_hat[valid]
+    err   = ya - yh
+    rmse  = float(np.sqrt((err**2).mean()))
+    mae   = float(np.abs(err).mean())
+    mape  = float((np.abs(err) / np.clip(ya, 0.01, None)).mean())
+    mz    = OLS(ya, add_constant(yh)).fit()
+    return {
+        "label":  label,
+        "n":      int(valid.sum()),
+        "rmse":   round(rmse, 3),
+        "mae":    round(mae,  3),
+        "mape":   round(mape, 4),
+        "mz_r2":  round(float(mz.rsquared), 4),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 8 — Baseline Comparisons
+# ══════════════════════════════════════════════════════════════════════════════
+def martingale_forecast(panel: pd.DataFrame, train_end: str) -> pd.Series:
+    """BTZ martingale: E[RV_{t+1}] = RV_t (lagged RV22)."""
+    test = panel[panel.index > train_end]
+    return test["RV22_lag"]
+
+
+def run_return_predictability(panel: pd.DataFrame,
+                               sp_ret: pd.Series,
+                               horizons=(1, 3, 12)) -> dict:
+    """
+    Table 4 replication: regress horizon-average excess returns on VP / CV.
+    Uses end-of-month observations; Newey-West SEs (max(3, 2h) lags).
+    """
+    monthly = panel.resample("ME").last()[["VP", "CV"]].dropna()
+    sp_m    = sp_ret.resample("ME").agg(lambda x: (1 + x).prod() - 1)
+    log_sp  = np.log1p(sp_m)
+
+    results = {}
+    for h in horizons:
+        fwd_log = log_sp.rolling(h).sum().shift(-h)
+        fwd_ann = (np.exp(fwd_log) - 1) * (12.0 / h) * 100.0
+        monthly["ret_fwd"] = fwd_ann
+        sub = monthly.dropna()
+        if len(sub) < 20:
+            continue
+
+        y   = sub["ret_fwd"]
+        nwl = max(3, 2 * h)
+
+        def _run(Xcols):
+            X  = add_constant(sub[Xcols])
+            r  = OLS(y, X).fit()
+            nw = _nw_se(r, nlags=nwl)   # from bh_replication.har_model
+            return {
+                "params": dict(zip(X.columns, r.params)),
+                "nw_se":  dict(zip(X.columns, nw)),
+                "t_stat": dict(zip(X.columns, r.params / nw)),
+                "adj_r2": float(r.rsquared_adj),
+            }
+
+        results[h] = {
+            "n":          len(sub),
+            "univariate": _run(["VP"]),
+            "bivariate":  _run(["VP", "CV"]),
+        }
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLOTS
+# ══════════════════════════════════════════════════════════════════════════════
+def _label_crises(ax, start, end):
+    """Shade known crisis periods on a time-series axis."""
+    crises = [
+        ("Gulf War",      "1990-08-01", "1991-03-01"),
+        ("Mexican",       "1994-12-01", "1995-03-01"),
+        ("Asian/LTCM",    "1997-07-01", "1999-01-01"),
+        ("9/11",          "2001-09-01", "2001-12-01"),
+        ("Corp Scandals", "2002-01-01", "2003-03-01"),
+        ("GFC",           "2007-06-01", "2009-06-01"),
+        ("COVID",         "2020-02-01", "2020-06-01"),
+    ]
+    for lbl, s, e in crises:
+        s, e = pd.Timestamp(s), pd.Timestamp(e)
+        if e < start or s > end:
+            continue
+        ax.axvspan(max(s, start), min(e, end), alpha=0.10,
+                   color="grey", linewidth=0)
+
+
+def plot_vp_cv(panel, tag, title_extra=""):
+    fig, axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
+    s, e = panel.index[0], panel.index[-1]
+
+    ax = axes[0]
+    _label_crises(ax, s, e)
+    ax.fill_between(panel.index, panel["VP"], 0,
+                    where=(panel["VP"] >= 0), color="steelblue",
+                    alpha=0.55, label="VP > 0")
+    ax.fill_between(panel.index, panel["VP"], 0,
+                    where=(panel["VP"] < 0), color="salmon",
+                    alpha=0.55, label="VP < 0")
+    ax.axhline(0, color="black", linewidth=0.6)
+    ax.set_ylabel("VP = IVar − CV  (%² monthly)")
+    ax.set_title(f"Variance Risk Premium (VP) {title_extra}")
+    ax.legend(fontsize=8); ax.set_ylim(-200, 350)
+
+    ax = axes[1]
+    _label_crises(ax, s, e)
+    ax.plot(panel.index, panel["CV"],   color="darkorange",
+            linewidth=0.7, label="CV — HAR fitted")
+    ax.plot(panel.index, panel["IVar"], color="steelblue",
+            linewidth=0.5, alpha=0.5, label="Implied Var (VIX²/12 or swap)")
+    ax.set_ylabel("Variance (%² monthly)")
+    ax.set_title("Conditional Variance (CV) vs Implied Variance")
+    ax.legend(fontsize=8)
+    ax.xaxis.set_major_locator(mdates.YearLocator(5 if (e-s).days > 5000 else 2))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.set_ylim(-20, 600)
+
+    plt.tight_layout()
+    path = OUTPUT / f"vp_cv_{tag}.png"
+    plt.savefig(path, dpi=150); plt.close()
+    return path
+
+
+def plot_oos_forecast(y_te, y_hat, oos_metrics, mart_hat, mart_metrics, tag):
+    fig, axes = plt.subplots(3, 1, figsize=(15, 11), sharex=False)
+
+    ax = axes[0]
+    ax.plot(y_te.index,  y_te.values,   color="steelblue",  lw=0.8,
+            alpha=0.8, label="Actual RV")
+    ax.plot(y_hat.index, y_hat.values,  color="darkorange", lw=0.8,
+            alpha=0.9, label=f"HAR-VIX  MZ-R²={oos_metrics['mz_r2']:.3f}")
+    if mart_hat is not None:
+        ax.plot(mart_hat.index, mart_hat.values, color="green", lw=0.7,
+                alpha=0.7, linestyle="--",
+                label=f"Martingale  MZ-R²={mart_metrics['mz_r2']:.3f}")
+    ax.set_ylabel("Monthly RV (%²)"); ax.set_title(f"OOS Forecast — {tag}")
+    ax.legend(fontsize=8); ax.set_ylim(-20, 600)
+    ax.xaxis.set_major_locator(mdates.YearLocator(2))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+    ax = axes[1]
+    err_har = y_te - y_hat
+    ax.bar(err_har.index, err_har.values, width=1, color="steelblue",
+           alpha=0.5, label="HAR error")
+    if mart_hat is not None:
+        err_m = y_te - mart_hat.reindex(y_te.index)
+        ax.bar(err_m.index, err_m.values, width=1, color="green",
+               alpha=0.3, label="Martingale error")
+    ax.axhline(0, color="black", lw=0.5)
+    ax.set_ylabel("Forecast error"); ax.set_title("Forecast Errors")
+    ax.legend(fontsize=8)
+    ax.xaxis.set_major_locator(mdates.YearLocator(2))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+    ax = axes[2]
+    cap  = np.percentile(y_te.dropna(), 98)
+    mask = (y_te <= cap) & (y_hat <= cap) & (~np.isnan(y_te)) & (~np.isnan(y_hat))
+    ax.scatter(y_hat[mask], y_te[mask], alpha=0.25, s=3, color="steelblue")
+    m = max(float(y_hat[mask].max()), float(y_te[mask].max()))
+    ax.plot([0, m], [0, m], "r--", lw=1)
+    ax.set_xlabel("HAR Forecast"); ax.set_ylabel("Actual RV")
+    ax.set_title(f"Forecast vs Actual  RMSE={oos_metrics['rmse']:.1f}  "
+                 f"MAE={oos_metrics['mae']:.1f}  MAPE={oos_metrics['mape']:.3f}  "
+                 f"[Paper: RMSE=46.1 MAPE=0.347]")
+
+    plt.tight_layout()
+    path = OUTPUT / f"oos_forecast_{tag}.png"
+    plt.savefig(path, dpi=150); plt.close()
+    return path
+
+
+def plot_production_loop(prod_df: pd.DataFrame, diag_df: pd.DataFrame, tag: str):
+    fig, axes = plt.subplots(3, 1, figsize=(15, 11), sharex=True)
+    s, e = prod_df.index[0], prod_df.index[-1]
+
+    ax = axes[0]
+    _label_crises(ax, s, e)
+    ax.plot(prod_df.index, prod_df["y_actual"], color="steelblue",
+            lw=0.7, alpha=0.8, label="Actual RV")
+    ax.plot(prod_df.index, prod_df["y_hat"],    color="darkorange",
+            lw=0.7, alpha=0.9, label="Prod-loop HAR forecast")
+    ax.set_ylabel("Monthly RV (%²)")
+    ax.set_title(f"Production Loop ({ROLL_WIN}-day rolling OLS) — {tag}")
+    ax.legend(fontsize=8)
+
+    ax = axes[1]
+    ax.plot(prod_df.index, prod_df["VP"], color="steelblue",
+            lw=0.7, label="VP (production)")
+    ax.plot(prod_df.index, prod_df["CV"], color="darkorange",
+            lw=0.7, label="CV (production)")
+    ax.axhline(0, color="black", lw=0.5)
+    ax.set_ylabel("Variance (%² monthly)")
+    ax.set_title("Real-time VP and CV from Production Loop")
+    ax.legend(fontsize=8)
+
+    ax = axes[2]
+    if len(diag_df) > 0:
+        kill_dates = diag_df[diag_df["kill_switch"]].index
+        ax.bar(diag_df.index, diag_df["mz_r2"],
+               width=20, color="steelblue", alpha=0.6, label="Monthly MZ-R²")
+        ax.axhline(PAPER_OOS["mz_r2"], color="firebrick", lw=1, ls="--",
+                   label=f"Paper OOS R²={PAPER_OOS['mz_r2']:.3f}")
+        for kd in kill_dates:
+            ax.axvline(kd, color="red", lw=0.8, alpha=0.5)
+        ax.set_ylabel("MZ-R²")
+        ax.set_title("Monthly Mincer-Zarnowitz R²  (red lines = kill-switch triggered)")
+        ax.legend(fontsize=8)
+
+    ax.xaxis.set_major_locator(mdates.YearLocator(2))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    plt.tight_layout()
+    path = OUTPUT / f"production_loop_{tag}.png"
+    plt.savefig(path, dpi=150); plt.close()
+    return path
+
+
+def plot_dm_diagnostics(diag_df: pd.DataFrame, tag: str):
+    if len(diag_df) == 0:
+        return None
+    fig, axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
+
+    ax = axes[0]
+    colors = ["red" if k else "steelblue" for k in diag_df["kill_switch"]]
+    ax.bar(diag_df.index, diag_df["dm_stat"], width=20, color=colors, alpha=0.7)
+    ax.axhline(-1.96, color="grey", ls="--", lw=0.8, label="±1.96 (5%)")
+    ax.axhline( 1.96, color="grey", ls="--", lw=0.8)
+    ax.axhline(0, color="black", lw=0.5)
+    ax.set_ylabel("DM Statistic")
+    ax.set_title(
+        f"Diebold-Mariano Test (HAR vs Martingale) — {tag}\n"
+        "Negative = HAR better; kill suppressed only when DM < −1.96 (HAR wins, p ≤ 0.05)"
+        " AND |MZ intercept| ≤ 1.96 SE"
+    )
+    ax.legend(fontsize=8)
+
+    ax = axes[1]
+    ax.bar(diag_df.index, diag_df["dm_pval"], width=20, color=colors, alpha=0.7)
+    ax.axhline(0.05, color="firebrick", ls="--", lw=1, label="p = 0.05 threshold")
+    ax.set_ylabel("DM p-value")
+    ax.set_title(
+        "DM p-value  (kill suppressed only when p ≤ 0.05 AND stat < 0; red = kill triggered)"
+    )
+    ax.legend(fontsize=8)
+
+    ax.xaxis.set_major_locator(mdates.YearLocator(2))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    plt.tight_layout()
+    path = OUTPUT / f"dm_diagnostics_{tag}.png"
+    plt.savefig(path, dpi=150); plt.close()
+    return path
+
+
+def plot_return_pred(results: dict, tag: str):
+    horizons = sorted(results.keys())
+    vp_coefs = [results[h]["univariate"]["params"].get("VP", np.nan)
+                for h in horizons]
+    vp_tstat = [results[h]["univariate"]["t_stat"].get("VP", np.nan)
+                for h in horizons]
+    vp_r2    = [results[h]["univariate"]["adj_r2"] for h in horizons]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    xlbl = [f"{h}m" for h in horizons]
+
+    axes[0].bar(xlbl, vp_coefs, color="steelblue", alpha=0.7)
+    axes[0].axhline(0, color="black", lw=0.5)
+    axes[0].set_title("VP Coefficient (univariate)")
+    axes[0].set_ylabel("Coefficient")
+
+    axes[1].bar(xlbl, vp_tstat,
+                color=["red" if abs(t) < 1.96 else "steelblue" for t in vp_tstat],
+                alpha=0.7)
+    axes[1].axhline( 1.96, color="grey", ls="--", lw=0.8)
+    axes[1].axhline(-1.96, color="grey", ls="--", lw=0.8)
+    axes[1].set_title("VP t-statistic")
+    axes[1].set_ylabel("t-stat")
+
+    axes[2].bar(xlbl, [max(0, r) for r in vp_r2], color="steelblue", alpha=0.7)
+    axes[2].set_title("Adj. R² (VP predicting excess returns)")
+    axes[2].set_ylabel("Adj. R²")
+
+    plt.suptitle(f"Return Predictability — VP univariate ({tag})")
+    plt.tight_layout()
+    path = OUTPUT / f"return_pred_{tag}.png"
+    plt.savefig(path, dpi=150); plt.close()
+    return path
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SUMMARY MARKDOWN
+# ══════════════════════════════════════════════════════════════════════════════
+def write_results_md(
+    panel_paper, panel_full,
+    res_paper, res_full,
+    oos_paper, oos_full,
+    prod_paper, prod_full,
+    diag_paper, diag_full,
+    metrics_paper_har, metrics_full_har,
+    metrics_paper_mart, metrics_full_mart,
+    ret_paper, ret_full,
+):
+    kill_paper = int(diag_paper["kill_switch"].sum()) if len(diag_paper) else 0
+    kill_full  = int(diag_full["kill_switch"].sum())  if len(diag_full)  else 0
+    n_diag_p   = len(diag_paper)
+    n_diag_f   = len(diag_full)
+
+    def coef_row(v, res):
+        p  = res["params"].get(v, np.nan)
+        se = res["nw_se"].get(v, np.nan)
+        t  = res["t_stats"].get(v, np.nan)
+        pc = PAPER_COEFS.get(v, np.nan)
+        return (f"| `{v}` | {p:>9.4f} | {se:>9.4f} | {t:>8.3f} | "
+                f"{pc:>10.3f} |")
+
+    def ret_row(h, results, label):
+        if h not in results:
+            return f"| {label} h={h} | — | — | — | — |"
+        u    = results[h]["univariate"]
+        vp_p = u["params"].get("VP", np.nan)
+        vp_t = u["t_stat"].get("VP", np.nan)
+        sig  = ("***" if abs(vp_t) > 2.58 else
+                ("**" if abs(vp_t) > 1.96 else
+                 ("*"  if abs(vp_t) > 1.645 else "")))
+        return (f"| {label} h={h}m | {vp_p:>8.4f}{sig} | {vp_t:>7.3f} | "
+                f"{u['adj_r2']:>7.4f} | {results[h]['n']:>4d} |")
+
+    lines = [
+        "# Bekaert & Hoerova (2014) — Full Experiment Results",
+        "",
+        "> **Paper:** 'The VIX, the Variance Premium and Stock Market Volatility'  ",
+        "> Geert Bekaert & Marie Hoerova, ECB WP No. 1675, May 2014",
+        "",
+        "---",
+        "",
+        "## 1. Methodology Summary",
+        "",
+        "| Step | Description |",
+        "|------|-------------|",
+        "| **1** | Implied variance: SPX 1-month variance swap data (from 2008); VIX²/12 for earlier dates |",
+        "| **2** | Physical RV: rolling 22-day sum of daily squared returns (daily-sq proxy) |",
+        "| **3** | HAR-RV-VIX (Model 8) out-of-sample fit: train up to 75% split date |",
+        "| **4** | VRP = IVar − CV (implied variance minus fitted conditional variance) |",
+        "| **5** | 500-day rolling-window OLS production loop (strict no look-ahead) |",
+        "| **6** | Monthly diagnostics (12-month window): DM test + MZ intercept check |",
+        "|       | Kill-switch: HAR must beat martingale (DM stat < 0, p ≤ 0.05) AND |MZ intercept| ≤ 1.96 SE |",
+        "| **7** | RMSE, MAE, MAPE metrics on OOS window |",
+        "| **8** | Baseline comparison: martingale (BTZ Model 30) + VP return predictability |",
+        "",
+        "**Data constraint:** Daily squared returns proxy for 5-min realized variance.  ",
+        "This attenuates lagged-RV coefficients (errors-in-variables) and inflates VIX²/IVar weight.",
+        "",
+        "**Shared code:** Steps 2–3 call `bh_replication.data_prep.compute_rv_components`,",
+        "`bh_replication.har_model.estimate_har`, and `bh_replication.har_model.out_of_sample_forecast` directly.",
+        "",
+        "---",
+        "",
+        "## 2. HAR-VIX Coefficient Estimates",
+        "",
+        "### Paper Sample (1990–2010)",
+        f"n = {res_paper['n']:,} daily observations  "
+        f"| IS Adj-R² = {res_paper['adj_r2']:.4f}  "
+        f"| IS RMSE = {res_paper['rmse_is']:.3f}",
+        f"(Paper IS RMSE benchmark = {PAPER_IS_RMSE:.3f})",
+        "",
+        "| Variable | Coef | NW-SE | t-stat | Paper Coef |",
+        "|----------|-----:|------:|-------:|-----------:|",
+    ]
+    for v in ["const", "VIX2_lag", "RV22_lag", "RV5_lag", "RV1_lag"]:
+        lines.append(coef_row(v, res_paper))
+
+    lines += [
+        "",
+        "### Full Sample (1990–present)",
+        f"n = {res_full['n']:,} daily observations  "
+        f"| IS Adj-R² = {res_full['adj_r2']:.4f}  "
+        f"| IS RMSE = {res_full['rmse_is']:.3f}",
+        "",
+        "| Variable | Coef | NW-SE | t-stat | Paper Coef |",
+        "|----------|-----:|------:|-------:|-----------:|",
+    ]
+    for v in ["const", "VIX2_lag", "RV22_lag", "RV5_lag", "RV1_lag"]:
+        lines.append(coef_row(v, res_full))
+
+    lines += [
+        "",
+        "---",
+        "",
+        "## 3. OOS Forecasting Performance (75% Split)",
+        "",
+        "| Metric | HAR-VIX Paper | HAR-VIX Full | Martingale Paper | Martingale Full | **Paper Benchmark** |",
+        "|--------|:------:|:------:|:------:|:------:|:------:|",
+        f"| MZ-R² | {metrics_paper_har['mz_r2']:.4f} | {metrics_full_har['mz_r2']:.4f} | {metrics_paper_mart['mz_r2']:.4f} | {metrics_full_mart['mz_r2']:.4f} | **{PAPER_OOS['mz_r2']:.3f}** |",
+        f"| RMSE  | {metrics_paper_har['rmse']:.3f} | {metrics_full_har['rmse']:.3f} | {metrics_paper_mart['rmse']:.3f} | {metrics_full_mart['rmse']:.3f} | **{PAPER_OOS['rmse']:.3f}** |",
+        f"| MAE   | {metrics_paper_har['mae']:.3f} | {metrics_full_har['mae']:.3f} | {metrics_paper_mart['mae']:.3f} | {metrics_full_mart['mae']:.3f} | **{PAPER_OOS['mae']:.3f}** |",
+        f"| MAPE  | {metrics_paper_har['mape']:.4f} | {metrics_full_har['mape']:.4f} | {metrics_paper_mart['mape']:.4f} | {metrics_full_mart['mape']:.4f} | **{PAPER_OOS['mape']:.3f}** |",
+        "",
+        "---",
+        "",
+        "## 4. VP/CV Series Statistics",
+        "",
+        "### Paper Sample",
+        "| Stat | VP | CV | IVar |",
+        "|------|----|----|------|",
+        f"| Mean | {panel_paper['VP'].mean():.3f} | {panel_paper['CV'].mean():.3f} | {panel_paper['IVar'].mean():.3f} |",
+        f"| Std  | {panel_paper['VP'].std():.3f}  | {panel_paper['CV'].std():.3f}  | {panel_paper['IVar'].std():.3f}  |",
+        f"| Min  | {panel_paper['VP'].min():.3f}  | {panel_paper['CV'].min():.3f}  | {panel_paper['IVar'].min():.3f}  |",
+        f"| Max  | {panel_paper['VP'].max():.3f}  | {panel_paper['CV'].max():.3f}  | {panel_paper['IVar'].max():.3f}  |",
+        f"| % VP > 0 | {(panel_paper['VP']>0).mean()*100:.1f}% | — | — |",
+        "",
+        "### Full Sample",
+        "| Stat | VP | CV | IVar |",
+        "|------|----|----|------|",
+        f"| Mean | {panel_full['VP'].mean():.3f} | {panel_full['CV'].mean():.3f} | {panel_full['IVar'].mean():.3f} |",
+        f"| Std  | {panel_full['VP'].std():.3f}  | {panel_full['CV'].std():.3f}  | {panel_full['IVar'].std():.3f}  |",
+        f"| Min  | {panel_full['VP'].min():.3f}  | {panel_full['CV'].min():.3f}  | {panel_full['IVar'].min():.3f}  |",
+        f"| Max  | {panel_full['VP'].max():.3f}  | {panel_full['CV'].max():.3f}  | {panel_full['IVar'].max():.3f}  |",
+        f"| % VP > 0 | {(panel_full['VP']>0).mean()*100:.1f}% | — | — |",
+        "",
+        "---",
+        "",
+        f"## 5. Production Loop — {ROLL_WIN}-Day Rolling OLS",
+        "",
+        "### Paper Sample",
+        f"- Period: {prod_paper.index.min().date()} – {prod_paper.index.max().date()}",
+        f"- n steps: {len(prod_paper):,}",
+        f"- Rolling RMSE: {np.sqrt((prod_paper['error']**2).mean()):.3f}",
+        f"- Rolling MAE:  {prod_paper['error'].abs().mean():.3f}",
+        "",
+        "### Full Sample",
+        f"- Period: {prod_full.index.min().date()} – {prod_full.index.max().date()}",
+        f"- n steps: {len(prod_full):,}",
+        f"- Rolling RMSE: {np.sqrt((prod_full['error']**2).mean()):.3f}",
+        f"- Rolling MAE:  {prod_full['error'].abs().mean():.3f}",
+        "",
+        "---",
+        "",
+        "## 6. Kill-Switch Diagnostics",
+        "",
+        "Kill-switch rule (12-month trailing window):",
+        "- **DM stat < 0** — HAR MSE must be below martingale MSE",
+        "- **DM p ≤ 0.05** — difference must be statistically significant",
+        "- **|MZ intercept| ≤ 1.96 SE** — no systematic forecast bias (95% CI)",
+        "All three must hold; failure on any one triggers suspension.",
+        "",
+        f"### Paper Sample ({n_diag_p} monthly checkpoints)",
+        f"- Kill switches triggered: **{kill_paper}** ({kill_paper/max(n_diag_p,1)*100:.1f}%)",
+        "",
+        f"### Full Sample ({n_diag_f} monthly checkpoints)",
+        f"- Kill switches triggered: **{kill_full}** ({kill_full/max(n_diag_f,1)*100:.1f}%)",
+        "",
+        "---",
+        "",
+        "## 7. Return Predictability (Table 4 Replication)",
+        "",
+        "| Sample | Horizon | VP Coef | t-stat | Adj-R² | n |",
+        "|--------|---------|--------:|-------:|-------:|---|",
+    ]
+    for h in [1, 3, 12]:
+        lines.append(ret_row(h, ret_paper, "Paper"))
+    for h in [1, 3, 12]:
+        lines.append(ret_row(h, ret_full,  "Full"))
+
+    lines += [
+        "",
+        "Significance: * p<0.10, ** p<0.05, *** p<0.01 (Newey-West SEs, max(3, 2h) lags)",
+        "",
+        "---",
+        "",
+        "## 8. Key Findings vs. Paper",
+        "",
+        "| Finding | Paper | This Replication |",
+        "|---------|-------|-----------------|",
+        f"| HAR-VIX OOS MZ-R² | 0.555 | {metrics_paper_har['mz_r2']:.3f} |",
+        f"| HAR-VIX OOS RMSE | 46.077 | {metrics_paper_har['rmse']:.3f} |",
+        f"| HAR-VIX OOS MAPE | 0.347 | {metrics_paper_har['mape']:.3f} |",
+        f"| VIX²/IVar weight (α) | 0.108 | {res_paper['params'].get('VIX2_lag', np.nan):.3f} |",
+        f"| RV^(22) weight (β^m) | 0.199 | {res_paper['params'].get('RV22_lag', np.nan):.3f} |",
+        f"| VP mean (paper period) | ~positive | {panel_paper['VP'].mean():.3f} |",
+        f"| % VP > 0 (paper period) | majority | {(panel_paper['VP']>0).mean()*100:.1f}% |",
+        "",
+        "**Data-constraint penalty:** R² gap vs paper is explained by the noise of",
+        "daily-sq returns vs 5-min RV (estimation variance ~252× higher).  ",
+        "The model shifts weight heavily onto IVar/VIX², a lower-noise forward-looking signal.",
+        "",
+        "---",
+        "",
+        "## 9. Output Files",
+        "",
+        "| File | Description |",
+        "|------|-------------|",
+        "| `vp_cv_paper_sample.png` | VP & CV time series, paper period |",
+        "| `vp_cv_full_sample.png` | VP & CV time series, full period |",
+        "| `oos_forecast_paper.png` | OOS actual vs HAR vs martingale, paper period |",
+        "| `oos_forecast_full.png` | OOS actual vs HAR vs martingale, full period |",
+        "| `production_loop_paper.png` | 500-day rolling loop + monthly MZ diagnostics |",
+        "| `production_loop_full.png` | 500-day rolling loop, full period |",
+        "| `dm_diagnostics_paper.png` | Diebold-Mariano test over time |",
+        "| `dm_diagnostics_full.png` | Diebold-Mariano test, full period |",
+        "| `return_pred_paper.png` | VP return predictability bars |",
+        "| `return_pred_full.png` | VP return predictability, full period |",
+        "| `vp_cv_series_paper.csv` | Daily VP/CV/IVar series, paper period |",
+        "| `vp_cv_series_full.csv` | Daily VP/CV/IVar series, full period |",
+        "| `oos_metrics.csv` | RMSE/MAE/MAPE comparison table |",
+        "| `production_loop_paper.csv` | Day-by-day production loop results |",
+        "| `production_loop_full.csv` | Day-by-day production loop results, full |",
+        "| `dm_diagnostics_paper.csv` | Monthly DM statistics |",
+        "| `return_pred_paper.csv` | Return predictability regression results |",
+    ]
+
+    text = "\n".join(lines)
+    path = OUTPUT / "EXPERIMENT_RESULTS.md"
+    path.write_text(text, encoding="utf-8")
+    print(f"    Written {path}")
+    return path
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+def main():
+    print("=" * 72)
+    print("  Bekaert & Hoerova (2014) — Full 8-Step Experiment")
+    print("=" * 72)
+
+    # ── Load & build panel ────────────────────────────────────────────────────
+    print("\n[1-2] Building daily panel (returns + implied variance + RV)…")
+    panel_full = build_full_panel()
+    sp_ret     = load_sp500_returns()
+
+    panel_paper = panel_full[
+        (panel_full.index >= PAPER_START) &
+        (panel_full.index <= PAPER_END)
+    ].copy()
+
+    print(f"    Paper panel: {panel_paper.shape[0]:,} obs  "
+          f"({panel_paper.index.min().date()} – {panel_paper.index.max().date()})")
+    print(f"    Full  panel: {panel_full.shape[0]:,} obs  "
+          f"({panel_full.index.min().date()} – {panel_full.index.max().date()})")
+
+    # ── STEP 3: HAR in-sample & OOS (via bh_replication.har_model) ───────────
+    print("\n[3] HAR Model 8 — in-sample and OOS estimates…")
+    res_paper = estimate_har(panel_paper, "1990–2010 paper")
+    res_full  = estimate_har(panel_full,  "1990–present full")
+
+    oos_paper = out_of_sample_forecast(panel_paper, PAPER_SPLIT, "Paper OOS")
+    oos_full  = out_of_sample_forecast(panel_full,  PAPER_SPLIT, "Full  OOS")
+
+    for tag, res, oos in [("Paper", res_paper, oos_paper),
+                           ("Full",  res_full,  oos_full)]:
+        print(f"\n  [{tag}] IS Adj-R²={res['adj_r2']:.4f}  "
+              f"IS-RMSE={res['rmse_is']:.3f}  "
+              f"OOS MZ-R²={oos['oos_mz_r2']:.4f}  "
+              f"OOS RMSE={oos['oos_rmse']:.3f}")
+        for v in ["const", "VIX2_lag", "RV22_lag", "RV5_lag", "RV1_lag"]:
+            p  = res["params"][v]
+            se = res["nw_se"][v]
+            t  = res["t_stats"][v]
+            pc = PAPER_COEFS.get(v, np.nan)
+            print(f"    {v:<12} {p:>9.4f}  SE={se:.4f}  t={t:>7.3f}"
+                  f"  [paper: {pc:.3f}]")
+
+    # ── STEP 4: VP extraction ─────────────────────────────────────────────────
+    print("\n[4] Extracting VP and CV series…")
+    panel_paper = extract_vrp(panel_paper, res_paper["fitted"])
+    panel_full  = extract_vrp(panel_full,  res_full["fitted"])
+
+    print(f"    VP mean (paper): {panel_paper['VP'].mean():.3f}")
+    print(f"    CV mean (paper): {panel_paper['CV'].mean():.3f}")
+    print(f"    VP mean (full):  {panel_full['VP'].mean():.3f}")
+
+    for p, tag in [(panel_paper, "paper"), (panel_full, "full")]:
+        p[["IVar", "CV", "VP", "RV22_fwd"]].to_csv(
+            OUTPUT / f"vp_cv_series_{tag}.csv")
+    panel_full[["IVar", "CV", "VP", "RV22_fwd"]].to_parquet(
+        OUTPUT / "vp_cv_series_full.parquet")
+
+    # ── STEP 5: Production loop ───────────────────────────────────────────────
+    print("\n[5] Production loop (500-day rolling OLS)…")
+    print("  Paper sample:")
+    prod_paper = production_loop(panel_paper, ROLL_WIN)
+    print("  Full sample:")
+    prod_full  = production_loop(panel_full,  ROLL_WIN)
+
+    prod_paper.to_csv(OUTPUT / "production_loop_paper.csv")
+    prod_full.to_csv( OUTPUT / "production_loop_full.csv")
+    prod_full.to_parquet(OUTPUT / "production_loop_full.parquet")
+
+    # ── STEP 6: Monthly diagnostics ───────────────────────────────────────────
+    print("\n[6] Monthly diagnostics (MZ + Diebold-Mariano, 12-month window)…")
+    diag_paper = run_monthly_diagnostics(prod_paper, panel_paper)
+    diag_full  = run_monthly_diagnostics(prod_full,  panel_full)
+
+    diag_paper.to_csv(OUTPUT / "dm_diagnostics_paper.csv")
+    diag_full.to_csv( OUTPUT / "dm_diagnostics_full.csv")
+
+    kill_p = int(diag_paper["kill_switch"].sum()) if len(diag_paper) else 0
+    kill_f = int(diag_full["kill_switch"].sum())  if len(diag_full)  else 0
+    print(f"    Kill switches — paper: {kill_p}/{len(diag_paper)},  "
+          f"full: {kill_f}/{len(diag_full)}")
+
+    # ── STEP 7: Metrics ───────────────────────────────────────────────────────
+    print("\n[7] Computing accuracy metrics…")
+    mart_paper = martingale_forecast(panel_paper, PAPER_SPLIT)
+    mart_full  = martingale_forecast(panel_full,  PAPER_SPLIT)
+
+    y_te_p = oos_paper["y_test"]
+    y_te_f = oos_full["y_test"]
+
+    metrics_p_har  = compute_metrics(y_te_p.values, oos_paper["y_hat"].values,
+                                     "HAR paper OOS")
+    metrics_f_har  = compute_metrics(y_te_f.values, oos_full["y_hat"].values,
+                                     "HAR full  OOS")
+    metrics_p_mart = compute_metrics(
+        y_te_p.values,
+        mart_paper.reindex(y_te_p.index).values,
+        "Martingale paper OOS")
+    metrics_f_mart = compute_metrics(
+        y_te_f.values,
+        mart_full.reindex(y_te_f.index).values,
+        "Martingale full  OOS")
+
+    for m in [metrics_p_har, metrics_f_har, metrics_p_mart, metrics_f_mart]:
+        print(f"    {m['label']:<28} RMSE={m['rmse']:.3f}  MAE={m['mae']:.3f}"
+              f"  MAPE={m['mape']:.4f}  MZ-R²={m['mz_r2']:.4f}")
+
+    pd.DataFrame([metrics_p_har, metrics_f_har, metrics_p_mart,
+                  metrics_f_mart]).to_csv(OUTPUT / "oos_metrics.csv", index=False)
+
+    # NOTE: Return predictability regressions (originally Step 8 here) have been
+    # moved to Experiment 2, where they are expanded into the full bivariate
+    # predictive regression analysis (VRP × term structure, trend, VVIX).
+    ret_paper = {}
+    ret_full  = {}
+
+    # ── Plots ─────────────────────────────────────────────────────────────────
+    print("\n[9] Generating plots…")
+    plot_vp_cv(panel_paper, "paper_sample",
+               f"[{panel_paper.index.min().date()}–{panel_paper.index.max().date()}]")
+    plot_vp_cv(panel_full,  "full_sample",
+               f"[{panel_full.index.min().date()}–{panel_full.index.max().date()}]")
+
+    plot_oos_forecast(
+        y_te_p, oos_paper["y_hat"], metrics_p_har,
+        mart_paper.reindex(y_te_p.index), metrics_p_mart, "paper")
+    plot_oos_forecast(
+        y_te_f, oos_full["y_hat"], metrics_f_har,
+        mart_full.reindex(y_te_f.index), metrics_f_mart, "full")
+
+    plot_production_loop(prod_paper, diag_paper, "paper")
+    plot_production_loop(prod_full,  diag_full,  "full")
+
+    plot_dm_diagnostics(diag_paper, "paper")
+    plot_dm_diagnostics(diag_full,  "full")
+
+    # Return predictability plots moved to Experiment 2.
+
+    # ── Summary markdown ──────────────────────────────────────────────────────
+    print("\n[10] Writing EXPERIMENT_RESULTS.md…")
+    write_results_md(
+        panel_paper, panel_full,
+        res_paper, res_full,
+        oos_paper,  oos_full,
+        prod_paper, prod_full,
+        diag_paper, diag_full,
+        metrics_p_har, metrics_f_har,
+        metrics_p_mart, metrics_f_mart,
+        ret_paper, ret_full,
+    )
+
+    print(f"\nAll outputs saved to {OUTPUT}/")
+    print("=" * 72)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,5 @@
+label,n,rmse,mae,mape,mz_r2
+HAR paper OOS,1315,88.677,29.017,0.5664,0.4309
+HAR full  OOS,5197,58.806,17.848,0.6807,0.3581
+Martingale paper OOS,1315,90.68,34.891,0.7295,0.4318
+Martingale full  OOS,5197,67.846,23.796,0.8818,0.2958

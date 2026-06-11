@@ -6,8 +6,7 @@ Bekaert & Hoerova (2014) — Full 8-Step Experiment
 
 Steps
 -----
-1.  Implied Variance from EquityIndexVarianceSwapData.csv (SPX 1-month tenor)
-    → For periods without swap data (pre-2008), fall back to VIX²/12
+1.  Implied Variance from VIX: IVar = VIX²/12 throughout (monthly %²-units)
 2.  Physical Realized Variance: rolling 22-day sum of squared daily returns
 3.  HAR panel fitting (Model 8) — strictly out-of-sample coefficients
 4.  VRP = ImpliedVariance − CV (fitted conditional variance)
@@ -78,50 +77,56 @@ PAPER_IS_RMSE = 10.508   # from paper Table 3
 # ══════════════════════════════════════════════════════════════════════════════
 def load_implied_variance() -> pd.Series:
     """
-    Implied variance from SPX 1-month variance swap data.
-    IMPLIED_VOLATILITY is annualised % vol → IVar = IV²/12  (monthly %²-units).
-    Falls back to VIX²/12 where swap data is unavailable (pre-2008).
+    Implied variance from VIX: IVar = VIX²/12  (monthly %²-units).
+    VIX is the CBOE model-free risk-neutral expected variance proxy (annualised %).
     """
-    swap  = pd.read_csv(DATA / "EquityIndexVarianceSwapData.csv",
-                        parse_dates=["DATE"])
+    vix = load_vix()                              # from bh_replication.data_prep
+    ivar = vix ** 2 / 12.0
+    ivar.name = "IVar"
+    return ivar
+
+
+def load_implied_variance_vs() -> pd.Series:
+    """
+    Implied variance from SPX 1-month variance swap: IVar = VS²/12  (monthly %²-units).
+    Pure VS series — no VIX fallback. Available from November 2008 onwards only.
+    """
+    swap  = pd.read_csv(DATA / "EquityIndexVarianceSwapData.csv", parse_dates=["DATE"])
     spx1m = (swap[(swap["UNDERLYING"] == "SPX") & (swap["TENOR_MONTHS"] == 1.0)]
              .sort_values("DATE")
              .set_index("DATE")["IMPLIED_VOLATILITY"])
     spx1m.index.name = "date"
-    iv_var = spx1m ** 2 / 12.0
-
-    vix     = load_vix()                          # from bh_replication.data_prep
-    vix_var = vix ** 2 / 12.0
-    combined = iv_var.reindex(vix_var.index).combine_first(vix_var)
-    combined.name = "IVar"
-    return combined
+    ivar = spx1m ** 2 / 12.0
+    ivar.name = "IVar"
+    return ivar
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 2+3 — Panel Assembly
 # ══════════════════════════════════════════════════════════════════════════════
-def build_full_panel() -> pd.DataFrame:
-    """
-    Assemble the aligned daily panel with forward RV target.
-
-    Extends bh_replication.data_prep.build_panel() by substituting VIX²/12 with
-    SPX variance-swap implied variance (post-2008) where available.  The feature
-    column is named VIX2_lag to remain compatible with bh_replication.har_model.
-    """
-    ret  = load_sp500_returns()                   # from bh_replication.data_prep
-    ivar = load_implied_variance()
-    rv   = compute_rv_components(ret)             # from bh_replication.data_prep
-
+def _build_panel_from_ivar(ivar: pd.Series) -> pd.DataFrame:
+    """Shared panel builder: join IVar with RV components and create lag features."""
+    ret   = load_sp500_returns()
+    rv    = compute_rv_components(ret)
     panel = rv.join(ivar, how="inner").dropna()
     panel["RV22_fwd"] = panel["RV22"].shift(-22)
-
-    # VIX2_lag is the lagged implied variance predictor (swap-data or VIX²/12).
+    # VIX2_lag is the lagged implied variance predictor.
     # Named VIX2_lag so har_model.estimate_har / out_of_sample_forecast work directly.
     panel["VIX2_lag"] = panel["IVar"].shift(1)
     panel["RV22_lag"] = panel["RV22"].shift(1)
     panel["RV5_lag"]  = panel["RV5"].shift(1)
     panel["RV1_lag"]  = panel["RV1"].shift(1)
     return panel.dropna()
+
+
+def build_full_panel() -> pd.DataFrame:
+    """Panel using VIX²/12 as implied variance throughout (full history from 1990)."""
+    return _build_panel_from_ivar(load_implied_variance())
+
+
+def build_panel_vs() -> pd.DataFrame:
+    """Panel using pure VS²/12 as implied variance (restricted to VS availability, ~2008+)."""
+    return _build_panel_from_ivar(load_implied_variance_vs())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -406,7 +411,7 @@ def plot_vp_cv(panel, tag, title_extra=""):
     ax.plot(panel.index, panel["CV"],   color="darkorange",
             linewidth=0.7, label="CV — HAR fitted")
     ax.plot(panel.index, panel["IVar"], color="steelblue",
-            linewidth=0.5, alpha=0.5, label="Implied Var (VIX²/12 or swap)")
+            linewidth=0.5, alpha=0.5, label="Implied Var (VIX²/12)")
     ax.set_ylabel("Variance (%² monthly)")
     ax.set_title("Conditional Variance (CV) vs Implied Variance")
     ax.legend(fontsize=8)
@@ -468,8 +473,8 @@ def plot_oos_forecast(y_te, y_hat, oos_metrics, mart_hat, mart_metrics, tag):
     return path
 
 
-def plot_production_loop(prod_df: pd.DataFrame, diag_df: pd.DataFrame, tag: str):
-    fig, axes = plt.subplots(3, 1, figsize=(15, 11), sharex=True)
+def plot_production_loop(prod_df: pd.DataFrame, tag: str):
+    fig, axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
     s, e = prod_df.index[0], prod_df.index[-1]
 
     ax = axes[0]
@@ -491,19 +496,6 @@ def plot_production_loop(prod_df: pd.DataFrame, diag_df: pd.DataFrame, tag: str)
     ax.set_ylabel("Variance (%² monthly)")
     ax.set_title("Real-time VP and CV from Production Loop")
     ax.legend(fontsize=8)
-
-    ax = axes[2]
-    if len(diag_df) > 0:
-        kill_dates = diag_df[diag_df["kill_switch"]].index
-        ax.bar(diag_df.index, diag_df["mz_r2"],
-               width=20, color="steelblue", alpha=0.6, label="Monthly MZ-R²")
-        ax.axhline(PAPER_OOS["mz_r2"], color="firebrick", lw=1, ls="--",
-                   label=f"Paper OOS R²={PAPER_OOS['mz_r2']:.3f}")
-        for kd in kill_dates:
-            ax.axvline(kd, color="red", lw=0.8, alpha=0.5)
-        ax.set_ylabel("MZ-R²")
-        ax.set_title("Monthly Mincer-Zarnowitz R²  (red lines = kill-switch triggered)")
-        ax.legend(fontsize=8)
 
     ax.xaxis.set_major_locator(mdates.YearLocator(2))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
@@ -584,6 +576,90 @@ def plot_return_pred(results: dict, tag: str):
     return path
 
 
+def plot_vrp_comparison(prod_vix: pd.DataFrame, prod_vs: pd.DataFrame,
+                        diag_vix: pd.DataFrame, diag_vs: pd.DataFrame):
+    """
+    Three-panel comparison of VIX-based vs VS-based VRP over the overlap period.
+      Row 1: VP time series (VIX vs VS)
+      Row 2: IVar time series (VIX²/12 vs VS²/12)
+      Row 3: Monthly MZ-R² from each production loop
+    """
+    overlap_start = prod_vs.index.min()
+    overlap_end   = min(prod_vix.index.max(), prod_vs.index.max())
+
+    vix_ol = prod_vix.loc[overlap_start:overlap_end]
+    vs_ol  = prod_vs.loc[overlap_start:overlap_end]
+
+    fig, axes = plt.subplots(3, 1, figsize=(15, 12), sharex=False)
+    s, e = overlap_start, overlap_end
+
+    # ── Row 1: VP time series ─────────────────────────────────────────────────
+    ax = axes[0]
+    _label_crises(ax, s, e)
+    ax.plot(vix_ol.index, vix_ol["VP"], color="steelblue",
+            lw=0.7, alpha=0.85, label="VRP (VIX²/12)")
+    ax.plot(vs_ol.index,  vs_ol["VP"],  color="darkorange",
+            lw=0.7, alpha=0.85, label="VRP (VS²/12)")
+    ax.axhline(0, color="black", lw=0.5)
+    ax.set_ylabel("VP = IVar - CV  (%² monthly)")
+    ax.set_title(
+        f"Variance Risk Premium: VIX²/12 vs VS²/12  "
+        f"[{overlap_start.date()} – {overlap_end.date()}]\n"
+        f"VIX mean={vix_ol['VP'].mean():.2f}  VS mean={vs_ol['VP'].mean():.2f}  "
+        f"Corr={vix_ol['VP'].corr(vs_ol['VP'].reindex(vix_ol.index)):.3f}"
+    )
+    ax.legend(fontsize=9)
+    ax.set_ylim(-250, 400)
+    ax.xaxis.set_major_locator(mdates.YearLocator(2))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+    # ── Row 2: IVar time series ───────────────────────────────────────────────
+    ax = axes[1]
+    _label_crises(ax, s, e)
+    ax.plot(vix_ol.index, vix_ol["IVar"], color="steelblue",
+            lw=0.7, alpha=0.85, label="IVar (VIX²/12)")
+    ax.plot(vs_ol.index,  vs_ol["IVar"],  color="darkorange",
+            lw=0.7, alpha=0.85, label="IVar (VS²/12)")
+    ax.set_ylabel("Implied Variance (%² monthly)")
+    ax.set_title(
+        f"Implied Variance: VIX²/12 vs VS²/12  "
+        f"[VIX mean={vix_ol['IVar'].mean():.2f}  VS mean={vs_ol['IVar'].mean():.2f}  "
+        f"Ratio={vix_ol['IVar'].mean()/vs_ol['IVar'].mean():.3f}]"
+    )
+    ax.legend(fontsize=9)
+    ax.set_ylim(-10, 600)
+    ax.xaxis.set_major_locator(mdates.YearLocator(2))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+    # ── Row 3: Monthly MZ-R² from each production loop ───────────────────────
+    ax = axes[2]
+    diag_vix_ol = diag_vix[diag_vix.index >= overlap_start]
+    diag_vs_ol  = diag_vs[diag_vs.index  >= overlap_start]
+
+    ax.plot(diag_vix_ol.index, diag_vix_ol["mz_r2"], color="steelblue",
+            lw=1.2, marker="o", markersize=2, label="MZ-R² (VIX-based HAR)")
+    ax.plot(diag_vs_ol.index,  diag_vs_ol["mz_r2"],  color="darkorange",
+            lw=1.2, marker="o", markersize=2, label="MZ-R² (VS-based HAR)")
+    ax.axhline(PAPER_OOS["mz_r2"], color="firebrick", lw=1, ls="--",
+               label=f"Paper OOS R²={PAPER_OOS['mz_r2']:.3f}")
+    ax.axhline(0, color="black", lw=0.4)
+    ax.set_ylabel("Monthly MZ-R²  (12-month trailing window)")
+    ax.set_title(
+        f"Forecast R² over time: VIX-based HAR vs VS-based HAR  "
+        f"[mean VIX={diag_vix_ol['mz_r2'].mean():.3f}  "
+        f"mean VS={diag_vs_ol['mz_r2'].mean():.3f}]"
+    )
+    ax.legend(fontsize=9)
+    ax.xaxis.set_major_locator(mdates.YearLocator(2))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+    plt.tight_layout()
+    path = OUTPUT / "vrp_comparison_vix_vs.png"
+    plt.savefig(path, dpi=150)
+    plt.close()
+    return path
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SUMMARY MARKDOWN
 # ══════════════════════════════════════════════════════════════════════════════
@@ -596,6 +672,7 @@ def write_results_md(
     metrics_paper_har, metrics_full_har,
     metrics_paper_mart, metrics_full_mart,
     ret_paper, ret_full,
+    prod_vs=None, diag_vs=None,
 ):
     kill_paper = int(diag_paper["kill_switch"].sum()) if len(diag_paper) else 0
     kill_full  = int(diag_full["kill_switch"].sum())  if len(diag_full)  else 0
@@ -634,7 +711,7 @@ def write_results_md(
         "",
         "| Step | Description |",
         "|------|-------------|",
-        "| **1** | Implied variance: SPX 1-month variance swap data (from 2008); VIX²/12 for earlier dates |",
+        "| **1** | Implied variance: VIX²/12 throughout (monthly %²-units) |",
         "| **2** | Physical RV: rolling 22-day sum of daily squared returns (daily-sq proxy) |",
         "| **3** | HAR-RV-VIX (Model 8) out-of-sample fit: train up to 75% split date |",
         "| **4** | VRP = IVar − CV (implied variance minus fitted conditional variance) |",
@@ -801,9 +878,62 @@ def write_results_md(
         "| `oos_metrics.csv` | RMSE/MAE/MAPE comparison table |",
         "| `production_loop_paper.csv` | Day-by-day production loop results |",
         "| `production_loop_full.csv` | Day-by-day production loop results, full |",
+        "| `production_loop_vs.csv` | Day-by-day production loop results, VS-based |",
+        "| `production_loop_vs.parquet` | VS-based production loop (parquet) |",
         "| `dm_diagnostics_paper.csv` | Monthly DM statistics |",
-        "| `return_pred_paper.csv` | Return predictability regression results |",
+        "| `vrp_comparison_vix_vs.png` | VRP/IVar/MZ-R² comparison: VIX vs VS |",
     ]
+
+    # ── VIX vs VS comparison section ─────────────────────────────────────────
+    if prod_vs is not None and diag_vs is not None:
+        overlap_start = prod_vs.index.min()
+        overlap_end   = min(prod_full.index.max(), prod_vs.index.max())
+        vix_ol = prod_full.loc[overlap_start:overlap_end]
+        vs_ol  = prod_vs.loc[overlap_start:overlap_end]
+        dv_ol  = diag_vs[diag_vs.index >= overlap_start]
+        df_ol  = diag_full[diag_full.index >= overlap_start]
+        corr   = vix_ol["VP"].corr(vs_ol["VP"].reindex(vix_ol.index))
+        lines += [
+            "",
+            "---",
+            "",
+            "## 9. VIX-based vs VS-based VRP Comparison",
+            "",
+            f"Overlap period: {overlap_start.date()} – {overlap_end.date()}  "
+            f"({len(vs_ol):,} trading days)",
+            "",
+            "### Implied Variance (IVar = X²/12)",
+            "",
+            "| Statistic | VIX²/12 | VS²/12 | Ratio |",
+            "|-----------|--------:|-------:|------:|",
+            f"| Mean | {vix_ol['IVar'].mean():.3f} | {vs_ol['IVar'].mean():.3f} | {vix_ol['IVar'].mean()/vs_ol['IVar'].mean():.3f} |",
+            f"| Median | {vix_ol['IVar'].median():.3f} | {vs_ol['IVar'].median():.3f} | {vix_ol['IVar'].median()/vs_ol['IVar'].median():.3f} |",
+            f"| Std | {vix_ol['IVar'].std():.3f} | {vs_ol['IVar'].std():.3f} | — |",
+            "",
+            "### Variance Risk Premium (VP = IVar − CV)",
+            "",
+            "| Statistic | VIX-VRP | VS-VRP |",
+            "|-----------|--------:|-------:|",
+            f"| Mean | {vix_ol['VP'].mean():.3f} | {vs_ol['VP'].mean():.3f} |",
+            f"| Median | {vix_ol['VP'].median():.3f} | {vs_ol['VP'].median():.3f} |",
+            f"| Std | {vix_ol['VP'].std():.3f} | {vs_ol['VP'].std():.3f} |",
+            f"| % VP > 0 | {(vix_ol['VP']>0).mean()*100:.1f}% | {(vs_ol['VP']>0).mean()*100:.1f}% |",
+            f"| Correlation (VIX-VRP vs VS-VRP) | {corr:.4f} | — |",
+            "",
+            "### HAR Forecast Quality (Monthly MZ-R², 12-month trailing window)",
+            "",
+            "| Statistic | VIX-based HAR | VS-based HAR |",
+            "|-----------|:-------------:|:------------:|",
+            f"| Mean MZ-R² | {df_ol['mz_r2'].mean():.4f} | {dv_ol['mz_r2'].mean():.4f} |",
+            f"| Median MZ-R² | {df_ol['mz_r2'].median():.4f} | {dv_ol['mz_r2'].median():.4f} |",
+            f"| % months R² > 0.3 | {(df_ol['mz_r2']>0.3).mean()*100:.1f}% | {(dv_ol['mz_r2']>0.3).mean()*100:.1f}% |",
+            f"| Kill switches triggered | {int(df_ol['kill_switch'].sum())}/{len(df_ol)} | {int(dv_ol['kill_switch'].sum())}/{len(dv_ol)} |",
+            "",
+            "**Note:** VIX runs ~2.7% higher than VS in vol terms (~5.5% higher in variance terms).",
+            "Since CV (HAR forecast of physical RV) is nearly identical under both,",
+            "the entire IVar gap passes through to VRP: VIX-VRP exceeds VS-VRP by ~1.9 variance units on average.",
+            "The correlation between the two VRP series is high (>0.96), preserving signal direction.",
+        ]
 
     text = "\n".join(lines)
     path = OUTPUT / "EXPERIMENT_RESULTS.md"
@@ -944,13 +1074,38 @@ def main():
         y_te_f, oos_full["y_hat"], metrics_f_har,
         mart_full.reindex(y_te_f.index), metrics_f_mart, "full")
 
-    plot_production_loop(prod_paper, diag_paper, "paper")
-    plot_production_loop(prod_full,  diag_full,  "full")
+    plot_production_loop(prod_paper, "paper")
+    plot_production_loop(prod_full,  "full")
 
     plot_dm_diagnostics(diag_paper, "paper")
     plot_dm_diagnostics(diag_full,  "full")
 
     # Return predictability plots moved to Experiment 2.
+
+    # ── VS-based parallel run (pure VS²/12, ~2008 onwards) ───────────────────
+    print("\n[VS] Building VS-based panel (pure VS²/12, no VIX fallback)…")
+    panel_vs = build_panel_vs()
+    print(f"    VS panel: {panel_vs.shape[0]:,} obs  "
+          f"({panel_vs.index.min().date()} – {panel_vs.index.max().date()})")
+
+    print("  Running VS production loop…")
+    prod_vs = production_loop(panel_vs, ROLL_WIN)
+    prod_vs.to_csv(OUTPUT / "production_loop_vs.csv")
+    prod_vs.to_parquet(OUTPUT / "production_loop_vs.parquet")
+
+    print("  Running VS monthly diagnostics…")
+    diag_vs = run_monthly_diagnostics(prod_vs, panel_vs)
+    diag_vs.to_csv(OUTPUT / "dm_diagnostics_vs.csv")
+
+    overlap_start = prod_vs.index.min()
+    vix_ol = prod_full.loc[overlap_start:]
+    vs_ol  = prod_vs
+    print(f"    VS VRP mean={vs_ol['VP'].mean():.3f}  "
+          f"VIX VRP mean (overlap)={vix_ol['VP'].mean():.3f}  "
+          f"Corr={vix_ol['VP'].corr(vs_ol['VP'].reindex(vix_ol.index)):.4f}")
+
+    print("  Generating VIX vs VS comparison plot…")
+    plot_vrp_comparison(prod_full, prod_vs, diag_full, diag_vs)
 
     # ── Summary markdown ──────────────────────────────────────────────────────
     print("\n[10] Writing EXPERIMENT_RESULTS.md…")
@@ -963,6 +1118,7 @@ def main():
         metrics_p_har, metrics_f_har,
         metrics_p_mart, metrics_f_mart,
         ret_paper, ret_full,
+        prod_vs=prod_vs, diag_vs=diag_vs,
     )
 
     print(f"\nAll outputs saved to {OUTPUT}/")

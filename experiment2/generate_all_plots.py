@@ -35,15 +35,15 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.gridspec as gridspec
 import matplotlib.ticker as mticker
-import matplotlib.patches as mpatches
-import matplotlib.lines as mlines
 
-ROOT    = Path(__file__).parent
-OUTPUT  = ROOT / "output"
-DIR_UNI = OUTPUT / "univariate_vrp"
-DIR_BIV = OUTPUT / "bivariate"
-DIR_CMP = OUTPUT / "comparisons"
-for d in [DIR_UNI, DIR_BIV, DIR_CMP]:
+ROOT              = Path(__file__).parent
+OUTPUT            = ROOT / "output"
+DIR_RW            = OUTPUT / "rolling_window"
+DIR_RW_VRP        = DIR_RW / "VRP"
+DIR_RW_TERM_SLOPE = DIR_RW / "VRP + Term Slope"
+DIR_RW_VVIX_MA5   = DIR_RW / "VRP + VVIX MA5"
+DIR_RW_CMP        = DIR_RW / "comparisons"
+for d in [DIR_RW_VRP, DIR_RW_TERM_SLOPE, DIR_RW_VVIX_MA5, DIR_RW_CMP]:
     d.mkdir(parents=True, exist_ok=True)
 
 sys.path.insert(0, str(ROOT.parent / "bh_replication"))
@@ -138,79 +138,6 @@ for t in THRESHOLDS:
             POS[(m, t, di)] = pos
             SIM[(m, t, di)] = (st, sim)
 
-# ════════════════════════════════════════════════════════════════════════════
-# HELPER: individual model detail (5-row: return + 4 position panels)
-# ════════════════════════════════════════════════════════════════════════════
-def plot_model_detail(model, t_threshold, out_path):
-    meta    = MODEL_META[model]
-    palette = meta["palette"]
-
-    fig = plt.figure(figsize=(15, 17))
-    fig.suptitle(
-        f"{meta['label']}\n"
-        f"{meta['subtitle']}  |  Significance gate {t_label(t_threshold)}\n"
-        "Strictly out-of-sample  ·  Training labels end 20 days before prediction  ·  "
-        "0.05% slippage per trade",
-        fontsize=11, y=0.998,
-    )
-    gs = gridspec.GridSpec(5, 1, height_ratios=[2.8, 1, 1, 1, 1],
-                           hspace=0.35, top=0.93, bottom=0.04,
-                           left=0.08, right=0.97)
-    ax_ret  = fig.add_subplot(gs[0])
-    ax_poss = [fig.add_subplot(gs[i + 1]) for i in range(4)]
-
-    # Set shared x-range manually (no sharex — keeps tick labels independent)
-    xlim = (s_dt, e_dt)
-    for ax in [ax_ret] + ax_poss:
-        ax.set_xlim(*xlim)
-
-    # Return panel
-    shade(ax_ret)
-    ax_ret.plot(bah_sim["cum_net"].index, bah_sim["cum_net"].values,
-                color=BAH_COLOR, lw=1.2, ls="-.", alpha=0.55,
-                label=f"Buy-and-Hold  [SR={bah_st['sharpe']:.2f}  "
-                      f"DD={bah_st['max_dd']*100:.1f}%  "
-                      f"Total={bah_st['total_ret']*100:.0f}%]")
-    for di in range(4):
-        st, sim = SIM[(model, t_threshold, di)]
-        ax_ret.plot(sim["cum_net"].index, sim["cum_net"].values,
-                    color=palette[di], lw=1.8 - di * 0.15,
-                    ls=LINESTYLE[di], alpha=0.92,
-                    label=(f"{DELTA_LBL[di]}  "
-                           f"[SR={st['sharpe']:.2f}  "
-                           f"DD={st['max_dd']*100:.1f}%  "
-                           f"Total={st['total_ret']*100:.0f}%  "
-                           f"Trades={st['n_trades']}]"))
-    ax_ret.axhline(1, color="black", lw=0.4, ls=":")
-    ax_ret.set_yscale("log")
-    ax_ret.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.1f}x"))
-    ax_ret.set_ylabel("Cumulative Net Return (log)", fontsize=9)
-    ax_ret.legend(fontsize=8, loc="upper left")
-
-    # Position panels
-    for di, ax_p in enumerate(ax_poss):
-        st, _ = SIM[(model, t_threshold, di)]
-        pos   = POS[(model, t_threshold, di)]
-        shade(ax_p)
-        ax_p.fill_between(pos.index, pos.where(pos == 1, 0), 0,
-                          color=palette[di], alpha=0.75)
-        ax_p.fill_between(pos.index, pos.where(pos == -1, 0), 0,
-                          color=palette[di], alpha=0.35, hatch="///")
-        ax_p.axhline(0, color="black", lw=0.4)
-        ax_p.set_ylim(-1.5, 1.5)
-        ax_p.set_yticks([-1, 0, 1])
-        ax_p.set_yticklabels(["Short", "Flat", "Long"], fontsize=7)
-        ax_p.set_ylabel(DELTA_LBL[di], fontsize=8.5, rotation=0,
-                        ha="right", va="center", labelpad=55, color=palette[di])
-        ann = (f"Long {st['pct_long']:.1f}%   Short {st['pct_short']:.1f}%   "
-               f"Flat {st['pct_flat']:.1f}%   AvgPos={st['avg_position']:+.3f}")
-        ax_p.text(0.01, 0.88, ann, transform=ax_p.transAxes,
-                  fontsize=7.5, va="top", color=palette[di])
-
-    setup_year_axis([ax_ret] + ax_poss)
-    fig.savefig(out_path, dpi=155, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {out_path.name}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -395,88 +322,11 @@ def plot_comparison(t_threshold, out_path):
     print(f"  Saved: {out_path.name}")
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# HELPER: performance stats bar chart
-# ════════════════════════════════════════════════════════════════════════════
-def plot_perf_stats(t_threshold, out_path):
-    METRICS = [
-        ("total_ret",    "Total Return (%)",                              100, False),
-        ("ann_ret",      "Annualised Return (%)",                         100, False),
-        ("sharpe",       "Sharpe Ratio (0% risk-free)",                     1, False),
-        ("max_dd",       "Max Drawdown (%)",                               100, True ),
-        ("avg_position", "Average Position\n(-1 short / 0 flat / +1 long)", 1, False),
-    ]
-    N_D = 4
-    BAR_W = 0.18
-    GROUP_GAP = 0.85
-    DELTA_OFF = np.linspace(-(N_D - 1) / 2, (N_D - 1) / 2, N_D) * BAR_W
-    GROUP_X   = np.arange(len(MODELS)) * GROUP_GAP
-
-    fig, axes = plt.subplots(len(METRICS), 1, figsize=(13, 18),
-                             gridspec_kw={"hspace": 0.55})
-    fig.suptitle(
-        f"Experiment 2 — Performance Statistics  |  {t_label(t_threshold)}\n"
-        "Base VRP (univariate)  |  Model A (VRP + VIX Slope)  |  Model C (VRP + VVIX MA5)\n"
-        "Rolling 500-day OOS OLS  ·  0.05% slippage per trade",
-        fontsize=11, y=0.998,
-    )
-
-    for ax, (metric, ylabel, scale, invert) in zip(axes, METRICS):
-        for mi, m in enumerate(MODELS):
-            cols = MODEL_META[m]["palette"]
-            for di in range(N_D):
-                st, _ = SIM[(m, t_threshold, di)]
-                val  = st[metric] * scale
-                xpos = GROUP_X[mi] + DELTA_OFF[di]
-                ax.bar(xpos, val, width=BAR_W * 0.92, color=cols[di],
-                       edgecolor="white", lw=0.4,
-                       label=DELTA_LBL[di] if mi == 0 else "_nolegend_")
-                fmt = (f"{val:.1f}%" if metric not in ("sharpe", "avg_position")
-                       else f"{val:.3f}")
-                off = 0.5 if val >= 0 else -0.5
-                ax.text(xpos, val + off, fmt, ha="center",
-                        va="bottom" if val >= 0 else "top",
-                        fontsize=5.5, color="#333333", rotation=90)
-
-        bv = bah_st[metric] * scale
-        ax.axhline(bv, color=BAH_COLOR, lw=1.4, ls="--", alpha=0.55,
-                   label=f"Buy-and-Hold ({bv:.1f}"
-                         + ("%" if metric not in ("sharpe", "avg_position") else "") + ")")
-        ax.axhline(0, color="black", lw=0.5)
-        ax.set_xticks(GROUP_X)
-        ax.set_xticklabels([MODEL_LBL[m] for m in MODELS], fontsize=10)
-        ax.set_xlim(GROUP_X[0] - GROUP_GAP * 0.55, GROUP_X[-1] + GROUP_GAP * 0.55)
-        ax.set_ylabel(ylabel, fontsize=9)
-        if invert:
-            ax.invert_yaxis()
-        if metric == METRICS[0][0]:
-            handles = [mpatches.Patch(color=MODEL_META["Base"]["palette"][di],
-                                      label=DELTA_LBL[di]) for di in range(N_D)]
-            handles += [mlines.Line2D([], [], color=BAH_COLOR, lw=1.4, ls="--",
-                                      label="Buy-and-Hold")]
-            ax.legend(handles=handles, title="Threshold (d)", fontsize=8,
-                      title_fontsize=8, loc="upper right", ncol=3)
-        if metric == "avg_position":
-            for mi, m in enumerate(MODELS):
-                for di in range(N_D):
-                    st, _ = SIM[(m, t_threshold, di)]
-                    xpos = GROUP_X[mi] + DELTA_OFF[di]
-                    ax.text(xpos, min(st["avg_position"] - 0.03, -0.05),
-                            f"L{st['pct_long']:.0f}/S{st['pct_short']:.0f}",
-                            ha="center", va="top", fontsize=5,
-                            color="#555555", rotation=90)
-        ax.grid(axis="y", alpha=0.25, lw=0.6)
-        ax.spines[["top", "right"]].set_visible(False)
-
-    fig.savefig(out_path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {out_path.name}")
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # HELPER: monthly VRP signal
 # ════════════════════════════════════════════════════════════════════════════
-def plot_monthly(out_detail, out_perf):
+def plot_monthly(out_detail):
     M_PAL = ["#08306b", "#2171b5", "#6baed6", "#9ecae1"]
     m_sims, m_poss = [], []
     for di, delta in enumerate(DELTAS):
@@ -553,73 +403,22 @@ def plot_monthly(out_detail, out_perf):
     plt.close(fig)
     print(f"  Saved: {out_detail.name}")
 
-    # Perf bar chart
-    METRICS = [
-        ("total_ret",    "Total Return (%)",               100, False),
-        ("ann_ret",      "Annualised Return (%)",           100, False),
-        ("sharpe",       "Sharpe Ratio (0% risk-free)",       1, False),
-        ("max_dd",       "Max Drawdown (%)",                100, True ),
-        ("avg_position", "Avg Position (+1 long / -1 short)", 1, False),
-    ]
-    fig2, axes = plt.subplots(len(METRICS), 1, figsize=(10, 16),
-                              gridspec_kw={"hspace": 0.55})
-    fig2.suptitle(
-        "Monthly VRP Signal — Performance Statistics\n"
-        "Rolling 60-month OOS OLS  |  Significance gate |t| > 1.28  |  0.05% slippage",
-        fontsize=11, y=0.998,
-    )
-    xpos = np.arange(4)
-    for ax, (metric, ylabel, scale, invert) in zip(axes, METRICS):
-        vals = [m_sims[di][0][metric] * scale for di in range(4)]
-        ax.bar(xpos, vals, width=0.55, color=M_PAL, edgecolor="white", lw=0.5)
-        for xi, v in zip(xpos, vals):
-            fmt = f"{v:.1f}%" if metric not in ("sharpe", "avg_position") else f"{v:.3f}"
-            ax.text(xi, v + (0.3 if v >= 0 else -0.3), fmt,
-                    ha="center", va="bottom" if v >= 0 else "top",
-                    fontsize=8, color="#333333")
-        bv = bah_st[metric] * scale
-        ax.axhline(bv, color=BAH_COLOR, lw=1.4, ls="--", alpha=0.6,
-                   label=f"Buy-and-Hold ({bv:.1f}"
-                         + ("%" if metric not in ("sharpe", "avg_position") else "") + ")")
-        ax.axhline(0, color="black", lw=0.5)
-        ax.set_xticks(xpos)
-        ax.set_xticklabels(DELTA_LBL, fontsize=9)
-        ax.set_ylabel(ylabel, fontsize=9)
-        ax.legend(fontsize=8, loc="upper right")
-        if invert:
-            ax.invert_yaxis()
-        ax.grid(axis="y", alpha=0.25, lw=0.6)
-        ax.spines[["top", "right"]].set_visible(False)
-        if metric == "avg_position":
-            for di in range(4):
-                st = m_sims[di][0]
-                ax.text(di, min(vals[di] - 0.03, -0.04),
-                        f"L{st['pct_long']:.0f}/S{st['pct_short']:.0f}",
-                        ha="center", va="top", fontsize=7, color="#555555")
-    fig2.savefig(out_perf, dpi=155, bbox_inches="tight")
-    plt.close(fig2)
-    print(f"  Saved: {out_perf.name}")
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # RUN ALL
 # ════════════════════════════════════════════════════════════════════════════
-print("\n--- univariate_vrp/ ---")
-plot_model_detail("Base", 1.96, DIR_UNI / "base_daily_t196.png")
-plot_model_detail("Base", 1.28, DIR_UNI / "base_daily_t128.png")
-plot_threshold_comparison("Base", DIR_UNI / "base_threshold_comparison.png")
-plot_monthly(DIR_UNI / "monthly_vrp.png", DIR_UNI / "monthly_vrp_perf.png")
+print("\n--- rolling_window/VRP/ ---")
+plot_threshold_comparison("Base", DIR_RW_VRP / "base_threshold_comparison.png")
+plot_monthly(DIR_RW_VRP / "monthly_vrp.png")
 
-print("\n--- bivariate/ ---")
-for m, tag in [("Model_A", "model_a"), ("Model_C", "model_c")]:
-    plot_model_detail(m, 1.96, DIR_BIV / f"{tag}_t196.png")
-    plot_model_detail(m, 1.28, DIR_BIV / f"{tag}_t128.png")
-    plot_threshold_comparison(m, DIR_BIV / f"{tag}_threshold_comparison.png")
+print("\n--- rolling_window/VRP + Term Slope/ ---")
+plot_threshold_comparison("Model_A", DIR_RW_TERM_SLOPE / "model_a_threshold_comparison.png")
 
-print("\n--- comparisons/ ---")
-plot_comparison(1.96, DIR_CMP / "all_models_t196.png")
-plot_comparison(1.28, DIR_CMP / "all_models_t128.png")
-plot_perf_stats(1.96, DIR_CMP / "perf_stats_t196.png")
-plot_perf_stats(1.28, DIR_CMP / "perf_stats_t128.png")
+print("\n--- rolling_window/VRP + VVIX MA5/ ---")
+plot_threshold_comparison("Model_C", DIR_RW_VVIX_MA5 / "model_c_threshold_comparison.png")
+
+print("\n--- rolling_window/comparisons/ ---")
+plot_comparison(1.96, DIR_RW_CMP / "all_models_t196.png")
+plot_comparison(1.28, DIR_RW_CMP / "all_models_t128.png")
 
 print("\nAll done.")

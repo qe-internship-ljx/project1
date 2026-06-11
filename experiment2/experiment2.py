@@ -67,7 +67,9 @@ VRP_OUT = ROOT.parent / "vrp_experiment" / "output"
 
 BH_DIR = ROOT.parent / "bh_replication"
 sys.path.insert(0, str(BH_DIR))
+sys.path.insert(0, str(ROOT.parent))
 from har_model import _nw_se          # Newey-West SE helper from bh_replication
+from fh_replication.fh_replication import compute_vix_term_slope  # FH (2019) cross-sectional model
 
 NW_LAGS_20 = 20   # for 20-day overlapping returns
 ROLL_WIN   = 500  # rolling regression window (trading days)
@@ -177,37 +179,45 @@ def load_vix_spot() -> pd.Series:
     return vix
 
 
+def load_vix_basis() -> pd.Series:
+    """
+    Daily VIX basis = front VIX futures price − VIX spot.
+    Front contract is the nearest-expiry VX contract with tts >= 0.
+    Returns pd.Series indexed by date.
+    """
+    sec_meta = pd.read_parquet(DATA / "VolatilityIndexFuture_security_meta.parquet")
+    hist     = pd.read_parquet(DATA / "VolatilityIndexFuture_historical.parquet")
+
+    vx_secs = sec_meta[sec_meta["curve_group"] == "VX"][
+        ["security", "last_trade_date"]].copy()
+    vx_secs["last_trade_date"] = pd.to_datetime(vx_secs["last_trade_date"])
+
+    vx_hist = hist[hist["security"].isin(set(vx_secs["security"]))].copy()
+    vx_hist["date"] = pd.to_datetime(vx_hist["date"])
+    vx = vx_hist.merge(vx_secs, on="security")
+    vx["tts"] = np.busday_count(
+        vx["date"].values.astype("datetime64[D]"),
+        vx["last_trade_date"].values.astype("datetime64[D]"),
+    )
+    vx = vx[vx["tts"] >= 0]
+
+    front_price = (vx.sort_values(["date", "tts"])
+                     .groupby("date")["price"].first())
+    front_price.index = pd.to_datetime(front_price.index)
+    front_price.index.name = "date"
+
+    spot = load_vix_spot()
+    basis = front_price - spot
+    basis.name = "vix_basis"
+    return basis
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # STEP 2 — VIX Term Structure Slope
+# Sourced from fh_replication (Fassas & Hourvouliades, 2019) — see
+# fh_replication/fh_replication.py for the full implementation.
 # ═══════════════════════════════════════════════════════════════════════════
-
-def compute_vix_term_slope(vx_df: pd.DataFrame) -> pd.Series:
-    """
-    For each trading day, fit a cross-sectional OLS:
-        VIX_future_price_{i,t} = α_t + s_t · TtM_{i,t} + ε_{i,t}
-
-    Returns daily series of slopes s_t (VIX points per year of TtM).
-    Positive slope = contango; negative slope = backwardation.
-
-    Requires at least 3 contracts per day for a meaningful regression.
-    """
-    slopes = {}
-    for date, grp in vx_df.groupby("date"):
-        grp = grp.dropna(subset=["price", "ttm_years"])
-        if len(grp) < 3:
-            continue
-        y = grp["price"].values
-        X = add_constant(grp["ttm_years"].values)
-        try:
-            res = OLS(y, X).fit()
-            slopes[date] = float(res.params[1])
-        except Exception:
-            continue
-
-    slope_series = pd.Series(slopes, name="term_slope")
-    slope_series.index.name = "date"
-    return slope_series.sort_index()
-
+# compute_vix_term_slope is imported from fh_replication.fh_replication above.
 
 # ═══════════════════════════════════════════════════════════════════════════
 # STEP 3 — Equity Trend Quotient (200-day SMA)
@@ -326,21 +336,6 @@ def run_bivariate_regressions(panel: pd.DataFrame) -> dict:
 
     results["Model_C"] = _ols_nw(y, sub[["VP", "vvix_ma5"]])
     results["Model_C"]["vars"] = ["const", "VP", "vvix_ma5"]
-
-    # Return predictability at longer horizons
-    for h in [1, 3, 6, 12]:
-        ret_m   = (sub["daily_ret"] + 1).resample("ME").prod() - 1
-        log_m   = np.log1p(ret_m)
-        fwd_h   = log_m.rolling(h).sum().shift(-h)
-        fwd_h_ann = (np.exp(fwd_h) - 1) * (12.0 / h) * 100.0
-        monthly_vp = sub["VP"].resample("ME").last()
-        monthly_df = pd.DataFrame({"VP": monthly_vp, "ret_fwd": fwd_h_ann}).dropna()
-        if len(monthly_df) < 20:
-            continue
-        nwl   = max(3, 2 * h)
-        r_uni = _ols_nw(monthly_df["ret_fwd"], monthly_df[["VP"]], nlags=nwl)
-        r_uni["vars"] = ["const", "VP"]
-        results[f"RetPred_h{h}m"] = r_uni
 
     return results
 
@@ -892,43 +887,6 @@ def plot_position_history(pos_dict: dict, panel: pd.DataFrame) -> Path:
     return path
 
 
-def plot_return_predictability(reg_results: dict) -> Path:
-    """Bar chart of VRP coefficient and t-stat at each monthly horizon."""
-    horizons = [h for h in [1, 3, 6, 12] if f"RetPred_h{h}m" in reg_results]
-    if not horizons:
-        return None
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    xlbls = [f"{h}m" for h in horizons]
-
-    coefs   = [reg_results[f"RetPred_h{h}m"]["params"].get("VP", np.nan) for h in horizons]
-    tstats  = [reg_results[f"RetPred_h{h}m"]["t_stat"].get("VP", np.nan) for h in horizons]
-    adj_r2s = [reg_results[f"RetPred_h{h}m"]["adj_r2"] for h in horizons]
-
-    axes[0].bar(xlbls, coefs, color="steelblue", alpha=0.7)
-    axes[0].axhline(0, color="black", lw=0.5)
-    axes[0].set_title("VRP Coefficient (annualised return ~ VRP, monthly obs)")
-    axes[0].set_ylabel("Coefficient")
-
-    axes[1].bar(xlbls, tstats,
-                color=["steelblue" if abs(t) >= 1.96 else "salmon" for t in tstats],
-                alpha=0.7)
-    axes[1].axhline(1.96,  color="grey", ls="--", lw=0.8, label="±1.96")
-    axes[1].axhline(-1.96, color="grey", ls="--", lw=0.8)
-    axes[1].set_title("VRP t-statistic (Newey-West)")
-    axes[1].set_ylabel("t-stat")
-    axes[1].legend(fontsize=8)
-
-    axes[2].bar(xlbls, [max(0, r) for r in adj_r2s], color="steelblue", alpha=0.7)
-    axes[2].set_title("Adj. R² (VRP predicting annualised equity return)")
-    axes[2].set_ylabel("Adj. R²")
-
-    plt.suptitle("Return Predictability: VRP → Forward Equity Returns (Monthly Obs.)")
-    plt.tight_layout()
-    path = OUTPUT / "return_predictability.png"
-    plt.savefig(path, dpi=150)
-    plt.close()
-    return path
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1049,32 +1007,6 @@ def write_results_md(panel: pd.DataFrame,
         "",
         "---",
         "",
-        "## Return Predictability (VRP → Forward Equity Returns)",
-        "",
-        "Monthly observations, VRP predicting annualised future equity returns.",
-        "Newey-West SEs (max(3, 2h) lags). * p<0.10, ** p<0.05, *** p<0.01",
-        "",
-        "| Horizon | VRP Coef | NW-SE | t-stat | Adj R² | n |",
-        "|---------|--------:|------:|-------:|-------:|---|",
-    ]
-    for h in [1, 3, 6, 12]:
-        key = f"RetPred_h{h}m"
-        if key not in reg_results:
-            lines.append(f"| {h}m | — | — | — | — | — |")
-            continue
-        r = reg_results[key]
-        coef = r["params"].get("VP", np.nan)
-        se   = r["nw_se"].get("VP", np.nan)
-        t    = r["t_stat"].get("VP", np.nan)
-        sig  = "***" if abs(t) > 2.58 else ("**" if abs(t) > 1.96 else
-               ("*" if abs(t) > 1.645 else ""))
-        lines.append(f"| {h}m | {coef:.4f} | {se:.4f} | {t:.3f}{sig} | "
-                     f"{r['adj_r2']:.4f} | {r['n']} |")
-
-    lines += [
-        "",
-        "---",
-        "",
         "## Step 6: Logic Gate Signal Statistics",
         "",
     ]
@@ -1120,7 +1052,6 @@ def write_results_md(panel: pd.DataFrame,
         "| `cumulative_returns.png` | Cumulative net returns (main strategies) |",
         "| `all_cumulative_returns.png` | All strategies including regression-based |",
         "| `position_history.png` | Long / short / flat history for main strategies |",
-        "| `return_predictability.png` | VRP → horizon returns bar charts |",
         "| `signals.csv` | Full panel with all daily signals |",
         "| `regression_results.csv` | Coefficient table for all models |",
         "| `strategy_performance.csv` | Daily P&L for all strategies |",
@@ -1295,7 +1226,6 @@ def main():
                              if k in sim_dict})
     plot_all_cumulative_returns(sim_dict)
     plot_position_history(pos_dict, panel_overlap)
-    plot_return_predictability(reg_results)
 
     # ── Results markdown ───────────────────────────────────────────────────
     print("\n[9] Writing EXPERIMENT_RESULTS.md…")

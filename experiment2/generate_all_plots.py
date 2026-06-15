@@ -35,6 +35,8 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.gridspec as gridspec
 import matplotlib.ticker as mticker
+from statsmodels.regression.linear_model import OLS
+from statsmodels.tools import add_constant
 
 ROOT              = Path(__file__).parent
 OUTPUT            = ROOT / "output"
@@ -45,6 +47,8 @@ DIR_RW_VVIX_MA5   = DIR_RW / "VRP + VVIX MA5"
 DIR_RW_CMP        = DIR_RW / "comparisons"
 for d in [DIR_RW_VRP, DIR_RW_TERM_SLOPE, DIR_RW_VVIX_MA5, DIR_RW_CMP]:
     d.mkdir(parents=True, exist_ok=True)
+CACHE_DIR = OUTPUT / "regression_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 sys.path.insert(0, str(ROOT.parent / "bh_replication"))
 sys.path.insert(0, str(ROOT))
@@ -55,6 +59,7 @@ from experiment2 import (
     run_monthly_vrp_positions,
     compute_buy_and_hold, simulate_strategy, compute_performance_stats,
 )
+from har_model import _nw_se
 
 # ── Build panel once ──────────────────────────────────────────────────────────
 print("Building panel...")
@@ -91,9 +96,99 @@ MODEL_LBL = {"Base": "Base (VRP only)",
              "Model_A": "Model A (VRP+Slope)",
              "Model_C": "Model C (VRP+VVIX)"}
 
+MODEL_FEATURES = {
+    "Base":    ["VP"],
+    "Model_A": ["VP", "term_slope"],
+    "Model_C": ["VP", "vvix_ma5"],
+}
+PRED_LABELS = {"VP": "VRP", "term_slope": "Term Slope", "vvix_ma5": "VVIX MA5"}
+
 def t_label(t):
     ci = "95" if t == 1.96 else "80"
     return f"|t| > {t:.2f}  ({ci}% CI)"
+
+
+def compute_rolling_betas_series(model, panel, window=500, nw_lags=20):
+    """Rolling 500-day OLS at each prediction step: beta, t-stat, in-sample R² time series."""
+    feat_cols = MODEL_FEATURES[model]
+    cache_key = f"rw_betas_{model}_w{window}.parquet"
+    cache_path = CACHE_DIR / cache_key
+
+    required = ([f"beta_{j+1}" for j in range(len(feat_cols))]
+                + [f"t_stat_{j+1}" for j in range(len(feat_cols))]
+                + ["r2_insample"])
+    if cache_path.exists():
+        df = pd.read_parquet(cache_path)
+        if all(c in df.columns for c in required):
+            return df
+        cache_path.unlink()
+
+    print(f"    Computing rolling betas for {model}...")
+    sub = panel.dropna(subset=feat_cols + ["fwd_ret_20"]).copy()
+    N = len(sub)
+    dates, records = [], []
+    for i in range(window + 20, N):
+        train = sub.iloc[i - window - 20 : i - 20]
+        y_tr  = train["fwd_ret_20"]
+        X_tr  = add_constant(train[feat_cols], has_constant="skip")
+        try:
+            res = OLS(y_tr, X_tr).fit()
+            nw  = _nw_se(res, nlags=nw_lags)
+        except Exception:
+            continue
+        row = {"r2_insample": float(res.rsquared)}
+        for j in range(len(feat_cols)):
+            b  = float(res.params.iloc[j + 1])
+            se = float(nw[j + 1])
+            row[f"beta_{j+1}"]   = b
+            row[f"t_stat_{j+1}"] = b / se if se > 0 else 0.0
+        dates.append(sub.index[i])
+        records.append(row)
+
+    df = pd.DataFrame(records, index=dates) if dates else pd.DataFrame()
+    df.to_parquet(cache_path)
+    return df
+
+
+def compute_monthly_betas_series(panel, window=60, nw_lags=3):
+    """Rolling 60-month OLS at each month-end: VRP → next-month return."""
+    cache_key = "rw_betas_Monthly_w60.parquet"
+    cache_path = CACHE_DIR / cache_key
+    if cache_path.exists():
+        df = pd.read_parquet(cache_path)
+        if "beta_1" in df.columns and "t_stat_1" in df.columns:
+            return df
+        cache_path.unlink()
+
+    print("    Computing monthly rolling betas for VRP...")
+    monthly_vrp = panel["VP"].resample("ME").last()
+    monthly_ret = (panel["daily_ret"] + 1).resample("ME").prod() - 1
+    df_m = pd.DataFrame({"VRP": monthly_vrp, "ret": monthly_ret}).dropna()
+    df_m["fwd_ret"] = df_m["ret"].shift(-1)
+    df_m = df_m.dropna()
+    N = len(df_m)
+    dates, records = [], []
+    for i in range(window, N):
+        train = df_m.iloc[i - window : i]
+        y_tr  = train["fwd_ret"]
+        X_tr  = add_constant(train[["VRP"]], has_constant="skip")
+        try:
+            res = OLS(y_tr, X_tr).fit()
+            nw  = _nw_se(res, nlags=nw_lags)
+        except Exception:
+            continue
+        b  = float(res.params.iloc[1])
+        se = float(nw[1])
+        records.append({
+            "beta_1":      b,
+            "t_stat_1":    b / se if se > 0 else 0.0,
+            "r2_insample": float(res.rsquared),
+        })
+        dates.append(df_m.index[i])
+    df = pd.DataFrame(records, index=dates) if dates else pd.DataFrame()
+    df.to_parquet(cache_path)
+    return df
+
 
 # ── BAH reference ─────────────────────────────────────────────────────────────
 bah_pos = compute_buy_and_hold(daily_ret)
@@ -144,24 +239,72 @@ for t in THRESHOLDS:
 # HELPER: threshold comparison for one model (two columns)
 # ════════════════════════════════════════════════════════════════════════════
 def plot_threshold_comparison(model, out_path):
-    meta    = MODEL_META[model]
-    palette = meta["palette"]
+    meta      = MODEL_META[model]
+    palette   = meta["palette"]
+    feat_cols = MODEL_FEATURES[model]
+    betas_df  = compute_rolling_betas_series(model, panel)
+    pred_lbls = [PRED_LABELS.get(c, c) for c in feat_cols]
 
-    fig = plt.figure(figsize=(22, 18))
+    fig = plt.figure(figsize=(22, 21))
     fig.suptitle(
         f"{meta['label']} — Significance Threshold Comparison\n"
         f"{meta['subtitle']}  ·  0.05% slippage  ·  Strictly out-of-sample\n"
         "Left: |t| > 1.96 (95% CI)   |   Right: |t| > 1.28 (80% CI)",
         fontsize=12, y=0.998,
     )
-    gs = gridspec.GridSpec(5, 2, height_ratios=[2.8, 1, 1, 1, 1],
+    gs = gridspec.GridSpec(6, 2, height_ratios=[2.8, 1.2, 1, 1, 1, 1],
                            hspace=0.35, wspace=0.06,
                            top=0.93, bottom=0.04, left=0.06, right=0.98)
     xlim = (s_dt, e_dt)
 
+    # ── t-stat / beta / R² panel (spans both columns) ────────────────────────
+    ax_t = fig.add_subplot(gs[1, :])
+    ax_t.set_xlim(*xlim)
+    shade(ax_t)
+    if len(betas_df) > 0:
+        ax_t.plot(betas_df.index, betas_df["t_stat_1"].values,
+                  color=palette[0], lw=1.0, alpha=0.85,
+                  label=f"NW t-stat: {pred_lbls[0]} (20-lag HAC)")
+        if len(feat_cols) > 1 and "t_stat_2" in betas_df.columns:
+            ax_t.plot(betas_df.index, betas_df["t_stat_2"].values,
+                      color=palette[2], lw=1.0, alpha=0.85, ls="--",
+                      label=f"NW t-stat: {pred_lbls[1]} (20-lag HAC)")
+        ax_t.fill_between(betas_df.index, -1.28, 1.28,
+                          color="firebrick", alpha=0.05, label="Below 80% gate (flat zone)")
+    ax_t.axhline( 1.96, color="firebrick",  lw=1.2, ls="--", label="|t| = 1.96 (95% CI gate)")
+    ax_t.axhline(-1.96, color="firebrick",  lw=1.2, ls="--")
+    ax_t.axhline( 1.28, color="darkorange", lw=1.2, ls=":",  label="|t| = 1.28 (80% CI gate)")
+    ax_t.axhline(-1.28, color="darkorange", lw=1.2, ls=":")
+    ax_t.axhline(0, color="black", lw=0.5, ls=":")
+    ax_t.set_ylabel("NW t-stat (500-day rolling)", fontsize=9)
+    ax_t.grid(axis="y", alpha=0.2, lw=0.6)
+    ax_t.spines[["top", "right"]].set_visible(False)
+
+    ax_t2 = ax_t.twinx()
+    if len(betas_df) > 0:
+        ax_t2.plot(betas_df.index, betas_df["beta_1"].values,
+                   color="dimgrey", lw=1.0, ls="--", alpha=0.60,
+                   label=f"Beta: {pred_lbls[0]}")
+        if len(feat_cols) > 1 and "beta_2" in betas_df.columns:
+            ax_t2.plot(betas_df.index, betas_df["beta_2"].values,
+                       color="dimgrey", lw=1.0, ls=":", alpha=0.60,
+                       label=f"Beta: {pred_lbls[1]}")
+        if "r2_insample" in betas_df.columns:
+            ax_t2.plot(betas_df.index, betas_df["r2_insample"].values,
+                       color="forestgreen", lw=0.9, ls=":", alpha=0.75,
+                       label="In-sample R²")
+    ax_t2.axhline(0, color="dimgrey", lw=0.4, ls=":")
+    ax_t2.set_ylabel("Beta / R²", fontsize=8, color="dimgrey")
+    ax_t2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
+    ax_t2.spines["top"].set_visible(False)
+
+    lines1, labs1 = ax_t.get_legend_handles_labels()
+    lines2, labs2 = ax_t2.get_legend_handles_labels()
+    ax_t.legend(lines1 + lines2, labs1 + labs2, fontsize=8, loc="upper left")
+
     for col, t in enumerate(THRESHOLDS):
         ax_ret  = fig.add_subplot(gs[0, col])
-        ax_poss = [fig.add_subplot(gs[i + 1, col]) for i in range(4)]
+        ax_poss = [fig.add_subplot(gs[i + 2, col]) for i in range(4)]
         for ax in [ax_ret] + ax_poss:
             ax.set_xlim(*xlim)
 
@@ -211,6 +354,7 @@ def plot_threshold_comparison(model, out_path):
 
         setup_year_axis([ax_ret] + ax_poss)
 
+    setup_year_axis([ax_t])
     fig.savefig(out_path, dpi=155, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {out_path.name}")
@@ -341,10 +485,11 @@ def plot_monthly(out_detail):
         m_poss.append(pos)
         m_sims.append((st, sim))
 
+    betas_df = compute_monthly_betas_series(panel)
     xlim = (s_dt, e_dt)
 
     # Detail figure
-    fig = plt.figure(figsize=(15, 17))
+    fig = plt.figure(figsize=(15, 20))
     fig.suptitle(
         "Monthly VRP Signal — Base Model (Univariate VRP)\n"
         "Rolling 60-month OLS: VRP → next-month return  |  "
@@ -353,12 +498,13 @@ def plot_monthly(out_detail):
         "0.05% slippage",
         fontsize=11, y=0.998,
     )
-    gs = gridspec.GridSpec(5, 1, height_ratios=[2.8, 1, 1, 1, 1],
+    gs = gridspec.GridSpec(6, 1, height_ratios=[2.8, 1.2, 1, 1, 1, 1],
                            hspace=0.35, top=0.93, bottom=0.04,
                            left=0.08, right=0.97)
     ax_ret  = fig.add_subplot(gs[0])
-    ax_poss = [fig.add_subplot(gs[i + 1]) for i in range(4)]
-    for ax in [ax_ret] + ax_poss:
+    ax_t    = fig.add_subplot(gs[1])
+    ax_poss = [fig.add_subplot(gs[i + 2]) for i in range(4)]
+    for ax in [ax_ret, ax_t] + ax_poss:
         ax.set_xlim(*xlim)
 
     shade(ax_ret)
@@ -380,6 +526,39 @@ def plot_monthly(out_detail):
     ax_ret.set_ylabel("Cumulative Net Return (log)", fontsize=9)
     ax_ret.legend(fontsize=8, loc="upper left")
 
+    # ── t-stat / beta / R² panel ──────────────────────────────────────────────
+    shade(ax_t)
+    if len(betas_df) > 0:
+        ax_t.plot(betas_df.index, betas_df["t_stat_1"].values,
+                  color=M_PAL[0], lw=1.0, alpha=0.85,
+                  label="NW t-stat: VRP (3-lag HAC, monthly)")
+        ax_t.fill_between(betas_df.index, -1.28, 1.28,
+                          color="firebrick", alpha=0.05, label="Below 80% gate (flat zone)")
+    ax_t.axhline( 1.28, color="firebrick", lw=1.2, ls="--", label="|t| = 1.28 (80% CI gate)")
+    ax_t.axhline(-1.28, color="firebrick", lw=1.2, ls="--")
+    ax_t.axhline(0, color="black", lw=0.5, ls=":")
+    ax_t.set_ylabel("NW t-stat (monthly VRP, 60-month window)", fontsize=9)
+    ax_t.grid(axis="y", alpha=0.2, lw=0.6)
+    ax_t.spines[["top", "right"]].set_visible(False)
+
+    ax_t2 = ax_t.twinx()
+    if len(betas_df) > 0:
+        ax_t2.plot(betas_df.index, betas_df["beta_1"].values,
+                   color="dimgrey", lw=1.0, ls="--", alpha=0.60,
+                   label="Beta: VRP")
+        if "r2_insample" in betas_df.columns:
+            ax_t2.plot(betas_df.index, betas_df["r2_insample"].values,
+                       color="forestgreen", lw=0.9, ls=":", alpha=0.75,
+                       label="In-sample R²")
+    ax_t2.axhline(0, color="dimgrey", lw=0.4, ls=":")
+    ax_t2.set_ylabel("Beta / R²", fontsize=8, color="dimgrey")
+    ax_t2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
+    ax_t2.spines["top"].set_visible(False)
+
+    lines1, labs1 = ax_t.get_legend_handles_labels()
+    lines2, labs2 = ax_t2.get_legend_handles_labels()
+    ax_t.legend(lines1 + lines2, labs1 + labs2, fontsize=8, loc="upper left")
+
     for di, (ax_p, pos) in enumerate(zip(ax_poss, m_poss)):
         st = m_sims[di][0]
         shade(ax_p)
@@ -398,7 +577,7 @@ def plot_monthly(out_detail):
         ax_p.text(0.01, 0.88, ann, transform=ax_p.transAxes,
                   fontsize=7.5, va="top", color=M_PAL[di])
 
-    setup_year_axis([ax_ret] + ax_poss)
+    setup_year_axis([ax_ret, ax_t] + ax_poss)
     fig.savefig(out_detail, dpi=155, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {out_detail.name}")
@@ -408,17 +587,17 @@ def plot_monthly(out_detail):
 # RUN ALL
 # ════════════════════════════════════════════════════════════════════════════
 print("\n--- rolling_window/VRP/ ---")
-plot_threshold_comparison("Base", DIR_RW_VRP / "base_threshold_comparison.png")
-plot_monthly(DIR_RW_VRP / "monthly_vrp.png")
+plot_threshold_comparison("Base", DIR_RW_VRP / "symmetric_VRP.png")
+plot_monthly(DIR_RW_VRP / "monthly_VRP.png")
 
 print("\n--- rolling_window/VRP + Term Slope/ ---")
-plot_threshold_comparison("Model_A", DIR_RW_TERM_SLOPE / "model_a_threshold_comparison.png")
+plot_threshold_comparison("Model_A", DIR_RW_TERM_SLOPE / "symmetric_VRP_+_Term_Slope.png")
 
 print("\n--- rolling_window/VRP + VVIX MA5/ ---")
-plot_threshold_comparison("Model_C", DIR_RW_VVIX_MA5 / "model_c_threshold_comparison.png")
+plot_threshold_comparison("Model_C", DIR_RW_VVIX_MA5 / "symmetric_VRP_+_VVIX_MA5.png")
 
 print("\n--- rolling_window/comparisons/ ---")
-plot_comparison(1.96, DIR_RW_CMP / "all_models_t196.png")
-plot_comparison(1.28, DIR_RW_CMP / "all_models_t128.png")
+plot_comparison(1.96, DIR_RW_CMP / "symmetric_comparisons_t196.png")
+plot_comparison(1.28, DIR_RW_CMP / "symmetric_comparisons_t128.png")
 
 print("\nAll done.")

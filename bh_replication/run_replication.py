@@ -3,17 +3,16 @@ run_replication.py
 ==================
 Master script for the Bekaert & Hoerova (2014) replication.
 
-Steps:
-  1. Load panel of daily SP500 returns and VIX
-  2. Estimate Model 8 (HAR-RV-VIX) over:
-       (a) Paper sample  1990-01-02 – 2010-10-01
-       (b) Full sample   1990-01-02 – 2026-02-28
-  3. Out-of-sample (OOS) Mincer-Zarnowitz analysis
-       Paper splits: 75% (train end = 2005-07-15) — matching B&H exactly
-  4. Variance risk premium series: VP = VIX²/12 − fitted CV
-  5. Predictive regressions for SP500 excess returns (as in Table 4)
-  6. Rolling in-sample R² over time
-  7. Save all outputs to /output/
+Produces two combined output images (one per formulation):
+
+  bh_vix_summary.png
+    Top:    Predicted VRP time series with long-run mean ± 1σ
+    Bottom: Table of IS adj-R², OOS MZ-R², and per-variable beta / NW-SE / t-stat
+
+  bh_vs_summary.png
+    Same layout but using the pure VS²/12 formulation.
+    VS regression starts only from when VS data is first available.
+    VIX data is NEVER mixed into the VS model.
 
 Paper benchmarks (Table 3, Model 8):
   OOS  RMSE = 46.077  MAE = 16.856  MAPE = 0.347  R² = 0.555
@@ -23,7 +22,7 @@ Paper benchmarks (Table 3, Model 8):
 import warnings
 warnings.filterwarnings("ignore")
 
-import sys, os
+import sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -37,12 +36,16 @@ from statsmodels.stats.sandwich_covariance import cov_hac
 
 sys.path.insert(0, str(Path(__file__).parent))
 from data_prep import build_panel, load_sp500_returns, load_vix, compute_rv_components
-from har_model import estimate_har, out_of_sample_forecast, rolling_r2, NW_LAGS
+from har_model import estimate_har, out_of_sample_forecast, NW_LAGS
 
-OUTPUT = Path(__file__).parent / "output"
+DATA_DIR = Path(__file__).parent.parent / "data"
+OUTPUT   = Path(__file__).parent / "output"
 OUTPUT.mkdir(exist_ok=True)
 
-# ── Paper benchmarks ──────────────────────────────────────────────────────────
+PAPER_START = "1990-01-02"
+PAPER_END   = "2010-10-01"
+PAPER_SPLIT = "2005-07-15"   # 75% split matching B&H
+
 PAPER_COEFS = {
     "const":    3.730,
     "VIX2_lag": 0.108,
@@ -50,376 +53,265 @@ PAPER_COEFS = {
     "RV5_lag":  0.330,
     "RV1_lag":  0.107,
 }
-PAPER_NW_SE = {
-    "const":    1.903,
-    "VIX2_lag": 0.072,
-    "RV22_lag": 0.096,
-    "RV5_lag":  0.117,
-    "RV1_lag":  0.026,
-}
 PAPER_OOS = {"rmse": 46.077, "mae": 16.856, "mape": 0.347, "mz_r2": 0.555}
-PAPER_IS_RMSE = 10.508
 
-# ── Date windows ─────────────────────────────────────────────────────────────
-PAPER_START  = "1990-01-02"
-PAPER_END    = "2010-10-01"
-PAPER_SPLIT  = "2005-07-15"   # 75% split
-FULL_END     = None            # all available data
 
 # ─────────────────────────────────────────────────────────────────────────────
-def fmt_coef_table(res: dict) -> str:
-    """Format coefficient table as a string."""
-    lines = [
-        f"\n{'Variable':<14} {'Coef':>10} {'NW-SE':>10} {'t-stat':>9}  "
-        f"{'Paper Coef':>11} {'Paper SE':>10}",
-        "-" * 68,
+# Data loaders
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_vs_panel() -> pd.DataFrame:
+    """
+    Build panel using VS²/12 as the implied-variance predictor.
+    Only rows where VS data exists are included; VIX is never used.
+    """
+    # SP500 returns and RV components
+    sp_ret = load_sp500_returns()
+    rv     = compute_rv_components(sp_ret)
+
+    # Variance swap 1m SPX (pure VS, no fallback to VIX)
+    vs_raw = pd.read_csv(DATA_DIR / "EquityIndexVarianceSwapData.csv",
+                         parse_dates=["DATE"])
+    vs = (vs_raw[(vs_raw["UNDERLYING"] == "SPX") & (vs_raw["TENOR_MONTHS"] == 1.0)]
+          .sort_values("DATE")
+          .set_index("DATE")["IMPLIED_VOLATILITY"])
+    vs.index.name = "date"
+
+    vs2 = (vs ** 2 / 12.0).rename("VS2")
+
+    panel = rv.join(vs2, how="inner").dropna()
+    panel["RV22_fwd"] = panel["RV22"].shift(-22)
+    # Name the implied-variance lag 'VIX2_lag' so estimate_har() works directly.
+    # The column contains VS²/12 data — the name is a structural label only.
+    panel["VIX2_lag"] = panel["VS2"].shift(1)
+    panel["RV22_lag"] = panel["RV22"].shift(1)
+    panel["RV5_lag"]  = panel["RV5"].shift(1)
+    panel["RV1_lag"]  = panel["RV1"].shift(1)
+    return panel.dropna()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plotting
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _label_crises(ax, start, end):
+    crises = [
+        ("Gulf War",      "1990-08-01", "1991-03-01"),
+        ("Asian/LTCM",    "1997-07-01", "1999-01-01"),
+        ("9/11",          "2001-09-01", "2001-12-01"),
+        ("GFC",           "2007-06-01", "2009-06-01"),
+        ("COVID",         "2020-02-01", "2020-06-01"),
     ]
-    for v in ["const", "VIX2_lag", "RV22_lag", "RV5_lag", "RV1_lag"]:
-        pc  = PAPER_COEFS.get(v, float("nan"))
-        pse = PAPER_NW_SE.get(v, float("nan"))
-        lines.append(
-            f"  {v:<12} {res['params'][v]:>10.4f} {res['nw_se'][v]:>10.4f}"
-            f" {res['t_stats'][v]:>9.3f}  {pc:>11.3f} {pse:>10.3f}"
-        )
-    return "\n".join(lines)
+    for lbl, s, e in crises:
+        s, e = pd.Timestamp(s), pd.Timestamp(e)
+        if e < start or s > end:
+            continue
+        ax.axvspan(max(s, start), min(e, end), alpha=0.09,
+                   color="grey", linewidth=0)
 
 
-def run_predictive_regression(
+def plot_bh_formulation_summary(
     panel: pd.DataFrame,
-    sp500_ret: pd.Series,
-    horizon: int,
-) -> dict:
+    res_is: dict,
+    res_oos: dict,
+    formulation: str,          # "VIX" or "VS"
+    ivar_col: str,             # column in panel holding IVar (e.g. "VIX2" or "VS2")
+    ivar_lag_label: str,       # display label for lag predictor
+    output_path: Path,
+) -> Path:
     """
-    Regress horizon-average excess returns on VP and CV (Table 4 replication).
-    horizon in months (1, 3, 12), matching B&H Table 4 convention.
-    Uses end-of-month observations with Newey-West SEs (max(3, 2*h) lags).
+    Two-panel figure:
+      Top:    Predicted VRP over time with long-run mean ± 1σ
+      Bottom: Results table (IS adj-R², OOS MZ-R², betas, t-stats)
     """
-    # Build monthly VP/CV panel (end-of-month)
-    monthly = panel.resample("ME").last()[["VP", "CV"]].dropna()
+    # Compute VRP = IVar - CV (using full-sample IS fitted values)
+    panel = panel.copy()
+    panel["CV"] = res_is["fitted"]
+    panel["VP"] = panel[ivar_col] - panel["CV"]
 
-    # Monthly compounded SP500 return (decimal), then h-month forward average
-    sp_m = sp500_ret.resample("ME").agg(lambda x: (1 + x).prod() - 1)
-    log_sp = np.log(1 + sp_m)
-    # Annualised forward return: sum of next h log-returns, then annualised
-    fwd_log = log_sp.rolling(horizon).sum().shift(-horizon)
-    fwd_ann = (np.exp(fwd_log) - 1) * (12.0 / horizon) * 100.0
+    vrp_mean = float(panel["VP"].mean())
+    vrp_std  = float(panel["VP"].std())
+    s, e     = panel.index[0], panel.index[-1]
 
-    monthly["ret_fwd"] = fwd_ann
-    monthly = monthly.dropna()
+    fig = plt.figure(figsize=(14, 13))
+    gs  = fig.add_gridspec(2, 1, height_ratios=[1.6, 1.0], hspace=0.35)
+    ax_vrp = fig.add_subplot(gs[0])
+    ax_tbl = fig.add_subplot(gs[1])
 
-    if len(monthly) < 20:
-        return {"horizon": horizon, "n": 0}
+    # ── Top: VRP time series ─────────────────────────────────────────────────
+    _label_crises(ax_vrp, s, e)
+    ax_vrp.fill_between(panel.index, panel["VP"], 0,
+                        where=(panel["VP"] >= 0), color="steelblue",
+                        alpha=0.55, label="VRP > 0")
+    ax_vrp.fill_between(panel.index, panel["VP"], 0,
+                        where=(panel["VP"] < 0), color="salmon",
+                        alpha=0.55, label="VRP < 0")
+    ax_vrp.axhline(0, color="black", lw=0.5)
+    ax_vrp.axhline(vrp_mean, color="navy", lw=1.6, ls="--",
+                   label=f"Long-run mean = {vrp_mean:.2f}")
+    ax_vrp.axhline(vrp_mean + vrp_std, color="steelblue", lw=1.1, ls=":",
+                   label=f"+1σ  ({vrp_mean + vrp_std:.2f})")
+    ax_vrp.axhline(vrp_mean - vrp_std, color="salmon", lw=1.1, ls=":",
+                   label=f"−1σ  ({vrp_mean - vrp_std:.2f})")
+    ax_vrp.set_ylabel("VRP = IVar − CV  (%² monthly)", fontsize=9)
+    ax_vrp.set_title(
+        f"Predicted Variance Risk Premium — HAR-RV-{formulation}  "
+        f"[{s.date()} – {e.date()}]",
+        fontsize=10,
+    )
+    ax_vrp.legend(fontsize=8, loc="upper right", ncol=2)
+    ax_vrp.set_ylim(-280, 520)
+    step = 5 if (e - s).days > 5000 else 2
+    ax_vrp.xaxis.set_major_locator(mdates.YearLocator(step))
+    ax_vrp.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
 
-    y  = monthly["ret_fwd"]
-    X  = add_constant(monthly[["VP"]])
-    X2 = add_constant(monthly[["VP", "CV"]])
+    # ── Bottom: results table ────────────────────────────────────────────────
+    ax_tbl.axis("off")
 
-    nw_lags = max(3, 2 * horizon)
-    res  = OLS(y, X).fit()
-    nw   = np.sqrt(np.diag(cov_hac(res,  nlags=nw_lags)))
-    res2 = OLS(y, X2).fit()
-    nw2  = np.sqrt(np.diag(cov_hac(res2, nlags=nw_lags)))
+    var_names   = ["const", "VIX2_lag", "RV22_lag", "RV5_lag", "RV1_lag"]
+    var_display = ["const", ivar_lag_label, "RV(22) β^m", "RV(5) β^w", "RV(1) β^d"]
 
-    return {
-        "horizon": horizon,
-        "n":       len(monthly),
-        "univariate": {
-            "params": dict(zip(X.columns,  res.params)),
-            "nw_se":  dict(zip(X.columns,  nw)),
-            "t_stat": dict(zip(X.columns,  res.params / nw)),
-            "adj_r2": res.rsquared_adj,
-        },
-        "bivariate": {
-            "params": dict(zip(X2.columns, res2.params)),
-            "nw_se":  dict(zip(X2.columns, nw2)),
-            "t_stat": dict(zip(X2.columns, res2.params / nw2)),
-            "adj_r2": res2.rsquared_adj,
-        },
-    }
+    NCOLS = 5
+    paper_col_hdr = "Paper coef" if formulation == "VIX" else "—"
+
+    # Summary rows (padded to NCOLS)
+    summary_data = [
+        ["Metric",    "In-Sample (full)",           "Out-of-Sample (75% split)", "", ""],
+        ["Adj-R²",    f"{res_is['adj_r2']:.4f}",    "—",                         "", ""],
+        ["RMSE",      f"{res_is['rmse_is']:.3f}",   f"{res_oos['oos_rmse']:.3f}","", ""],
+        ["MZ-R²",     "—",                           f"{res_oos['oos_mz_r2']:.4f}","",""],
+        ["n obs",     f"{res_is['n']:,}",
+                      f"train {res_oos['n_train']:,} / test {res_oos['n_test']:,}", "", ""],
+    ]
+
+    coef_header = ["Variable", "Beta (IS)", "NW-SE", "t-stat (NW)", paper_col_hdr]
+    coef_rows = [coef_header]
+    for vn, vd in zip(var_names, var_display):
+        beta  = res_is["params"].get(vn, np.nan)
+        nwse  = res_is["nw_se"].get(vn, np.nan)
+        tstat = res_is["t_stats"].get(vn, np.nan)
+        paper = PAPER_COEFS.get(vn, "—") if formulation == "VIX" else "—"
+        paper_str = f"{paper:.3f}" if isinstance(paper, float) else paper
+        coef_rows.append([vd,
+                          f"{beta:.4f}",
+                          f"{nwse:.4f}",
+                          f"{tstat:.3f}",
+                          paper_str])
+
+    blank_row  = [[""] * NCOLS]
+    all_rows   = summary_data + blank_row + coef_rows
+
+    tbl = ax_tbl.table(
+        cellText=all_rows,
+        loc="center",
+        cellLoc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    tbl.scale(1.15, 1.55)
+
+    # Style header rows
+    for col in range(NCOLS):
+        tbl[0, col].set_facecolor("#d0d8e8")
+        tbl[0, col].set_text_props(fontweight="bold")
+    coef_header_row = len(summary_data) + 1  # +1 for blank row
+    for col in range(NCOLS):
+        tbl[coef_header_row, col].set_facecolor("#d0d8e8")
+        tbl[coef_header_row, col].set_text_props(fontweight="bold")
+
+    ax_tbl.set_title(
+        f"IS/OOS Statistics — HAR-RV-{formulation}   "
+        f"(Newey-West SEs, {NW_LAGS} lags)",
+        fontsize=9, pad=4,
+    )
+
+    plt.suptitle(
+        f"BH Replication — HAR-RV-{formulation} Model",
+        fontsize=11, fontweight="bold",
+    )
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"    Saved {output_path}")
+    return output_path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
     print("=" * 72)
-    print("  Bekaert & Hoerova (2014) Replication — HAR-RV-VIX (Model 8)")
-    print("  Data-constrained: daily squared returns proxy for intraday RV")
+    print("  Bekaert & Hoerova (2014) — HAR-RV-VIX and HAR-RV-VS")
     print("=" * 72)
 
-    # ── 1. Load data ──────────────────────────────────────────────────────────
-    print("\n[1] Building daily panel …")
-    panel_full = build_panel()
-    sp_ret     = load_sp500_returns()
-    vix_raw    = load_vix()
+    # ── VIX formulation ───────────────────────────────────────────────────────
+    print("\n[VIX 1] Building VIX panel (full sample, 1990-present)…")
+    panel_vix = build_panel()     # uses VIX²/12 as implied-variance predictor
 
-    # ── Paper sample ──────────────────────────────────────────────────────────
-    panel_paper = panel_full[
-        (panel_full.index >= PAPER_START) & (panel_full.index <= PAPER_END)
-    ].copy()
+    print(f"    VIX panel: {panel_vix.shape[0]:,} obs  "
+          f"({panel_vix.index.min().date()} – {panel_vix.index.max().date()})")
 
-    print(f"    Full  panel: {panel_full.shape[0]:,} obs  "
-          f"({panel_full.index.min().date()} – {panel_full.index.max().date()})")
-    print(f"    Paper panel: {panel_paper.shape[0]:,} obs  "
-          f"({panel_paper.index.min().date()} – {panel_paper.index.max().date()})")
+    print("[VIX 2] In-sample HAR-RV-VIX estimate…")
+    res_vix_is  = estimate_har(panel_vix, "VIX full-sample IS")
 
-    # ── 2. Full-sample IS regressions ─────────────────────────────────────────
-    print("\n[2] In-sample regressions …")
-    res_paper = estimate_har(panel_paper, label="1990–2010 (paper sample)")
-    res_full  = estimate_har(panel_full,  label="1990–2026 (full sample)")
+    print("[VIX 3] OOS forecast (75% split = 2005-07-15)…")
+    res_vix_oos = out_of_sample_forecast(panel_vix, PAPER_SPLIT, "VIX OOS")
 
-    for res in [res_paper, res_full]:
-        print(f"\n  === {res['label']}  (n={res['n']:,}) ===")
-        print(f"  Adj-R²  : {res['adj_r2']:.4f}  (paper IS benchmark n/a; "
-              f"OOS MZ-R² benchmark = 0.555)")
-        print(f"  RMSE    : {res['rmse_is']:.3f}  (paper IS RMSE = {PAPER_IS_RMSE:.3f})")
-        print(fmt_coef_table(res))
+    print(f"    IS  Adj-R²={res_vix_is['adj_r2']:.4f}  "
+          f"IS  RMSE={res_vix_is['rmse_is']:.3f}")
+    print(f"    OOS MZ-R²={res_vix_oos['oos_mz_r2']:.4f}  "
+          f"OOS RMSE={res_vix_oos['oos_rmse']:.3f}  "
+          f"[paper: MZ-R²=0.555  RMSE=46.077]")
 
-    # ── 3. OOS forecasting — paper's 75% split ────────────────────────────────
-    print("\n[3] Out-of-sample analysis (75% split ending 2005-07-15) …")
-    oos_paper = out_of_sample_forecast(panel_paper, PAPER_SPLIT,
-                                       label="Paper OOS 2005–2010")
-    oos_full  = out_of_sample_forecast(panel_full, PAPER_SPLIT,
-                                       label="Full OOS 2005–2026")
-
-    for oos in [oos_paper, oos_full]:
-        print(f"\n  {oos['label']}  (train={oos['n_train']:,}, test={oos['n_test']:,})")
-        print(f"  IS  Adj-R²  : {oos['is_adj_r2']:.4f}")
-        print(f"  OOS MZ-R²  : {oos['oos_mz_r2']:.4f}  "
-              f"(paper = {PAPER_OOS['mz_r2']:.3f})")
-        print(f"  OOS RMSE   : {oos['oos_rmse']:.3f}  "
-              f"(paper = {PAPER_OOS['rmse']:.3f})")
-        print(f"  OOS MAE    : {oos['oos_mae']:.3f}  "
-              f"(paper = {PAPER_OOS['mae']:.3f})")
-        print(f"  OOS MAPE   : {oos['oos_mape']:.4f}  "
-              f"(paper = {PAPER_OOS['mape']:.3f})")
-
-    # ── 4. VP series & predictive regressions ─────────────────────────────────
-    print("\n[4] Variance risk premium series …")
-    # CV = fitted conditional variance from Model 8 (in-sample)
-    panel_full["CV"]  = res_full["fitted"]
-    panel_paper["CV"] = res_paper["fitted"]
-
-    # VP = VIX²/12 - CV  (both in monthly %² units)
-    panel_full["VP"]  = panel_full["VIX2"]  - panel_full["CV"]
-    panel_paper["VP"] = panel_paper["VIX2"] - panel_paper["CV"]
-
-    print(f"  VP mean (paper sample): {panel_paper['VP'].mean():.3f}")
-    print(f"  CV mean (paper sample): {panel_paper['CV'].mean():.3f}")
-    print(f"  VP mean (full  sample): {panel_full['VP'].mean():.3f}")
-    print(f"  CV mean (full  sample): {panel_full['CV'].mean():.3f}")
-
-    # Stock return predictability (Table 4 replica)
-    print("\n[5] Return predictability (VP & CV -> excess returns) ...")
-    # Pass decimal daily returns (not ×100); annualisation done inside
-    pred_results = {}
-    for h in [1, 3, 12]:
-        pred_results[h] = run_predictive_regression(
-            panel_paper.copy(), sp_ret, horizon=h
-        )
-        if "univariate" not in pred_results[h]:
-            print(f"\n  Horizon {h:>2}m: insufficient data (n={pred_results[h].get('n',0)})")
-            continue
-        uni  = pred_results[h]["univariate"]
-        biv  = pred_results[h]["bivariate"]
-        vp_t = uni["params"]["VP"] / uni["nw_se"]["VP"]
-        print(
-            f"\n  Horizon {h:>2}m (n={pred_results[h]['n']}): "
-            f"VP coef={uni['params']['VP']:.4f} "
-            f"(NW-SE={uni['nw_se']['VP']:.4f}, t={vp_t:.2f}, "
-            f"adj-R2={uni['adj_r2']:.3f}) | "
-            f"bivariate adj-R2={biv['adj_r2']:.3f}"
-        )
-
-    # ── 5. Rolling R² ─────────────────────────────────────────────────────────
-    print("\n[6] Computing rolling R² …")
-    roll_paper = rolling_r2(panel_paper, window=252, step=22)
-    roll_full  = rolling_r2(panel_full,  window=252, step=22)
-
-    # ── 6. Plots ──────────────────────────────────────────────────────────────
-    print("\n[7] Generating plots …")
-    _plot_rv_fit(panel_paper, oos_paper, "paper_sample")
-    _plot_rv_fit(panel_full,  oos_full,  "full_sample")
-    _plot_rolling_r2(roll_paper, roll_full)
-    _plot_vp_cv(panel_paper, "paper_sample")
-    _plot_vp_cv(panel_full,  "full_sample")
-    _plot_forecast_scatter(oos_paper, "paper")
-    _plot_forecast_scatter(oos_full,  "full")
-
-    # ── 7. Save summary CSV ───────────────────────────────────────────────────
-    print("\n[8] Saving summary CSVs …")
-    _save_summaries(res_paper, res_full, oos_paper, oos_full)
-    _save_vp_cv_series(panel_paper, panel_full)
-
-    print(f"\nAll outputs saved to {OUTPUT}/")
-    return {
-        "res_paper": res_paper, "res_full": res_full,
-        "oos_paper": oos_paper, "oos_full": oos_full,
-        "panel_paper": panel_paper, "panel_full": panel_full,
-        "pred_results": pred_results,
-        "roll_paper": roll_paper, "roll_full": roll_full,
-    }
-
-
-# ── Plot helpers ──────────────────────────────────────────────────────────────
-
-def _plot_rv_fit(panel, oos, tag):
-    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=False)
-
-    # Top: actual vs fitted (IS)
-    ax = axes[0]
-    ax.plot(panel.index, panel["RV22_fwd"], color="steelblue",
-            alpha=0.6, linewidth=0.8, label="Actual RV (next 22d)")
-    ax.plot(panel.index, panel["CV"], color="firebrick",
-            alpha=0.8, linewidth=0.8, label="HAR-VIX fitted CV")
-    ax.set_ylabel("Monthly RV (daily-sq proxy, %²)")
-    ax.set_title(f"Model 8 – In-sample fit  [{panel.index.min().date()}–{panel.index.max().date()}]")
-    ax.legend(fontsize=8)
-    ax.xaxis.set_major_locator(mdates.YearLocator(5))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    ax.set_ylim(-20, 300)
-
-    # Bottom: OOS actual vs forecast
-    ax = axes[1]
-    y_te  = oos["y_test"]
-    y_hat = oos["y_hat"]
-    ax.plot(y_te.index,  y_te.values,  color="steelblue",
-            alpha=0.6, linewidth=0.8, label="Actual RV")
-    ax.plot(y_hat.index, y_hat.values, color="darkorange",
-            alpha=0.8, linewidth=0.8, label="HAR-VIX OOS forecast")
-    ax.axvline(pd.Timestamp(oos["train_end"]), color="grey",
-               linestyle="--", linewidth=1, label="Train/test split")
-    ax.set_ylabel("Monthly RV (daily-sq proxy, %²)")
-    ax.set_title(
-        f"Out-of-sample forecast  "
-        f"MZ-R²={oos['oos_mz_r2']:.3f}  RMSE={oos['oos_rmse']:.1f}  "
-        f"[Paper MZ-R²=0.555  RMSE=46.1]"
-    )
-    ax.legend(fontsize=8)
-    ax.xaxis.set_major_locator(mdates.YearLocator(2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    ax.set_ylim(-20, 500)
-
-    plt.tight_layout()
-    plt.savefig(OUTPUT / f"rv_fit_{tag}.png", dpi=150)
-    plt.close()
-
-
-def _plot_rolling_r2(roll_paper, roll_full):
-    fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=False)
-    for ax, roll, title, colour in zip(
-        axes,
-        [roll_paper, roll_full],
-        ["Paper sample (1990–2010)", "Full sample (1990–2026)"],
-        ["steelblue", "darkorange"],
-    ):
-        ax.plot(roll.index, roll["adj_r2"], color=colour, linewidth=1)
-        ax.axhline(0.555, color="firebrick", linestyle="--",
-                   linewidth=1, label="Paper OOS benchmark (0.555)")
-        ax.axhline(roll["adj_r2"].mean(), color="grey", linestyle=":",
-                   linewidth=1, label=f"Mean = {roll['adj_r2'].mean():.3f}")
-        ax.set_ylim(-0.1, 0.85)
-        ax.set_ylabel("Adj R²")
-        ax.set_title(f"Rolling 252-day in-sample Adj-R²  — {title}")
-        ax.legend(fontsize=8)
-        ax.xaxis.set_major_locator(mdates.YearLocator(5))
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-
-    plt.tight_layout()
-    plt.savefig(OUTPUT / "rolling_r2.png", dpi=150)
-    plt.close()
-
-
-def _plot_vp_cv(panel, tag):
-    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
-
-    ax = axes[0]
-    ax.fill_between(panel.index, panel["VP"], 0,
-                    where=panel["VP"] >= 0, color="steelblue",
-                    alpha=0.5, label="VP > 0")
-    ax.fill_between(panel.index, panel["VP"], 0,
-                    where=panel["VP"] < 0, color="salmon",
-                    alpha=0.5, label="VP < 0")
-    ax.axhline(0, color="black", linewidth=0.5)
-    ax.set_ylabel("VP = VIX²/12 − CV  (%²)")
-    ax.set_title(
-        f"Variance Risk Premium (VP)  [{panel.index.min().date()}–{panel.index.max().date()}]"
-    )
-    ax.legend(fontsize=8)
-
-    ax = axes[1]
-    ax.plot(panel.index, panel["CV"], color="darkorange",
-            linewidth=0.8, label="CV (fitted conditional variance)")
-    ax.plot(panel.index, panel["VIX2"], color="steelblue",
-            alpha=0.4, linewidth=0.6, label="VIX²/12")
-    ax.set_ylabel("Variance (%²)")
-    ax.set_title("Conditional Variance (CV) vs VIX²/12")
-    ax.legend(fontsize=8)
-    ax.xaxis.set_major_locator(mdates.YearLocator(5))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-
-    plt.tight_layout()
-    plt.savefig(OUTPUT / f"vp_cv_{tag}.png", dpi=150)
-    plt.close()
-
-
-def _plot_forecast_scatter(oos, tag):
-    y_te  = oos["y_test"]
-    y_hat = oos["y_hat"]
-    fig, ax = plt.subplots(figsize=(7, 7))
-    # Cap display at 99th pct for readability
-    cap = np.percentile(y_te, 99)
-    mask = (y_te <= cap) & (y_hat <= cap)
-    ax.scatter(y_hat[mask], y_te[mask], alpha=0.3, s=4, color="steelblue")
-    m = max(y_hat[mask].max(), y_te[mask].max())
-    ax.plot([0, m], [0, m], "r--", linewidth=1)
-    ax.set_xlabel("Forecast CV")
-    ax.set_ylabel("Actual RV")
-    ax.set_title(
-        f"OOS forecast vs actual  ({tag})\n"
-        f"MZ-R²={oos['oos_mz_r2']:.3f}  RMSE={oos['oos_rmse']:.1f}  "
-        f"[Paper: MZ-R²=0.555  RMSE=46.1]"
-    )
-    plt.tight_layout()
-    plt.savefig(OUTPUT / f"scatter_{tag}.png", dpi=150)
-    plt.close()
-
-
-def _save_summaries(res_paper, res_full, oos_paper, oos_full):
-    rows = []
-    for label, res, oos in [
-        ("1990–2010 (paper)", res_paper, oos_paper),
-        ("1990–2026 (full)",  res_full,  oos_full),
-    ]:
-        rows.append({
-            "sample":        label,
-            "n_obs":         res["n"],
-            "IS_adj_r2":     round(res["adj_r2"], 4),
-            "IS_rmse":       round(res["rmse_is"], 3),
-            "OOS_mz_r2":     round(oos["oos_mz_r2"], 4),
-            "OOS_rmse":      round(oos["oos_rmse"], 3),
-            "OOS_mae":       round(oos["oos_mae"], 3),
-            "OOS_mape":      round(oos["oos_mape"], 4),
-            "paper_OOS_mz_r2": 0.555,
-            "paper_OOS_rmse":  46.077,
-            "r2_penalty":    round(0.555 - oos["oos_mz_r2"], 4),
-        })
-        for v in ["const", "VIX2_lag", "RV22_lag", "RV5_lag", "RV1_lag"]:
-            rows[-1][f"coef_{v}"]   = round(res["params"][v], 4)
-            rows[-1][f"nwse_{v}"]   = round(res["nw_se"][v], 4)
-            rows[-1][f"tstat_{v}"]  = round(res["t_stats"][v], 3)
-            rows[-1][f"paper_{v}"]  = PAPER_COEFS.get(v, np.nan)
-
-    pd.DataFrame(rows).to_csv(OUTPUT / "model8_summary.csv", index=False)
-
-
-def _save_vp_cv_series(panel_paper, panel_full):
-    panel_paper[["VIX2", "CV", "VP", "RV22_fwd"]].to_csv(
-        OUTPUT / "vp_cv_paper_sample.csv"
-    )
-    panel_full[["VIX2", "CV", "VP", "RV22_fwd"]].to_csv(
-        OUTPUT / "vp_cv_full_sample.csv"
+    print("[VIX 4] Generating VIX summary image…")
+    plot_bh_formulation_summary(
+        panel       = panel_vix,
+        res_is      = res_vix_is,
+        res_oos     = res_vix_oos,
+        formulation = "VIX",
+        ivar_col    = "VIX2",
+        ivar_lag_label = "VIX²/12 (α)",
+        output_path = OUTPUT / "bh_vix_summary.png",
     )
 
+    # ── VS formulation ────────────────────────────────────────────────────────
+    # VS panel uses only VS²/12; starts from first VS data point.
+    # No VIX data is used in training or in the implied-variance feature.
+    print("\n[VS 1] Building VS panel (VS-available period only, no VIX)…")
+    panel_vs = _build_vs_panel()
 
-# ─────────────────────────────────────────────────────────────────────────────
+    print(f"    VS panel: {panel_vs.shape[0]:,} obs  "
+          f"({panel_vs.index.min().date()} – {panel_vs.index.max().date()})")
+
+    print("[VS 2] In-sample HAR-RV-VS estimate…")
+    res_vs_is = estimate_har(panel_vs, "VS full-sample IS")
+
+    # 75% split of the VS-available sample
+    vs_split_idx = panel_vs.index[int(0.75 * len(panel_vs))]
+    print(f"    VS OOS split: {vs_split_idx.date()}  (75% of {len(panel_vs)} obs)")
+    res_vs_oos = out_of_sample_forecast(panel_vs, str(vs_split_idx.date()), "VS OOS")
+
+    print(f"    IS  Adj-R²={res_vs_is['adj_r2']:.4f}  "
+          f"IS  RMSE={res_vs_is['rmse_is']:.3f}")
+    print(f"    OOS MZ-R²={res_vs_oos['oos_mz_r2']:.4f}  "
+          f"OOS RMSE={res_vs_oos['oos_rmse']:.3f}")
+
+    # The panel column holding the actual VS²/12 series (needed for VRP plot)
+    # In _build_vs_panel(), VS2 is the column.
+    print("[VS 3] Generating VS summary image…")
+    plot_bh_formulation_summary(
+        panel       = panel_vs,
+        res_is      = res_vs_is,
+        res_oos     = res_vs_oos,
+        formulation = "VS",
+        ivar_col    = "VS2",
+        ivar_lag_label = "VS²/12 (α)",
+        output_path = OUTPUT / "bh_vs_summary.png",
+    )
+
+    print(f"\nOutputs saved to {OUTPUT}/")
+    print("=" * 72)
+
+
 if __name__ == "__main__":
-    results = main()
+    main()

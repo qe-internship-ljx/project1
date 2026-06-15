@@ -96,6 +96,34 @@ def load_vrp_series() -> pd.DataFrame:
     return df[["VP", "CV", "IVar"]].copy()
 
 
+def load_es_open_interest() -> pd.Series:
+    """
+    Total ES open interest (sum across tracked contracts), smoothed with a
+    252-day backward rolling mean. The raw total still shows a quarterly
+    sawtooth because the dataset covers only the front 1-2 contracts: when
+    the expiring contract disappears the new front starts from near-zero,
+    producing the same spike pattern as front-month OI alone. A 252-day
+    rolling mean spans ~4 full roll cycles so the quarterly oscillation
+    averages out, leaving a stable trend-following measure of aggregate
+    market participation with no lookahead.
+    Returns a Series indexed by date, named 'open_interest'.
+    """
+    sec_meta   = pd.read_parquet(DATA / "EquityFuture_security_meta.parquet")
+    hist       = pd.read_parquet(DATA / "EquityFuture_historical.parquet")
+    es_tickers = sec_meta[sec_meta["curve_group"] == "ES"]["security"].tolist()
+    es = hist[hist["security"].isin(es_tickers)].copy()
+    es["date"] = pd.to_datetime(es["date"])
+    total_oi = (
+        es.dropna(subset=["open_interest"])
+          .groupby("date")["open_interest"].sum()
+    )
+    total_oi.index = pd.to_datetime(total_oi.index)
+    total_oi = total_oi.sort_index()
+    smooth_oi = total_oi.rolling(252, min_periods=63).mean()
+    smooth_oi.name = "open_interest"
+    return smooth_oi
+
+
 def load_es_front_month() -> pd.DataFrame:
     """
     Build a continuous S&P 500 E-mini (ES) daily series.
@@ -336,6 +364,9 @@ def run_bivariate_regressions(panel: pd.DataFrame) -> dict:
 
     results["Model_C"] = _ols_nw(y, sub[["VP", "vvix_ma5"]])
     results["Model_C"]["vars"] = ["const", "VP", "vvix_ma5"]
+
+    results["Model_VS"] = _ols_nw(y, sub[["vvix_ma5", "term_slope"]])
+    results["Model_VS"]["vars"] = ["const", "vvix_ma5", "term_slope"]
 
     return results
 

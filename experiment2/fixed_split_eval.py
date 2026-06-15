@@ -306,6 +306,58 @@ def run_expanding_window_rolmu(panel, model, delta, t_threshold=T_THRESH,
     return pos
 
 
+def run_expanding_window_asym(panel, model, t_threshold=T_THRESH,
+                               rolling_window=500):
+    """
+    Expanding window with asymmetric threshold (no delta parameter).
+    At prediction day i:
+        mu500 = mean of fwd_ret_20 over the last `rolling_window` training rows
+        long  when y_hat > mu500   (prediction beats recent historical mean)
+        short when y_hat < 0       (prediction negative, regardless of magnitude)
+        flat  otherwise
+    T-stat gate still applies; only t-stat gated positions enter the signal.
+    """
+    feat_cols = MODEL_FEATURES[model]
+    tag = (f"pos_EW_asym_{model}_t{int(t_threshold*100)}"
+           f"_rw{rolling_window}_oos{OOS_START}.parquet")
+    cache_path = CACHE_DIR / tag
+    if cache_path.exists():
+        s = pd.read_parquet(cache_path).squeeze()
+        s.name = f"pos_EWasym_{model}"
+        return s
+
+    sub = panel.dropna(subset=feat_cols + ["fwd_ret_20"]).copy()
+    N   = len(sub)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_EWasym_{model}")
+
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + 20, oos_idx)
+
+    fwd = sub["fwd_ret_20"].values
+
+    for i in range(start_i, N):
+        train = sub.iloc[0 : i - 20]
+        X_tr  = add_constant(train[feat_cols], has_constant="skip")
+        res   = OLS(train["fwd_ret_20"], X_tr).fit()
+        nw    = _nw_se(res, nlags=NW_LAGS)
+        t_stats = res.params.values[1:] / nw[1:]
+        if not np.all(np.abs(t_stats) > t_threshold):
+            continue
+
+        lo    = max(0, i - 20 - rolling_window)
+        mu500 = float(np.mean(fwd[lo : i - 20]))
+
+        test_row = sub.iloc[[i]][feat_cols].copy()
+        test_row.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test_row).iloc[0])
+
+        if   y_hat > mu500: pos.iloc[i] =  1.0
+        elif y_hat < 0.0:   pos.iloc[i] = -1.0
+
+    pos.to_frame().to_parquet(cache_path)
+    return pos
+
+
 # ── Pre-compute all positions ─────────────────────────────────────────────────
 print("Computing fixed-split positions (fast)...")
 FS  = {}   # (model, di) -> (pos, t_stats, n_train, n_oos)
@@ -503,7 +555,7 @@ def plot_fixed_split_detail(model, out_path):
 # ════════════════════════════════════════════════════════════════════════════
 
 def plot_expanding_detail(model, out_path, ew_dict=None, ew_sim_dict=None,
-                          extra_title=""):
+                          extra_title="", r2_oos=None):
     _ew     = ew_dict     if ew_dict     is not None else EW
     _ew_sim = ew_sim_dict if ew_sim_dict is not None else EW_SIM
     pal       = MODEL_PALETTE[model]
@@ -520,9 +572,10 @@ def plot_expanding_detail(model, out_path, ew_dict=None, ew_sim_dict=None,
         gridspec_kw={"height_ratios": [2.5, 1.2] + [1.0] * n_d, "hspace": 0.35},
     )
     fig.subplots_adjust(top=0.955, bottom=0.03, left=0.10, right=0.93)
+    _r2_str = f"  R²_OOS = {r2_oos:+.4f}" if r2_oos is not None else ""
     fig.suptitle(
         f"{pred_str} -> 20-day Forward Return  "
-        f"(Expanding Window, OOS from {OOS_START}){extra_title}\n"
+        f"(Expanding Window, OOS from {OOS_START}){_r2_str}{extra_title}\n"
         f"Training grows daily; OOS gap = 20 days; "
         f"NW-HAC {NW_LAGS} lags; |t| > {T_THRESH:.2f} gate; 0.05% slippage",
         fontsize=10, y=0.998,
@@ -537,27 +590,64 @@ def plot_expanding_detail(model, out_path, ew_dict=None, ew_sim_dict=None,
     ax_ret.set_xlim(*xlim)
     shade(ax_ret)
 
+    # Find earliest OOS activation across all deltas (stat-window consistency)
+    _activation = None
+    for di in range(n_d):
+        _p = _ew[(model, di)]
+        _p_oos = _p[_p.index >= OOS_START]
+        _active = _p_oos[_p_oos != 0]
+        if len(_active):
+            _cand = _active.index.min()
+            if _activation is None or _cand < _activation:
+                _activation = _cand
+
+    _rebase_start = None
+    if _activation is not None and _activation > pd.Timestamp("2020-01-01"):
+        _bah_idx      = bah_sim.index
+        _act_iloc     = _bah_idx.searchsorted(_activation)
+        _rebase_start = _bah_idx[min(_act_iloc + 1, len(_bah_idx) - 1)]
+
+    _stat_start = _rebase_start if _rebase_start is not None else pd.Timestamp(OOS_START)
+    _stat_lbl   = (f" · stats from {_stat_start.strftime('%Y-%m-%d')}"
+                   if _rebase_start is not None else "")
+
+    _bah_st_plot = compute_performance_stats(
+        bah_sim[bah_sim.index >= _stat_start], "BaH_plot")
     bah_oos = oos_cumret(bah_sim)
     ax_ret.plot(bah_oos.index, bah_oos.values,
                 color=BAH_COLOR, lw=1.5, ls="-.", alpha=0.6,
-                label=(f"Buy-and-Hold  "
-                       f"[SR={bah_st['sharpe']:+.2f}  "
-                       f"ret={bah_st['ann_ret']*100:+.1f}%  "
-                       f"DD={bah_st['max_dd']*100:.1f}%]"))
+                label=(f"Buy-and-Hold{_stat_lbl}  "
+                       f"[SR={_bah_st_plot['sharpe']:+.2f}  "
+                       f"ret={_bah_st_plot['ann_ret']*100:+.1f}%  "
+                       f"DD={_bah_st_plot['max_dd']*100:.1f}%]"))
+
+    if _rebase_start is not None:
+        _bah_from   = bah_sim["net_pnl"][bah_sim.index >= _rebase_start]
+        _bah_act    = (1 + _bah_from).cumprod()
+        _bah_act_st = compute_performance_stats(
+            bah_sim[bah_sim.index >= _rebase_start], "BaH_act")
+        ax_ret.plot(_bah_act.index, _bah_act.values,
+                    color=BAH_COLOR, lw=1.2, ls=":", alpha=0.85,
+                    label=(f"Buy-and-Hold from {_rebase_start.strftime('%Y-%m-%d')}  "
+                           f"[SR={_bah_act_st['sharpe']:+.2f}  "
+                           f"ret={_bah_act_st['ann_ret']*100:+.1f}%  "
+                           f"DD={_bah_act_st['max_dd']*100:.1f}%]"))
 
     for di in range(n_d):
-        st, _ = _ew_sim[(model, di)]
-        cum   = oos_cumret(_ew_sim[(model, di)][1])
+        _, sim_di = _ew_sim[(model, di)]
+        st_plot   = compute_performance_stats(
+            sim_di[sim_di.index >= _stat_start], f"plot_{di}")
+        cum     = oos_cumret(sim_di)
         pos_oos = _ew[(model, di)]
-        pos_oos = pos_oos[pos_oos.index >= OOS_START]
+        pos_oos = pos_oos[pos_oos.index >= _stat_start]
         pL = float((pos_oos ==  1).mean() * 100)
         pS = float((pos_oos == -1).mean() * 100)
         ax_ret.plot(cum.index, cum.values,
                     color=pal[di], lw=1.8, alpha=0.9,
                     label=(f"{DELTA_LBL[di]}  "
-                           f"[SR={st['sharpe']:+.2f}  "
-                           f"ret={st['ann_ret']*100:+.1f}%  "
-                           f"DD={st['max_dd']*100:.1f}%  "
+                           f"[SR={st_plot['sharpe']:+.2f}  "
+                           f"ret={st_plot['ann_ret']*100:+.1f}%  "
+                           f"DD={st_plot['max_dd']*100:.1f}%  "
                            f"L{pL:.0f}%/S{pS:.0f}%]"))
 
     ax_ret.axhline(1, color="black", lw=0.4, ls=":")
@@ -1076,13 +1166,47 @@ def plot_ew_beta_evolution(out_path, models=None):
 # ════════════════════════════════════════════════════════════════════════════
 # RUN ALL
 # ════════════════════════════════════════════════════════════════════════════
+# OOS R² (Campbell-Thompson 2008) from oos_r2_table.py — loaded once, used in plot titles.
+_OOS_R2 = {
+    "Base":        0.004288,
+    "Model_A":     0.022006,
+    "Model_B":    -0.000071,
+    "Model_C":     0.020898,
+    "Model_G":     0.008088,
+    "Model_H":    -0.019053,
+    "Model_VVIX":  0.012834,
+    "Model_Basis": -0.019952,
+}
+
+# Output filenames (symmetric threshold = zero-centred band)
+_SYMMETRIC_NAME = {
+    "Base":     "symmetric_VRP.png",
+    "Model_A":  "symmetric_VRP_+_Term_Slope.png",
+    "Model_B":  "symmetric_VRP_+_Trend.png",
+    "Model_C":  "symmetric_VRP_+_VVIX_MA5.png",
+    "Model_G":  "symmetric_VRP_x_VVIX.png",
+    "Model_H":  "symmetric_VRP_Split.png",
+}
+
+# Output filenames (rolling-mu threshold = benchmark = historical-mean-adjusted band)
+_BASE_RETURN_SHIFT_NAME = {
+    "Base":     "base_return_shift_VRP.png",
+    "Model_A":  "base_return_shift_VRP_+_Term_Slope.png",
+    "Model_B":  "base_return_shift_VRP_+_Trend.png",
+    "Model_C":  "base_return_shift_VRP_+_VVIX_MA5.png",
+    "Model_G":  "base_return_shift_VRP_x_VVIX.png",
+    "Model_H":  "base_return_shift_VRP_Split.png",
+}
+
 print("\n--- expanding_window/ per-model detail plots ---")
-for m, tag in [("Base","base"), ("Model_A","model_a"), ("Model_B","model_b"), ("Model_C","model_c"),
-               ("Model_G","model_g"), ("Model_H","model_h")]:
-    plot_expanding_detail(m, EW_MODEL_DIR[m] / f"{tag}_expanding.png")
+for m in ["Base", "Model_A", "Model_B", "Model_C", "Model_G", "Model_H"]:
+    plot_expanding_detail(
+        m, EW_MODEL_DIR[m] / _SYMMETRIC_NAME[m],
+        r2_oos=_OOS_R2.get(m),
+    )
 
 print("\n--- expanding_window/comparisons/ cross-model ---")
-plot_post2020_comparison(DIR_EW_CMP / "post2020_comparison.png")
+plot_post2020_comparison(DIR_EW_CMP / "symmetric_comparisons.png")
 
 print("\nAll done.")
 
@@ -1113,17 +1237,17 @@ for m in _RM_MODELS:
         EW_RM_SIM[(m, di)] = (st, sim)
 
 print("\n--- expanding_window/ rolling-mu per-model detail plots ---")
-for m, tag in [("Base","base"), ("Model_A","model_a"), ("Model_B","model_b"), ("Model_C","model_c"),
-               ("Model_G","model_g"), ("Model_H","model_h")]:
+for m in ["Base", "Model_A", "Model_B", "Model_C", "Model_G", "Model_H"]:
     plot_expanding_detail(
-        m, EW_MODEL_DIR[m] / f"{tag}_expanding_rolmu.png",
+        m, EW_MODEL_DIR[m] / _BASE_RETURN_SHIFT_NAME[m],
         ew_dict=EW_RM, ew_sim_dict=EW_RM_SIM,
         extra_title=" · Threshold = rolling-avg(20d return) ± δ",
+        r2_oos=_OOS_R2.get(m),
     )
 
 print("\n--- expanding_window/comparisons/ rolling-mu cross-model ---")
 plot_post2020_comparison(
-    DIR_EW_CMP / "post2020_comparison_rolmu.png",
+    DIR_EW_CMP / "base_return_shift_comparisons.png",
     ew_dict=EW_RM, ew_sim_dict=EW_RM_SIM,
 )
 
@@ -1229,9 +1353,10 @@ EW_VVIX_SIM_DICT = {("Model_VVIX", di): EW_VVIX_SIM[di] for di in range(4)}
 
 print("\n--- expanding_window/VVIX MA5/ ---")
 plot_expanding_detail(
-    "Model_VVIX", EW_MODEL_DIR["Model_VVIX"] / "model_vvix_expanding_rolmu.png",
+    "Model_VVIX", EW_MODEL_DIR["Model_VVIX"] / "base_return_shift_VVIX_MA5.png",
     ew_dict=EW_VVIX_DICT, ew_sim_dict=EW_VVIX_SIM_DICT,
     extra_title=" · Threshold = rolling-avg(20d return) ± δ",
+    r2_oos=_OOS_R2.get("Model_VVIX"),
 )
 
 print("\n--- expanding_window/comparisons/ VVIX cross-model ---")
@@ -1280,8 +1405,9 @@ EW_BASIS_SIM_DICT = {("Model_Basis", di): EW_BASIS_SIM[di] for di in range(4)}
 
 print("\n--- expanding_window/VIX Basis/ ---")
 plot_expanding_detail(
-    "Model_Basis", EW_MODEL_DIR["Model_Basis"] / "model_basis_expanding.png",
+    "Model_Basis", EW_MODEL_DIR["Model_Basis"] / "symmetric_VIX_Basis.png",
     ew_dict=EW_BASIS_DICT, ew_sim_dict=EW_BASIS_SIM_DICT,
+    r2_oos=_OOS_R2.get("Model_Basis"),
 )
 
 print("\nAll done (VIX basis).")
@@ -1577,3 +1703,222 @@ def plot_rf_detail(out_path):
 print("\n--- Random Forest expanding window ---")
 plot_rf_detail(DIR_RF / "rf_expanding.png")
 print("\nAll done (Random Forest).")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ASYMMETRIC THRESHOLD — expanding window
+# Long when ŷ > μ₅₀₀ (rolling 500-day mean of actual fwd returns in training)
+# Short when ŷ < 0; Flat otherwise.  T-stat gate still applies.
+# ════════════════════════════════════════════════════════════════════════════
+
+_ASYM_MODELS = ["Base", "Model_A", "Model_C", "Model_VVIX", "Model_G", "Model_H"]
+
+print("\nComputing expanding-window (asymmetric threshold) positions...")
+EW_ASYM     = {}
+EW_ASYM_SIM = {}
+for m in _ASYM_MODELS:
+    print(f"  EW-asym  {m}...")
+    pos = run_expanding_window_asym(panel, m)
+    sim = simulate_strategy(pos, daily_ret)
+    sim_oos = sim[sim.index >= OOS_START]
+    st  = compute_performance_stats(sim_oos, f"EWasym_{m}")
+    oos_pos = pos[pos.index >= OOS_START]
+    st["avg_position"] = float(oos_pos.mean())
+    st["pct_long"]  = float((oos_pos ==  1).mean()) * 100
+    st["pct_short"] = float((oos_pos == -1).mean()) * 100
+    st["pct_flat"]  = float((oos_pos ==  0).mean()) * 100
+    EW_ASYM[m]     = pos
+    EW_ASYM_SIM[m] = (st, sim)
+
+
+def plot_expanding_asymmetric(model, out_path, r2_oos=None):
+    """
+    Two-panel plot for a single asymmetric position series.
+    Panel 1: cumulative net return (strategy vs B&H)
+    Panel 2: NW t-stat and beta over time
+    Panel 3: position over time
+    """
+    pos     = EW_ASYM[model]
+    st, sim = EW_ASYM_SIM[model]
+
+    pal       = MODEL_PALETTE[model]
+    feat_cols = MODEL_FEATURES[model]
+    bivariate = len(feat_cols) >= 2
+    pred_labels = [FEAT_DISPLAY.get(f, f) for f in feat_cols]
+    pred_str    = " + ".join(pred_labels)
+
+    fig, axes = plt.subplots(
+        3, 1,
+        figsize=(14, 13),
+        sharex=True,
+        gridspec_kw={"height_ratios": [2.5, 1.2, 1.0], "hspace": 0.35},
+    )
+    fig.subplots_adjust(top=0.955, bottom=0.03, left=0.10, right=0.93)
+
+    _r2_str = f"  R²_OOS = {r2_oos:+.4f}" if r2_oos is not None else ""
+    fig.suptitle(
+        f"{pred_str} -> 20-day Forward Return  "
+        f"(Expanding Window, OOS from {OOS_START}){_r2_str}\n"
+        f"Asymmetric: Long if ŷ > μ₅₀₀, Short if ŷ < 0  ·  "
+        f"NW-HAC {NW_LAGS} lags; |t| > {T_THRESH:.2f} gate; 0.05% slippage",
+        fontsize=10, y=0.998,
+    )
+
+    ax_ret  = axes[0]
+    ax_tb   = axes[1]
+    ax_p    = axes[2]
+    xlim    = (oos_dt, e_dt)
+
+    # stat-window: if signal first activates after 2020-01-01, stats start there
+    _p_oos  = pos[pos.index >= OOS_START]
+    _active = _p_oos[_p_oos != 0]
+    _activation = _active.index.min() if len(_active) else None
+
+    _rebase_start = None
+    if _activation is not None and _activation > pd.Timestamp("2020-01-01"):
+        _bah_idx      = bah_sim.index
+        _act_iloc     = _bah_idx.searchsorted(_activation)
+        _rebase_start = _bah_idx[min(_act_iloc + 1, len(_bah_idx) - 1)]
+
+    _stat_start = _rebase_start if _rebase_start is not None else pd.Timestamp(OOS_START)
+    _stat_lbl   = (f" · stats from {_stat_start.strftime('%Y-%m-%d')}"
+                   if _rebase_start is not None else "")
+
+    # ── Panel 1: Cumulative Net Return ────────────────────────────────────
+    ax_ret.set_xlim(*xlim)
+    shade(ax_ret)
+
+    _bah_st_plot = compute_performance_stats(
+        bah_sim[bah_sim.index >= _stat_start], "BaH_plot")
+    bah_oos = oos_cumret(bah_sim)
+    ax_ret.plot(bah_oos.index, bah_oos.values,
+                color=BAH_COLOR, lw=1.5, ls="-.", alpha=0.6,
+                label=(f"Buy-and-Hold{_stat_lbl}  "
+                       f"[SR={_bah_st_plot['sharpe']:+.2f}  "
+                       f"ret={_bah_st_plot['ann_ret']*100:+.1f}%  "
+                       f"DD={_bah_st_plot['max_dd']*100:.1f}%]"))
+
+    if _rebase_start is not None:
+        _bah_from   = bah_sim["net_pnl"][bah_sim.index >= _rebase_start]
+        _bah_act    = (1 + _bah_from).cumprod()
+        _bah_act_st = compute_performance_stats(
+            bah_sim[bah_sim.index >= _rebase_start], "BaH_act")
+        ax_ret.plot(_bah_act.index, _bah_act.values,
+                    color=BAH_COLOR, lw=1.2, ls=":", alpha=0.85,
+                    label=(f"Buy-and-Hold from {_rebase_start.strftime('%Y-%m-%d')}  "
+                           f"[SR={_bah_act_st['sharpe']:+.2f}  "
+                           f"ret={_bah_act_st['ann_ret']*100:+.1f}%  "
+                           f"DD={_bah_act_st['max_dd']*100:.1f}%]"))
+
+    st_plot = compute_performance_stats(
+        sim[sim.index >= _stat_start], "plot_asym")
+    cum = oos_cumret(sim)
+    pos_stat = pos[pos.index >= _stat_start]
+    pL = float((pos_stat ==  1).mean() * 100)
+    pS = float((pos_stat == -1).mean() * 100)
+    ax_ret.plot(cum.index, cum.values,
+                color=pal[0], lw=1.8, alpha=0.9,
+                label=(f"Asymmetric{_stat_lbl}  "
+                       f"[SR={st_plot['sharpe']:+.2f}  "
+                       f"ret={st_plot['ann_ret']*100:+.1f}%  "
+                       f"DD={st_plot['max_dd']*100:.1f}%  "
+                       f"L{pL:.0f}%/S{pS:.0f}%]"))
+
+    ax_ret.axhline(1, color="black", lw=0.4, ls=":")
+    ax_ret.set_yscale("log")
+    ax_ret.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}x"))
+    ax_ret.set_ylabel("Cumulative Net Return (log)", fontsize=9)
+    ax_ret.legend(fontsize=8, loc="upper left", framealpha=0.92)
+    ax_ret.grid(axis="y", alpha=0.2, lw=0.6)
+    ax_ret.spines[["top", "right"]].set_visible(False)
+
+    # ── Panel 2: NW t-stat and Beta Over Time ────────────────────────────
+    betas = compute_ew_betas(model)
+    ax_tb.set_xlim(*xlim)
+    shade(ax_tb)
+
+    t_prim = betas["t_VP"]
+    b_prim = betas["beta_VP"]
+    ax_tb.plot(t_prim.index, t_prim.values,
+               color=pal[0], lw=1.0, alpha=0.85,
+               label=f"NW t-stat ({pred_labels[0]})")
+    if bivariate:
+        ax_tb.plot(betas["t_sec"].index, betas["t_sec"].values,
+                   color=pal[1], lw=1.0, alpha=0.85, ls="--",
+                   label=f"NW t-stat ({pred_labels[1]})")
+
+    ax_tb.fill_between(t_prim.index, -T_THRESH, T_THRESH,
+                       color="firebrick", alpha=0.05, label="Below gate (flat zone)")
+    ax_tb.axhline( T_THRESH, color="firebrick", lw=1.2, ls="--",
+                  label=f"|t| = {T_THRESH:.2f} gate")
+    ax_tb.axhline(-T_THRESH, color="firebrick", lw=1.2, ls="--")
+    ax_tb.axhline(0, color="black", lw=0.5, ls=":")
+    ax_tb.set_ylabel(f"NW t-stat ({pred_str})", fontsize=9)
+    ax_tb.grid(axis="y", alpha=0.2, lw=0.6)
+    ax_tb.spines["top"].set_visible(False)
+
+    ax_tb2 = ax_tb.twinx()
+    ax_tb2.plot(b_prim.index, b_prim.values,
+                color="dimgrey", lw=1.0, ls="--", alpha=0.60,
+                label=f"Beta ({pred_labels[0]})")
+    if bivariate:
+        ax_tb2.plot(betas["beta_sec"].index, betas["beta_sec"].values,
+                    color="dimgrey", lw=1.0, ls=":", alpha=0.50,
+                    label=f"Beta ({pred_labels[1]})")
+    ax_tb2.axhline(0, color="dimgrey", lw=0.4, ls=":")
+    ax_tb2.set_ylabel(f"Beta ({pred_str})", fontsize=8, color="dimgrey")
+    ax_tb2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
+    ax_tb2.spines["top"].set_visible(False)
+
+    lines1, labs1 = ax_tb.get_legend_handles_labels()
+    lines2, labs2 = ax_tb2.get_legend_handles_labels()
+    ax_tb.legend(lines1 + lines2, labs1 + labs2, fontsize=8, loc="upper left")
+
+    # ── Panel 3: Position Over Time ───────────────────────────────────────
+    pos_oos = pos[pos.index >= OOS_START]
+    shade(ax_p)
+    ax_p.fill_between(pos_oos.index, pos_oos.where(pos_oos ==  1, 0), 0,
+                      color=pal[0], alpha=0.75)
+    ax_p.fill_between(pos_oos.index, pos_oos.where(pos_oos == -1, 0), 0,
+                      color=pal[0], alpha=0.30, hatch="///")
+    ax_p.axhline(0, color="black", lw=0.4)
+    ax_p.set_ylim(-1.5, 1.5)
+    ax_p.set_yticks([-1, 0, 1])
+    ax_p.set_yticklabels(["Short", "Flat", "Long"], fontsize=8)
+    ax_p.set_ylabel("Asymmetric", fontsize=9, rotation=0,
+                    ha="right", va="center", labelpad=60, color=pal[0])
+    _pL = float((pos_oos ==  1).mean() * 100)
+    _pS = float((pos_oos == -1).mean() * 100)
+    _pF = float((pos_oos ==  0).mean() * 100)
+    ax_p.text(0.01, 0.97,
+              f"Long {_pL:.1f}%  Short {_pS:.1f}%  Flat {_pF:.1f}%  "
+              f"AvgPos={float(pos_oos.mean()):+.3f}",
+              transform=ax_p.transAxes, fontsize=7.5, va="top", color=pal[0])
+    ax_p.spines[["top", "right"]].set_visible(False)
+
+    for ax in [ax_ret, ax_tb, ax_p]:
+        ax.set_xlim(*xlim)
+        ax.xaxis.set_major_locator(mdates.YearLocator(2))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+        ax.tick_params(axis="x", which="major", labelbottom=True, labelsize=7, pad=2)
+
+    fig.savefig(out_path, dpi=155, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out_path.name}")
+
+
+print("\n--- expanding_window/ asymmetric per-model plots ---")
+_ASYM_OOS_R2 = {
+    "Base":      _OOS_R2.get("Base"),
+    "Model_A":   _OOS_R2.get("Model_A"),
+    "Model_C":   _OOS_R2.get("Model_C"),
+    "Model_VVIX": _OOS_R2.get("Model_VVIX"),
+    "Model_G":   _OOS_R2.get("Model_G"),
+    "Model_H":   _OOS_R2.get("Model_H"),
+}
+for m in _ASYM_MODELS:
+    fname    = "asymmetric_" + EW_MODEL_DIR[m].name.replace(" ", "_") + ".png"
+    out_path = EW_MODEL_DIR[m] / fname
+    plot_expanding_asymmetric(m, out_path, r2_oos=_ASYM_OOS_R2.get(m))
+
+print("\nAll done (asymmetric).")

@@ -24,11 +24,7 @@ Modules shared with bh_replication (called directly, not duplicated)
 
 Outputs (all in ./output/)
 --------------------------
-  Plots: vp_cv_*.png, oos_forecast_*.png, production_loop_*.png,
-         dm_diagnostic_*.png, forecast_scatter_*.png, return_pred_*.png
-  CSVs:  vp_cv_series_*.csv, production_loop_*.csv, oos_metrics_*.csv,
-         return_pred_*.csv, dm_diagnostics_*.csv
-  Summary: EXPERIMENT_RESULTS.md
+  Plots: vrp_experiment_summary_full.png
 """
 
 import warnings
@@ -58,10 +54,12 @@ OUTPUT = ROOT / "output"
 OUTPUT.mkdir(exist_ok=True)
 DATA   = ROOT.parent / "data"
 
-PAPER_START  = "1990-01-02"
-PAPER_END    = "2010-10-01"
-PAPER_SPLIT  = "2005-07-15"   # 75% train split (matching B&H)
-ROLL_WIN     = 500            # production-loop rolling window (trading days)
+PAPER_START      = "1990-01-02"
+PAPER_END        = "2010-10-01"
+PAPER_SPLIT      = "2005-07-15"   # 75% train split (matching B&H)
+ROLL_WIN         = 500            # production-loop rolling window (trading days)
+EXP_TRAIN_START  = "2006-01-01"  # expanding-window anchor (matches experiment2 signal start)
+EXP_OOS_START    = "2013-01-01"  # first OOS prediction (after 2006-2012 initial training)
 
 # ── Paper benchmarks (Table 3, Model 8) ──────────────────────────────────────
 PAPER_COEFS = {"const": 3.730, "VIX2_lag": 0.108, "RV22_lag": 0.199,
@@ -143,24 +141,28 @@ def extract_vrp(panel: pd.DataFrame, cv_series: pd.Series) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 5 — Production Loop (500-day rolling OLS)
 # ══════════════════════════════════════════════════════════════════════════════
-def production_loop(panel: pd.DataFrame, window: int = ROLL_WIN) -> pd.DataFrame:
+def production_loop(panel: pd.DataFrame, window: int = ROLL_WIN,
+                    return_stats: bool = False):
     """
     For each day t ≥ window, fit HAR on [t-window, t-1], forecast RV_t+22.
-    Returns DataFrame: date, y_actual, y_hat, error, CV, VP.
+    Returns DataFrame: date, y_actual, y_hat, error, CV, IVar, VP.
+    If return_stats=True, also returns a second DataFrame with IS adj_r2,
+    betas, and NW t-stats at each step.
     Strictly no look-ahead (parameters estimated only on past data).
 
     Uses VIX2_lag as the implied-variance feature (matching har_model convention).
     """
-    rows  = []
-    idx   = panel.index
-    N     = len(idx)
-    feats = ["VIX2_lag", "RV22_lag", "RV5_lag", "RV1_lag"]
+    rows       = []
+    stats_rows = []
+    idx        = panel.index
+    N          = len(idx)
+    feats      = ["VIX2_lag", "RV22_lag", "RV5_lag", "RV1_lag"]
 
-    print(f"    Running {N - window} daily production steps (window={window})…",
+    print(f"    Running {N - window - 22} daily production steps (window={window}, oos_gap=22)…",
           flush=True)
 
-    for i in range(window, N - 22):
-        train_sl = panel.iloc[i - window : i]
+    for i in range(window + 22, N - 22):
+        train_sl = panel.iloc[i - window - 22 : i - 22]
         if len(train_sl) < 100:
             continue
         y_tr = train_sl["RV22_fwd"]
@@ -188,7 +190,103 @@ def production_loop(panel: pd.DataFrame, window: int = ROLL_WIN) -> pd.DataFrame
             "VP":       vp_t,
         })
 
+        if return_stats:
+            col_names = X_tr.columns.tolist()
+            try:
+                nw_ses = _nw_se(res_tr, nlags=NW_LAGS)
+            except Exception:
+                nw_ses = np.full(len(col_names), np.nan)
+            stat_row = {"date": idx[i], "adj_r2": float(res_tr.rsquared_adj)}
+            for j, col in enumerate(col_names):
+                stat_row[col] = float(res_tr.params[col])
+                nw_j = nw_ses[j] if not np.isnan(nw_ses[j]) else np.nan
+                stat_row[f"t_{col}"] = (float(res_tr.params[col] / nw_j)
+                                        if (nw_j and not np.isnan(nw_j) and nw_j != 0)
+                                        else np.nan)
+            stats_rows.append(stat_row)
+
     df = pd.DataFrame(rows).set_index("date")
+    if return_stats:
+        stats_df = pd.DataFrame(stats_rows).set_index("date")
+        return df, stats_df
+    return df
+
+
+def production_loop_expanding(panel: pd.DataFrame,
+                               train_start: str = EXP_TRAIN_START,
+                               oos_start: str = EXP_OOS_START,
+                               return_stats: bool = False):
+    """
+    Expanding-window production loop.
+    The training window is anchored at train_start and grows by one day each step.
+    Predictions begin only from oos_start (after the 2006-2012 initial training period).
+    A strict 22-day gap between the last training label and the prediction row is maintained
+    (matching the rolling-window design: train slice uses panel.iloc[anchor : i-22]).
+
+    Returns DataFrame: date, y_actual, y_hat, error, CV, IVar, VP.
+    If return_stats=True, also returns (df, stats_df) with IS adj_r2, betas, NW t-stats.
+    """
+    rows       = []
+    stats_rows = []
+    idx        = panel.index
+    N          = len(idx)
+    feats      = ["VIX2_lag", "RV22_lag", "RV5_lag", "RV1_lag"]
+
+    anchor_i  = int(idx.searchsorted(pd.Timestamp(train_start)))
+    oos_i     = int(idx.searchsorted(pd.Timestamp(oos_start)))
+
+    print(f"    Running {max(0, N - oos_i - 22)} expanding-window steps "
+          f"(anchor={train_start}, OOS from {oos_start}, oos_gap=22)…", flush=True)
+
+    for i in range(oos_i, N - 22):
+        # Training slice: anchor up to i-22 (exclusive), matching rolling-window gap
+        train_sl = panel.iloc[anchor_i : i - 22]
+        if len(train_sl) < 100:
+            continue
+        y_tr = train_sl["RV22_fwd"]
+        X_tr = add_constant(train_sl[feats])
+        if X_tr.shape[0] < 50:
+            continue
+
+        res_tr = OLS(y_tr, X_tr).fit()
+
+        test_row = panel.iloc[[i]]
+        X_te     = add_constant(test_row[feats], has_constant="add")
+        y_actual = panel["RV22_fwd"].iloc[i]
+        y_hat    = float(res_tr.predict(X_te).iloc[0])
+        cv_hat   = y_hat
+        ivar_t   = float(panel["IVar"].iloc[i])
+        vp_t     = ivar_t - cv_hat
+
+        rows.append({
+            "date":     idx[i],
+            "y_actual": y_actual,
+            "y_hat":    y_hat,
+            "error":    y_actual - y_hat,
+            "CV":       cv_hat,
+            "IVar":     ivar_t,
+            "VP":       vp_t,
+        })
+
+        if return_stats:
+            col_names = X_tr.columns.tolist()
+            try:
+                nw_ses = _nw_se(res_tr, nlags=NW_LAGS)
+            except Exception:
+                nw_ses = np.full(len(col_names), np.nan)
+            stat_row = {"date": idx[i], "adj_r2": float(res_tr.rsquared_adj)}
+            for j, col in enumerate(col_names):
+                stat_row[col] = float(res_tr.params[col])
+                nw_j = nw_ses[j] if not np.isnan(nw_ses[j]) else np.nan
+                stat_row[f"t_{col}"] = (float(res_tr.params[col] / nw_j)
+                                        if (nw_j and not np.isnan(nw_j) and nw_j != 0)
+                                        else np.nan)
+            stats_rows.append(stat_row)
+
+    df = pd.DataFrame(rows).set_index("date")
+    if return_stats:
+        stats_df = pd.DataFrame(stats_rows).set_index("date")
+        return df, stats_df
     return df
 
 
@@ -661,9 +759,147 @@ def plot_vrp_comparison(prod_vix: pd.DataFrame, prod_vs: pd.DataFrame,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SUMMARY MARKDOWN
+# COMBINED SUMMARY PLOT
 # ══════════════════════════════════════════════════════════════════════════════
-def write_results_md(
+def _trailing_oos_mz_r2(prod_df: pd.DataFrame, window: int = 252) -> pd.Series:
+    """Trailing-window OOS Mincer-Zarnowitz R² from production loop forecasts."""
+    rows    = []
+    arr_act = prod_df["y_actual"].values
+    arr_hat = prod_df["y_hat"].values
+    dates   = prod_df.index
+    for i in range(window, len(dates)):
+        ya    = arr_act[i - window : i]
+        yh    = arr_hat[i - window : i]
+        valid = ~(np.isnan(ya) | np.isnan(yh))
+        if valid.sum() < 20:
+            continue
+        mz = OLS(ya[valid], add_constant(yh[valid])).fit()
+        rows.append({"date": dates[i], "oos_mz_r2": float(mz.rsquared)})
+    if not rows:
+        return pd.Series(dtype=float, name="oos_mz_r2")
+    return pd.DataFrame(rows).set_index("date")["oos_mz_r2"]
+
+
+def plot_combined_vrp_summary(prod_df: pd.DataFrame, stats_df: pd.DataFrame,
+                               tag: str = "full",
+                               window_label: str = "500-day rolling OLS") -> Path:
+    """
+    Single combined image (4 panels):
+      Row 1: Predicted VRP with long-run mean ± 1σ labelled
+      Row 2: IS Adj-R² and trailing-252d OOS MZ-R²
+      Row 3: HAR betas over time
+      Row 4: NW t-statistics for all variables
+    window_label is embedded in titles (e.g. "500-day rolling OLS" or
+    "expanding window OLS (initial train 2006-2012)").
+    """
+    vrp_mean = float(prod_df["VP"].mean())
+    vrp_std  = float(prod_df["VP"].std())
+    oos_r2   = _trailing_oos_mz_r2(prod_df, window=252)
+
+    FEAT_COLS   = ["VIX2_lag", "RV22_lag", "RV5_lag", "RV1_lag"]
+    FEAT_LABELS = ["VIX²/12 (α)", "RV(22) (β^m)", "RV(5) (β^w)", "RV(1) (β^d)"]
+    FEAT_COLORS = ["steelblue", "darkorange", "green", "firebrick"]
+
+    fig, axes = plt.subplots(
+        4, 1, figsize=(16, 19),
+        gridspec_kw={"height_ratios": [1.8, 1.2, 1.3, 1.3]},
+    )
+    s, e = prod_df.index[0], prod_df.index[-1]
+
+    # ── Row 1: VRP time series ────────────────────────────────────────────────
+    ax = axes[0]
+    _label_crises(ax, s, e)
+    ax.fill_between(prod_df.index, prod_df["VP"], 0,
+                    where=(prod_df["VP"] >= 0), color="steelblue",
+                    alpha=0.55, label="VRP > 0")
+    ax.fill_between(prod_df.index, prod_df["VP"], 0,
+                    where=(prod_df["VP"] < 0), color="salmon",
+                    alpha=0.55, label="VRP < 0")
+    ax.axhline(0, color="black", lw=0.5)
+    ax.axhline(vrp_mean, color="navy", lw=1.6, ls="--",
+               label=f"Long-run mean = {vrp_mean:.2f}")
+    ax.axhline(vrp_mean + vrp_std, color="steelblue", lw=1.1, ls=":",
+               label=f"+1σ  ({vrp_mean + vrp_std:.2f})")
+    ax.axhline(vrp_mean - vrp_std, color="salmon",    lw=1.1, ls=":",
+               label=f"−1σ  ({vrp_mean - vrp_std:.2f})")
+    ax.set_ylabel("VRP = IVar − CV  (%² monthly)", fontsize=9)
+    ax.set_title(
+        f"Predicted Variance Risk Premium — {window_label}  "
+        f"(VIX formulation, no VS)   [{s.date()} – {e.date()}]",
+        fontsize=10,
+    )
+    ax.legend(fontsize=8, loc="upper right", ncol=2)
+    ax.set_ylim(-280, 520)
+    ax.xaxis.set_major_locator(mdates.YearLocator(4))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+    # ── Row 2: IS Adj-R² and OOS MZ-R² ───────────────────────────────────────
+    ax = axes[1]
+    ax.plot(stats_df.index, stats_df["adj_r2"], color="steelblue", lw=0.8,
+            alpha=0.9, label=f"IS Adj-R² ({window_label}, mean={stats_df['adj_r2'].mean():.3f})")
+    if len(oos_r2) > 0:
+        ax.plot(oos_r2.index, oos_r2, color="darkorange", lw=0.8, alpha=0.9,
+                label=f"Trailing 252d OOS MZ-R² (mean={oos_r2.mean():.3f})")
+    ax.axhline(0, color="black", lw=0.4)
+    ax.set_ylabel("R²", fontsize=9)
+    ax.set_title("IS Adj-R² and Trailing OOS MZ-R² Over Time", fontsize=9)
+    ax.legend(fontsize=8, loc="upper right")
+    ax.xaxis.set_major_locator(mdates.YearLocator(4))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+    # ── Row 3: Beta coefficients ───────────────────────────────────────────────
+    ax = axes[2]
+    for feat, lbl, col in zip(FEAT_COLS, FEAT_LABELS, FEAT_COLORS):
+        if feat in stats_df.columns:
+            ax.plot(stats_df.index, stats_df[feat], color=col, lw=0.8,
+                    alpha=0.9, label=lbl)
+    if "const" in stats_df.columns:
+        ax2 = ax.twinx()
+        ax2.plot(stats_df.index, stats_df["const"], color="purple", lw=0.7,
+                 alpha=0.7, ls="--", label="const (right)")
+        ax2.set_ylabel("const", fontsize=8, color="purple")
+        ax2.tick_params(axis="y", labelcolor="purple", labelsize=7)
+        ax2.legend(fontsize=7, loc="lower right")
+    ax.axhline(0, color="black", lw=0.4)
+    ax.set_ylabel("Beta", fontsize=9)
+    ax.set_title(f"HAR Beta Coefficients Over Time ({window_label})", fontsize=9)
+    ax.legend(fontsize=8, loc="upper right", ncol=2)
+    ax.xaxis.set_major_locator(mdates.YearLocator(4))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+    # ── Row 4: t-statistics ───────────────────────────────────────────────────
+    ax = axes[3]
+    for feat, lbl, col in zip(FEAT_COLS, FEAT_LABELS, FEAT_COLORS):
+        tcol = f"t_{feat}"
+        if tcol in stats_df.columns:
+            ax.plot(stats_df.index, stats_df[tcol], color=col, lw=0.8,
+                    alpha=0.9, label=lbl)
+    if "t_const" in stats_df.columns:
+        ax.plot(stats_df.index, stats_df["t_const"], color="purple", lw=0.7,
+                alpha=0.7, ls="--", label="const")
+    ax.axhline( 1.96, color="grey", lw=0.9, ls="--", label="±1.96")
+    ax.axhline(-1.96, color="grey", lw=0.9, ls="--")
+    ax.axhline(0, color="black", lw=0.4)
+    ax.set_ylabel("NW t-statistic", fontsize=9)
+    ax.set_title("Newey-West t-Statistics Over Time (44 lags)", fontsize=9)
+    ax.legend(fontsize=8, loc="upper right", ncol=3)
+    ax.xaxis.set_major_locator(mdates.YearLocator(4))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+    plt.suptitle(
+        f"VRP Experiment — {window_label} (VIX only)",
+        fontsize=11, fontweight="bold",
+    )
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.94)
+    path = OUTPUT / f"vrp_experiment_summary_{tag}.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"    Saved {path}")
+    return path
+
+
+def _write_results_md_stub(
     panel_paper, panel_full,
     res_paper, res_full,
     oos_paper, oos_full,
@@ -996,30 +1232,17 @@ def main():
     print(f"    CV mean (paper): {panel_paper['CV'].mean():.3f}")
     print(f"    VP mean (full):  {panel_full['VP'].mean():.3f}")
 
-    for p, tag in [(panel_paper, "paper"), (panel_full, "full")]:
-        p[["IVar", "CV", "VP", "RV22_fwd"]].to_csv(
-            OUTPUT / f"vp_cv_series_{tag}.csv")
-    panel_full[["IVar", "CV", "VP", "RV22_fwd"]].to_parquet(
-        OUTPUT / "vp_cv_series_full.parquet")
-
     # ── STEP 5: Production loop ───────────────────────────────────────────────
     print("\n[5] Production loop (500-day rolling OLS)…")
     print("  Paper sample:")
     prod_paper = production_loop(panel_paper, ROLL_WIN)
-    print("  Full sample:")
-    prod_full  = production_loop(panel_full,  ROLL_WIN)
-
-    prod_paper.to_csv(OUTPUT / "production_loop_paper.csv")
-    prod_full.to_csv( OUTPUT / "production_loop_full.csv")
-    prod_full.to_parquet(OUTPUT / "production_loop_full.parquet")
+    print("  Full sample (with IS stats for summary plot):")
+    prod_full, stats_full = production_loop(panel_full, ROLL_WIN, return_stats=True)
 
     # ── STEP 6: Monthly diagnostics ───────────────────────────────────────────
     print("\n[6] Monthly diagnostics (MZ + Diebold-Mariano, 12-month window)…")
     diag_paper = run_monthly_diagnostics(prod_paper, panel_paper)
     diag_full  = run_monthly_diagnostics(prod_full,  panel_full)
-
-    diag_paper.to_csv(OUTPUT / "dm_diagnostics_paper.csv")
-    diag_full.to_csv( OUTPUT / "dm_diagnostics_full.csv")
 
     kill_p = int(diag_paper["kill_switch"].sum()) if len(diag_paper) else 0
     kill_f = int(diag_full["kill_switch"].sum())  if len(diag_full)  else 0
@@ -1051,9 +1274,6 @@ def main():
         print(f"    {m['label']:<28} RMSE={m['rmse']:.3f}  MAE={m['mae']:.3f}"
               f"  MAPE={m['mape']:.4f}  MZ-R²={m['mz_r2']:.4f}")
 
-    pd.DataFrame([metrics_p_har, metrics_f_har, metrics_p_mart,
-                  metrics_f_mart]).to_csv(OUTPUT / "oos_metrics.csv", index=False)
-
     # NOTE: Return predictability regressions (originally Step 8 here) have been
     # moved to Experiment 2, where they are expanded into the full bivariate
     # predictive regression analysis (VRP × term structure, trend, VVIX).
@@ -1061,26 +1281,26 @@ def main():
     ret_full  = {}
 
     # ── Plots ─────────────────────────────────────────────────────────────────
-    print("\n[9] Generating plots…")
-    plot_vp_cv(panel_paper, "paper_sample",
-               f"[{panel_paper.index.min().date()}–{panel_paper.index.max().date()}]")
-    plot_vp_cv(panel_full,  "full_sample",
-               f"[{panel_full.index.min().date()}–{panel_full.index.max().date()}]")
+    print("\n[9] Generating combined VRP summary plot (VIX only)…")
+    plot_combined_vrp_summary(prod_full, stats_full, tag="full",
+                              window_label="500-day Rolling OLS")
 
-    plot_oos_forecast(
-        y_te_p, oos_paper["y_hat"], metrics_p_har,
-        mart_paper.reindex(y_te_p.index), metrics_p_mart, "paper")
-    plot_oos_forecast(
-        y_te_f, oos_full["y_hat"], metrics_f_har,
-        mart_full.reindex(y_te_f.index), metrics_f_mart, "full")
-
-    plot_production_loop(prod_paper, "paper")
-    plot_production_loop(prod_full,  "full")
-
-    plot_dm_diagnostics(diag_paper, "paper")
-    plot_dm_diagnostics(diag_full,  "full")
-
-    # Return predictability plots moved to Experiment 2.
+    # ── Expanding-window production loop (initial train 2006-2012) ──────────
+    print(f"\n[EW] Expanding-window production loop "
+          f"(anchor={EXP_TRAIN_START}, OOS from {EXP_OOS_START})…")
+    prod_ew, stats_ew = production_loop_expanding(
+        panel_full, train_start=EXP_TRAIN_START, oos_start=EXP_OOS_START,
+        return_stats=True
+    )
+    print(f"    EW loop: {len(prod_ew):,} OOS steps  "
+          f"({prod_ew.index.min().date()} – {prod_ew.index.max().date()})")
+    print(f"    EW VRP mean={prod_ew['VP'].mean():.3f}  "
+          f"EW OOS RMSE={np.sqrt((prod_ew['error']**2).mean()):.3f}")
+    plot_combined_vrp_summary(
+        prod_ew, stats_ew, tag="expanding",
+        window_label="Expanding Window OLS (initial train 2006–2012)"
+    )
+    prod_ew.to_csv(OUTPUT / "production_loop_expanding.csv")
 
     # ── VS-based parallel run (pure VS²/12, ~2008 onwards) ───────────────────
     print("\n[VS] Building VS-based panel (pure VS²/12, no VIX fallback)…")
@@ -1090,12 +1310,8 @@ def main():
 
     print("  Running VS production loop…")
     prod_vs = production_loop(panel_vs, ROLL_WIN)
-    prod_vs.to_csv(OUTPUT / "production_loop_vs.csv")
-    prod_vs.to_parquet(OUTPUT / "production_loop_vs.parquet")
-
     print("  Running VS monthly diagnostics…")
     diag_vs = run_monthly_diagnostics(prod_vs, panel_vs)
-    diag_vs.to_csv(OUTPUT / "dm_diagnostics_vs.csv")
 
     overlap_start = prod_vs.index.min()
     vix_ol = prod_full.loc[overlap_start:]
@@ -1103,23 +1319,6 @@ def main():
     print(f"    VS VRP mean={vs_ol['VP'].mean():.3f}  "
           f"VIX VRP mean (overlap)={vix_ol['VP'].mean():.3f}  "
           f"Corr={vix_ol['VP'].corr(vs_ol['VP'].reindex(vix_ol.index)):.4f}")
-
-    print("  Generating VIX vs VS comparison plot…")
-    plot_vrp_comparison(prod_full, prod_vs, diag_full, diag_vs)
-
-    # ── Summary markdown ──────────────────────────────────────────────────────
-    print("\n[10] Writing EXPERIMENT_RESULTS.md…")
-    write_results_md(
-        panel_paper, panel_full,
-        res_paper, res_full,
-        oos_paper,  oos_full,
-        prod_paper, prod_full,
-        diag_paper, diag_full,
-        metrics_p_har, metrics_f_har,
-        metrics_p_mart, metrics_f_mart,
-        ret_paper, ret_full,
-        prod_vs=prod_vs, diag_vs=diag_vs,
-    )
 
     print(f"\nAll outputs saved to {OUTPUT}/")
     print("=" * 72)

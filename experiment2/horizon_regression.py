@@ -3,13 +3,13 @@ horizon_regression.py
 =====================
 Expanding-window OOS regression analyses at alternative horizons.
 
-  (A) fwd_ret_40 ~ VRP                 (40-day, OOS gap=40, NW 40 lags)  symmetric + asymmetric
-  (B) fwd_ret_20 ~ VVIX MA5            (20-day, OOS gap=20, NW 20 lags)  symmetric only
-  (C) fwd_ret_20 ~ vol_trend           (20-day, OOS gap=20, NW 20 lags)  [poor corr baseline]
+  (A) fwd_20d ~ VRP                 (20-day, OOS gap=20, NW 20 lags)  symmetric + asymmetric
+  (B) fwd_20d ~ VVIX MA5            (20-day, OOS gap=20, NW 20 lags)  symmetric only
+  (C) fwd_20d ~ vol_trend           (20-day, OOS gap=20, NW 20 lags)  [poor corr baseline]
        vol_trend = ln(RV_5d / RV_22d)
-  (D) fwd_ret_20 ~ VIX spot            (20-day, OOS gap=20, NW 20 lags)  [poor corr baseline]
-  (E) fwd_ret_20 ~ term_slope          (20-day, OOS gap=20, NW 20 lags)  [poor corr baseline]
-  (G) fwd_ret_20 ~ VP + open_interest  (20-day, OOS gap=20, NW 20 lags)  symmetric + asymmetric
+  (D) fwd_20d ~ VIX spot            (20-day, OOS gap=20, NW 20 lags)  [poor corr baseline]
+  (E) fwd_20d ~ term_slope          (20-day, OOS gap=20, NW 20 lags)  [poor corr baseline]
+  (G) fwd_20d ~ VP + open_interest  (20-day, OOS gap=20, NW 20 lags)  symmetric + asymmetric
 
 Methodology matches fixed_split_eval.py:
   - OOS from 2012-01-01, min training = 500 obs
@@ -30,8 +30,8 @@ OOS R²: Campbell-Thompson (2008) — 1 - SS_res / SS_tot vs prevailing historic
   No t-stat gate applied; pure forecast accuracy. Cached per model.
 
 Outputs:
-  output/expanding_window/VRP 40-day/symmetric_VRP_40d.png
-  output/expanding_window/VRP 40-day/asymmetric_VRP_40d.png
+  output/expanding_window/poor_correlation/Expanding VRP/symmetric_VRP.png
+  output/expanding_window/poor_correlation/Expanding VRP/asymmetric_VRP.png
   output/expanding_window/VVIX MA5/symmetric_VVIX_MA5.png
   output/expanding_window/poor_correlation/Vol Trend/symmetric_Vol_Trend.png
   output/expanding_window/poor_correlation/VIX/symmetric_VIX.png
@@ -65,7 +65,8 @@ from har_model import _nw_se
 
 sys.path.insert(0, str(ROOT))
 from experiment2 import (
-    load_vrp_series, load_es_front_month, load_vvix, compute_vvix_ma5,
+    load_vrp_series, load_vrp_series_expanding,
+    load_es_front_month, load_vvix, compute_vvix_ma5,
     load_vix_spot, load_vix_futures_term_structure,
     compute_buy_and_hold, simulate_strategy, compute_performance_stats,
     load_es_open_interest,
@@ -90,15 +91,14 @@ def build_panel(vrp, es, vvix_ma5, vix_spot, term_slope, oi):
         "open_interest":  oi,
         "daily_ret":      ret,
     })
-    for h in [20, 40]:
-        fwd = (ret + 1).rolling(h).apply(np.prod, raw=True).shift(-h) - 1
-        panel[f"fwd_{h}d"] = fwd
+    panel["fwd_20d"] = (ret + 1).rolling(20).apply(np.prod, raw=True).shift(-20) - 1
     r2   = ret ** 2
     rv5  = np.sqrt(r2.rolling(5).mean()  * 252)
     rv22 = np.sqrt(r2.rolling(22).mean() * 252)
     panel["vol_trend"] = np.log(rv5 / rv22)
     panel = panel.dropna(subset=["VP", "vvix_ma5", "term_slope"])
     return panel[panel.index >= "2006-03-06"]
+
 
 
 # ── OOS R² (Campbell-Thompson 2008) ──────────────────────────────────────────
@@ -330,8 +330,10 @@ def compute_betas(panel, predictor, fwd_col, oos_gap, nw_lags):
         X_tr  = add_constant(train[[predictor]], has_constant="skip")
         res   = OLS(train[fwd_col], X_tr).fit()
         nw    = _nw_se(res, nlags=nw_lags)
+        a     = float(res.params.iloc[0])
         b, se = float(res.params.iloc[1]), float(nw[1])
-        records.append({"beta": b, "se": se, "t_stat": b / se if se > 0 else 0.0})
+        records.append({"alpha": a, "beta": b, "se": se,
+                        "t_stat": b / se if se > 0 else 0.0})
 
     df = pd.DataFrame(records, index=sub.index[start_i:])
     df.to_parquet(cache)
@@ -344,7 +346,10 @@ def compute_betas_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags):
     tag   = f"betas_EWbiv_{pred1}_{pred2}_{fwd_col}_oos{OOS_START}.parquet"
     cache = CACHE_DIR / tag
     if cache.exists():
-        return pd.read_parquet(cache)
+        df = pd.read_parquet(cache)
+        if "alpha" in df.columns:
+            return df
+        cache.unlink()   # recompute — missing alpha column
 
     print(f"    Computing bivariate betas for {pred1} + {pred2} -> {fwd_col}...")
     sub     = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
@@ -358,9 +363,11 @@ def compute_betas_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags):
         X_tr  = add_constant(train[[pred1, pred2]], has_constant="skip")
         res   = OLS(train[fwd_col], X_tr).fit()
         nw    = _nw_se(res, nlags=nw_lags)
+        a0    = float(res.params.iloc[0])
         b1, se1 = float(res.params.iloc[1]), float(nw[1])
         b2, se2 = float(res.params.iloc[2]), float(nw[2])
         records.append({
+            "alpha":    a0,
             "beta_1":   b1,  "se_1":   se1,
             "t_stat_1": b1 / se1 if se1 > 0 else 0.0,
             "beta_2":   b2,  "se_2":   se2,
@@ -1018,18 +1025,79 @@ def main():
 
     print("\n[1] Loading data...")
     vrp        = load_vrp_series()
+    vrp_exp    = load_vrp_series_expanding()
     es         = load_es_front_month()
     vvix_ma5   = compute_vvix_ma5(load_vvix())
     vix_spot   = load_vix_spot()
     term_slope = compute_vix_term_slope(load_vix_futures_term_structure())
     oi         = load_es_open_interest()
     panel      = build_panel(vrp, es, vvix_ma5, vix_spot, term_slope, oi)
-    print(f"    {len(panel):,} obs  "
+    # Panel for expanding-VRP analyses: expanding-window HAR VRP renamed to VP_exp
+    # so cache keys stay separate from the rolling-window VP analyses.
+    panel_exp  = build_panel(vrp_exp, es, vvix_ma5, vix_spot, term_slope, oi)
+    panel_exp  = panel_exp.rename(columns={"VP": "VP_exp"})
+    print(f"    {len(panel):,} obs (rolling VRP)  "
           f"[{panel.index.min().date()} - {panel.index.max().date()}]")
+    print(f"    {len(panel_exp):,} obs (expanding VRP)  "
+          f"[{panel_exp.index.min().date()} - {panel_exp.index.max().date()}]")
 
     daily_ret = panel["daily_ret"].dropna()
     bah_pos   = compute_buy_and_hold(daily_ret)
     bah_sim_  = simulate_strategy(bah_pos, daily_ret)
+
+    out_vrp_ew = OUTPUT / "expanding_window" / "poor_correlation" / "Expanding VRP"
+    out_vrp_ew.mkdir(parents=True, exist_ok=True)
+
+    # ── (A) Expanding VRP -> 20-day symmetric ────────────────────────────────
+    # Uses VP_exp (expanding-window HAR VRP) so cache keys differ from Base (VP).
+    print("\n[A-sym] Expanding VRP -> 20-day expanding-window positions (symmetric)...")
+    daily_ret_exp = panel_exp["daily_ret"].dropna()
+    bah_pos_exp   = compute_buy_and_hold(daily_ret_exp)
+    bah_sim_exp   = simulate_strategy(bah_pos_exp, daily_ret_exp)
+    vrp_sims = {}
+    for di, (delta, lbl) in enumerate(zip(DELTAS, DELTA_LBL)):
+        print(f"    {lbl}...", end="  ", flush=True)
+        pos = run_ew(panel_exp, "VP_exp", "fwd_20d", oos_gap=20, nw_lags=20, delta=delta)
+        sim = simulate_strategy(pos, daily_ret_exp)
+        st  = compute_performance_stats(sim[sim.index >= OOS_START], f"EW_VRP20d_{lbl}")
+        vrp_sims[di] = (st, sim)
+        p   = pos[pos.index >= OOS_START]
+        print(f"SR={st['sharpe']:+.3f}  L={float((p==1).mean())*100:.1f}%  "
+              f"S={float((p==-1).mean())*100:.1f}%  "
+              f"F={float((p==0).mean())*100:.1f}%")
+
+    vrp_betas  = compute_betas(panel_exp, "VP_exp", "fwd_20d", oos_gap=20, nw_lags=20)
+    vrp_r2_oos = compute_oos_r2(panel_exp, "VP_exp", "fwd_20d", oos_gap=20, nw_lags=20)
+    print(f"    OOS R² (Expanding VRP 20d) = {vrp_r2_oos:+.4f}")
+
+    plot_2panel(
+        pred_label="Expanding VRP", horizon_label="20-day",
+        oos_gap=20, nw_lags=20,
+        color_palette=["#08306b", "#2171b5", "#4292c6", "#6baed6"],
+        sim_dict=vrp_sims, betas_df=vrp_betas,
+        bah_sim=bah_sim_exp,
+        out_path=out_vrp_ew / "symmetric_VRP.png",
+        r2_oos=vrp_r2_oos,
+    )
+
+    # ── (A) Expanding VRP -> 20-day asymmetric ───────────────────────────────
+    print("\n[A-asym] Expanding VRP -> 20-day expanding-window positions (asymmetric)...")
+    pos_asym_vrp = run_ew_asym(panel_exp, "VP_exp", "fwd_20d", oos_gap=20, nw_lags=20)
+    sim_asym_vrp = simulate_strategy(pos_asym_vrp, daily_ret_exp)
+    p_asym_vrp   = pos_asym_vrp[pos_asym_vrp.index >= OOS_START]
+    print(f"    L={float((p_asym_vrp==1).mean())*100:.1f}%  "
+          f"S={float((p_asym_vrp==-1).mean())*100:.1f}%  "
+          f"F={float((p_asym_vrp==0).mean())*100:.1f}%")
+
+    plot_asym(
+        pred_label="Expanding VRP", horizon_label="20-day",
+        oos_gap=20, nw_lags=20,
+        main_color="#08306b",
+        sim=sim_asym_vrp, betas_df=vrp_betas,
+        bah_sim=bah_sim_exp,
+        out_path=out_vrp_ew / "asymmetric_VRP.png",
+        r2_oos=vrp_r2_oos,
+    )
 
     # ── (B) VVIX MA5 -> 20-day symmetric ────────────────────────────────────
     print("\n[2] VVIX MA5 -> 20-day expanding-window positions...")
@@ -1218,6 +1286,8 @@ def main():
     )
 
     print("\nDone.")
+    print(f"  output/expanding_window/poor_correlation/Expanding VRP/symmetric_VRP.png")
+    print(f"  output/expanding_window/poor_correlation/Expanding VRP/asymmetric_VRP.png")
     print(f"  output/expanding_window/VVIX MA5/symmetric_VVIX_MA5.png")
     print(f"  output/expanding_window/poor_correlation/Vol Trend/symmetric_Vol_Trend.png")
     print(f"  output/expanding_window/poor_correlation/VIX/symmetric_VIX.png")

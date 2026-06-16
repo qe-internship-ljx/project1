@@ -96,6 +96,17 @@ def load_vrp_series() -> pd.DataFrame:
     return df[["VP", "CV", "IVar"]].copy()
 
 
+def load_vrp_series_expanding() -> pd.DataFrame:
+    """
+    Load VRP from Experiment 1 expanding-window HAR production loop.
+    Returns DataFrame indexed by date with columns [VP, CV, IVar].
+    """
+    csv_path = VRP_OUT / "production_loop_expanding.csv"
+    df = pd.read_csv(csv_path, parse_dates=["date"])
+    df = df.set_index("date")
+    return df[["VP", "CV", "IVar"]].copy()
+
+
 def load_es_open_interest() -> pd.Series:
     """
     Total ES open interest (sum across tracked contracts), smoothed with a
@@ -188,13 +199,13 @@ def load_vix_futures_term_structure() -> pd.DataFrame:
 
 
 def load_vvix() -> pd.Series:
-    """Load VVIX (VIX-of-VIX) daily closing index values."""
+    """Load VVIX (VIX-of-VIX) daily closing index values, converted to monthly units (÷12)."""
     df = pd.read_csv(DATA / "VolatilityIndexData.csv", parse_dates=["DATE"])
     vvix = (df[df["SECURITY"] == "VVIX Index"]
             .sort_values("DATE")
             .set_index("DATE")["INDEX_VALUE"])
     vvix.index.name = "date"
-    return vvix
+    return vvix / 12.0
 
 
 def load_vix_spot() -> pd.Series:
@@ -293,7 +304,7 @@ def build_master_panel(vrp: pd.DataFrame,
     # Cumulative forward 20-day return on ES
     ret = es["returns"]
     fwd_20 = (ret + 1).rolling(20).apply(np.prod, raw=True).shift(-20) - 1
-    fwd_20.name = "fwd_ret_20"
+    fwd_20.name = "fwd_20d"
 
     # Daily ES return (for P&L simulation)
     daily_ret = ret.rename("daily_ret")
@@ -305,70 +316,13 @@ def build_master_panel(vrp: pd.DataFrame,
         "term_slope":   term_slope,
         "trend_q":      trend_q,
         "vvix_ma5":     vvix_ma5,
-        "fwd_ret_20":   fwd_20,
+        "fwd_20d":   fwd_20,
         "daily_ret":    daily_ret,
         "price_level":  es["price_level"],
-    }).dropna(subset=["VP", "term_slope", "trend_q", "vvix_ma5"])
+    }).dropna(subset=["VP", "term_slope", "vvix_ma5"])
 
     return panel.sort_index()
 
-
-def _ols_nw(y: pd.Series, X: pd.DataFrame, nlags: int = NW_LAGS_20) -> dict:
-    """Run OLS and return coefficients, Newey-West SEs, t-stats, adj-R²."""
-    X_c = add_constant(X, has_constant="skip")
-    res = OLS(y, X_c).fit()
-    nw  = _nw_se(res, nlags=nlags)
-    names = list(X_c.columns)
-    params = dict(zip(names, res.params))
-    nw_se  = dict(zip(names, nw))
-    t_stat = {k: params[k] / nw_se[k] for k in names}
-    return {
-        "n":      int(res.nobs),
-        "params": params,
-        "nw_se":  nw_se,
-        "t_stat": t_stat,
-        "adj_r2": float(res.rsquared_adj),
-        "r2":     float(res.rsquared),
-    }
-
-
-def run_bivariate_regressions(panel: pd.DataFrame) -> dict:
-    """
-    Full-sample predictive regressions of the 20-day forward return:
-
-    Base:    R_{t+20} = α + β₁ VRP_t + ε
-    Model A: R_{t+20} = α + β₁ VRP_t + β₂ s_t + ε
-    Model B: R_{t+20} = α + β₁ VRP_t + β₂ (P_t/SMA200_t) + ε
-    Model C: R_{t+20} = α + β₁ VRP_t + β₂ VVIX_MA5_t + ε
-
-    Uses Newey-West SEs with 20 lags to correct for serial correlation induced
-    by overlapping 20-day return windows.
-
-    Also runs univariate regressions for each signal against fwd_ret_20 to
-    isolate individual explanatory power (Step 8 return predictability).
-    """
-    sub = panel.dropna(subset=["VP", "term_slope", "trend_q",
-                                "vvix_ma5", "fwd_ret_20"])
-    y = sub["fwd_ret_20"]
-
-    results = {}
-
-    results["Base"]    = _ols_nw(y, sub[["VP"]])
-    results["Base"]["vars"] = ["const", "VP"]
-
-    results["Model_A"] = _ols_nw(y, sub[["VP", "term_slope"]])
-    results["Model_A"]["vars"] = ["const", "VP", "term_slope"]
-
-    results["Model_B"] = _ols_nw(y, sub[["VP", "trend_q"]])
-    results["Model_B"]["vars"] = ["const", "VP", "trend_q"]
-
-    results["Model_C"] = _ols_nw(y, sub[["VP", "vvix_ma5"]])
-    results["Model_C"]["vars"] = ["const", "VP", "vvix_ma5"]
-
-    results["Model_VS"] = _ols_nw(y, sub[["vvix_ma5", "term_slope"]])
-    results["Model_VS"]["vars"] = ["const", "vvix_ma5", "term_slope"]
-
-    return results
 
 
 CACHE_DIR = OUTPUT / "regression_cache"
@@ -411,11 +365,11 @@ def run_rolling_regression_positions(panel: pd.DataFrame,
     }
     feat_cols = col_map[model]
     # Use only rows where features AND the 20-day forward return are available.
-    # fwd_ret_20[i] = compounded return over days i+1..i+20.
+    # fwd_20d[i] = compounded return over days i+1..i+20.
     # Strict OOS: the training window ends at i-20 so that the most recent
-    # training label (fwd_ret_20[i-21]) covers days i-20..i-1, all fully
+    # training label (fwd_20d[i-21]) covers days i-20..i-1, all fully
     # realised before prediction date i.  The first prediction is at i = window+20.
-    sub = panel.dropna(subset=feat_cols + ["fwd_ret_20"]).copy()
+    sub = panel.dropna(subset=feat_cols + ["fwd_20d"]).copy()
     N   = len(sub)
 
     positions = pd.Series(0.0, index=sub.index, name=f"pos_{model}_d{delta}")
@@ -424,7 +378,7 @@ def run_rolling_regression_positions(panel: pd.DataFrame,
         # Training window ends 20 rows before prediction row so all labels
         # are fully realised (no forward-return leakage).
         train = sub.iloc[i - window - 20 : i - 20]
-        y_tr  = train["fwd_ret_20"]
+        y_tr  = train["fwd_20d"]
         X_tr  = add_constant(train[feat_cols], has_constant="skip")
         if len(y_tr) < 50:
             continue
@@ -531,51 +485,6 @@ def run_monthly_vrp_positions(panel: pd.DataFrame,
     return daily_pos
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# STEP 6 — Algorithmic Logic Gate
-# ═══════════════════════════════════════════════════════════════════════════
-
-def compute_logic_gate_positions(panel: pd.DataFrame,
-                                  roll_win: int = ROLL_WIN) -> pd.Series:
-    """
-    Conjunctive rule-based positions using all four signals:
-
-    Long (+1) when ALL of:
-      - VRP > rolling_mean(VRP, 500d) + 1·rolling_std(VRP, 500d)
-      - term_slope > 2.00   (historical contango average ≈ 2.32)
-      - trend_q > 1.00      (price above 200-day SMA)
-      - vvix_ma5 < 95       (tail-risk gauge below threshold)
-
-    Short (-1) when ALL of:
-      - VRP < rolling_mean(VRP, 500d) - 1·rolling_std(VRP, 500d)
-      - term_slope < -1.00  (backwardation regime)
-      - trend_q < 1.00      (price below 200-day SMA)
-      - vvix_ma5 > 110      (elevated tail-risk demand)
-
-    Flat (0) otherwise.
-    """
-    sub = panel.dropna(subset=["VP", "term_slope", "trend_q", "vvix_ma5"]).copy()
-
-    vp_mean = sub["VP"].rolling(roll_win, min_periods=100).mean()
-    vp_std  = sub["VP"].rolling(roll_win, min_periods=100).std()
-
-    long_cond = (
-        (sub["VP"] > vp_mean + vp_std) &
-        (sub["term_slope"] > 2.00) &
-        (sub["trend_q"] > 1.00) &
-        (sub["vvix_ma5"] < 95)
-    )
-    short_cond = (
-        (sub["VP"] < vp_mean - vp_std) &
-        (sub["term_slope"] < -1.00) &
-        (sub["trend_q"] < 1.00) &
-        (sub["vvix_ma5"] > 110)
-    )
-
-    pos = pd.Series(0, index=sub.index, name="pos_logic_gate")
-    pos[long_cond]  =  1
-    pos[short_cond] = -1
-    return pos
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -667,604 +576,5 @@ def compute_buy_and_hold(daily_ret: pd.Series) -> pd.Series:
     return pd.Series(1, index=daily_ret.index, name="pos_bah")
 
 
-def compute_ma_trend(es: pd.DataFrame) -> pd.Series:
-    """
-    200-day moving average trend strategy:
-        Long  (+1) when price_level > SMA200
-        Short (-1) when price_level < SMA200
-        (no flat zone; strict binary rule)
-    """
-    sma200 = es["price_level"].rolling(200).mean()
-    pos = pd.Series(np.where(es["price_level"] > sma200, 1, -1),
-                    index=es.index, name="pos_ma_trend")
-    return pos
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# PLOTS
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _shade_crises(ax, start, end):
-    crises = [
-        ("GFC",   "2007-06-01", "2009-06-01"),
-        ("COVID", "2020-02-01", "2020-06-01"),
-        ("2022",  "2022-01-01", "2022-12-31"),
-    ]
-    for lbl, s, e in crises:
-        s, e = pd.Timestamp(s), pd.Timestamp(e)
-        if e < start or s > end:
-            continue
-        ax.axvspan(max(s, start), min(e, end), alpha=0.08, color="grey", lw=0)
-
-
-def plot_signals(panel: pd.DataFrame) -> Path:
-    fig, axes = plt.subplots(4, 1, figsize=(16, 14), sharex=True)
-    s, e = panel.index[0], panel.index[-1]
-
-    ax = axes[0]
-    _shade_crises(ax, s, e)
-    ax.fill_between(panel.index, panel["VP"], 0,
-                    where=panel["VP"] >= 0, color="steelblue", alpha=0.5, label="VRP > 0")
-    ax.fill_between(panel.index, panel["VP"], 0,
-                    where=panel["VP"] < 0, color="salmon", alpha=0.5, label="VRP < 0")
-    ax.axhline(0, color="black", lw=0.5)
-    ax.set_ylabel("VRP")
-    ax.set_title("Variance Risk Premium (from Experiment 1)")
-    ax.legend(fontsize=8)
-
-    ax = axes[1]
-    _shade_crises(ax, s, e)
-    ax.plot(panel.index, panel["term_slope"], color="darkorange", lw=0.7,
-            label="VIX term slope (VIX pts / year)")
-    ax.axhline(2.0,  color="green",     ls="--", lw=0.8, label="Long threshold (2.0)")
-    ax.axhline(-1.0, color="firebrick", ls="--", lw=0.8, label="Short threshold (−1.0)")
-    ax.axhline(0,    color="black",     lw=0.4)
-    ax.set_ylabel("Slope (pts/yr)")
-    ax.set_title("VIX Futures Term Structure Slope (contango = positive)")
-    ax.legend(fontsize=8)
-
-    ax = axes[2]
-    _shade_crises(ax, s, e)
-    ax.plot(panel.index, panel["trend_q"], color="steelblue", lw=0.7,
-            label="P_t / SMA200")
-    ax.axhline(1.0, color="black", ls="--", lw=0.8, label="SMA200 level (1.0)")
-    ax.set_ylabel("Trend Quotient")
-    ax.set_title("Equity Trend Quotient (P / SMA200)")
-    ax.legend(fontsize=8)
-
-    ax = axes[3]
-    _shade_crises(ax, s, e)
-    ax.plot(panel.index, panel["vvix_ma5"], color="purple", lw=0.7,
-            label="VVIX 5-day MA")
-    ax.axhline(95,  color="green",     ls="--", lw=0.8, label="Long threshold (<95)")
-    ax.axhline(110, color="firebrick", ls="--", lw=0.8, label="Short threshold (>110)")
-    ax.set_ylabel("VVIX MA5")
-    ax.set_title("VVIX (Vol-of-VIX) 5-Day Moving Average")
-    ax.legend(fontsize=8)
-
-    ax.xaxis.set_major_locator(mdates.YearLocator(2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    plt.tight_layout()
-    path = OUTPUT / "signals.png"
-    plt.savefig(path, dpi=150)
-    plt.close()
-    return path
-
-
-def plot_regression_results(reg_results: dict) -> Path:
-    models = ["Base", "Model_A", "Model_B", "Model_C"]
-    labels = ["Base (VRP)", "Model A\n(VRP+Slope)", "Model B\n(VRP+Trend)", "Model C\n(VRP+VVIX)"]
-    var_of_interest = {
-        "Base":    "VP",
-        "Model_A": "term_slope",
-        "Model_B": "trend_q",
-        "Model_C": "vvix_ma5",
-    }
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-    # Adj R²
-    adj_r2 = [reg_results[m].get("adj_r2", np.nan) for m in models]
-    axes[0].bar(labels, adj_r2, color="steelblue", alpha=0.7)
-    axes[0].axhline(0, color="black", lw=0.5)
-    axes[0].set_title("Adj. R² — 20-day Forward Return Prediction")
-    axes[0].set_ylabel("Adj. R²")
-
-    # VRP t-stat across models
-    vp_tstats = []
-    for m in models:
-        r = reg_results[m]
-        vp_tstats.append(r["t_stat"].get("VP", np.nan))
-    axes[1].bar(labels, vp_tstats,
-                color=["steelblue" if abs(t) >= 1.96 else "salmon"
-                       for t in vp_tstats], alpha=0.7)
-    axes[1].axhline(1.96,  color="grey", ls="--", lw=0.8, label="±1.96")
-    axes[1].axhline(-1.96, color="grey", ls="--", lw=0.8)
-    axes[1].set_title("VRP t-statistic (NW, 20 lags)")
-    axes[1].set_ylabel("t-stat")
-    axes[1].legend(fontsize=8)
-
-    # Secondary signal t-stat
-    sec_tstats = []
-    sec_lbl    = []
-    for m in models:
-        if m == "Base":
-            sec_tstats.append(np.nan)
-            sec_lbl.append("(VRP only)")
-        else:
-            v = var_of_interest[m]
-            sec_tstats.append(reg_results[m]["t_stat"].get(v, np.nan))
-            sec_lbl.append(v)
-    axes[2].bar(labels,
-                [0 if np.isnan(x) else x for x in sec_tstats],
-                color=["steelblue" if (not np.isnan(t) and abs(t) >= 1.96) else "salmon"
-                       for t in sec_tstats], alpha=0.7)
-    axes[2].axhline(1.96,  color="grey", ls="--", lw=0.8, label="±1.96")
-    axes[2].axhline(-1.96, color="grey", ls="--", lw=0.8)
-    axes[2].set_title("Secondary Signal t-statistic")
-    axes[2].set_ylabel("t-stat")
-    axes[2].legend(fontsize=8)
-
-    plt.suptitle("Bivariate Predictive Regression Summary (Full-Sample, NW SEs, 20 lags)")
-    plt.tight_layout()
-    path = OUTPUT / "regression_results.png"
-    plt.savefig(path, dpi=150)
-    plt.close()
-    return path
-
-
-def plot_cumulative_returns(sim_dict: dict) -> Path:
-    """Plot cumulative net return for all strategies on one chart."""
-    fig, axes = plt.subplots(2, 1, figsize=(16, 10), sharex=True)
-
-    color_map = {
-        "Buy-and-Hold":   ("steelblue",   2.0,  "-"),
-        "MA Trend":       ("darkorange",  1.5,  "--"),
-        "Logic Gate":     ("green",       1.5,  "-"),
-    }
-
-    ax = axes[0]
-    for lbl, sim in sim_dict.items():
-        cum = sim["cum_net"]
-        col, lw, ls = color_map.get(lbl, ("grey", 1.0, "-"))
-        ax.plot(cum.index, cum.values, label=lbl, color=col, lw=lw, ls=ls, alpha=0.9)
-    s = list(sim_dict.values())[0]["cum_net"].index[0]
-    e = list(sim_dict.values())[0]["cum_net"].index[-1]
-    _shade_crises(ax, s, e)
-    ax.set_ylabel("Cumulative Return (starting at 1)")
-    ax.set_title("Cumulative Net Returns — All Strategies")
-    ax.legend(fontsize=9)
-    ax.axhline(1, color="black", lw=0.5, ls=":")
-
-    # Drawdown chart for the logic gate strategy
-    ax2 = axes[1]
-    for lbl in ["Logic Gate", "Buy-and-Hold", "MA Trend"]:
-        if lbl not in sim_dict:
-            continue
-        sim = sim_dict[lbl]
-        cum = sim["cum_net"].dropna()
-        roll_max = cum.cummax()
-        dd = (cum - roll_max) / roll_max
-        col, lw, ls = color_map.get(lbl, ("grey", 1.0, "-"))
-        ax2.fill_between(dd.index, dd.values, 0, alpha=0.3, color=col, label=lbl)
-    ax2.set_ylabel("Drawdown")
-    ax2.set_title("Drawdown Profiles")
-    ax2.legend(fontsize=9)
-
-    ax2.xaxis.set_major_locator(mdates.YearLocator(2))
-    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    plt.tight_layout()
-    path = OUTPUT / "cumulative_returns.png"
-    plt.savefig(path, dpi=150)
-    plt.close()
-    return path
-
-
-def plot_all_cumulative_returns(sim_dict: dict) -> Path:
-    """Separate chart including all regression-model strategies."""
-    fig, ax = plt.subplots(figsize=(16, 7))
-
-    palette = plt.cm.tab10.colors
-    for i, (lbl, sim) in enumerate(sim_dict.items()):
-        cum = sim["cum_net"]
-        ax.plot(cum.index, cum.values, label=lbl, lw=1.2,
-                color=palette[i % len(palette)], alpha=0.85)
-
-    s = list(sim_dict.values())[0]["cum_net"].index[0]
-    e = list(sim_dict.values())[0]["cum_net"].index[-1]
-    _shade_crises(ax, s, e)
-    ax.axhline(1, color="black", lw=0.5, ls=":")
-    ax.set_ylabel("Cumulative Return (starting at 1)")
-    ax.set_title("Cumulative Net Returns — All Strategies (incl. Regression-Based)")
-    ax.legend(fontsize=7, ncol=2)
-    ax.xaxis.set_major_locator(mdates.YearLocator(2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    plt.tight_layout()
-    path = OUTPUT / "all_cumulative_returns.png"
-    plt.savefig(path, dpi=150)
-    plt.close()
-    return path
-
-
-def plot_position_history(pos_dict: dict, panel: pd.DataFrame) -> Path:
-    """Heatmap-style position history for main strategies."""
-    keys   = ["Logic Gate", "Buy-and-Hold", "MA Trend"]
-    avail  = [k for k in keys if k in pos_dict]
-    if not avail:
-        return None
-
-    fig, axes = plt.subplots(len(avail), 1, figsize=(16, 3 * len(avail)), sharex=True)
-    if len(avail) == 1:
-        axes = [axes]
-
-    for ax, lbl in zip(axes, avail):
-        pos = pos_dict[lbl]
-        ax.fill_between(pos.index, pos.values, 0,
-                        where=pos.values > 0, color="steelblue", alpha=0.5, label="Long")
-        ax.fill_between(pos.index, pos.values, 0,
-                        where=pos.values < 0, color="salmon",    alpha=0.5, label="Short")
-        ax.set_ylabel(lbl)
-        ax.set_ylim(-1.5, 1.5)
-        ax.axhline(0, color="black", lw=0.4)
-        ax.legend(fontsize=7)
-
-    axes[-1].xaxis.set_major_locator(mdates.YearLocator(2))
-    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    plt.suptitle("Position History — Main Strategies")
-    plt.tight_layout()
-    path = OUTPUT / "position_history.png"
-    plt.savefig(path, dpi=150)
-    plt.close()
-    return path
-
-
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# RESULTS MARKDOWN
-# ═══════════════════════════════════════════════════════════════════════════
-
-def write_results_md(panel: pd.DataFrame,
-                     reg_results: dict,
-                     perf_stats: list[dict],
-                     pos_dict: dict) -> Path:
-
-    logic_stats = next((s for s in perf_stats if s["label"] == "Logic Gate"), {})
-    bah_stats   = next((s for s in perf_stats if s["label"] == "Buy-and-Hold"), {})
-    trend_stats = next((s for s in perf_stats if s["label"] == "MA Trend"), {})
-
-    DISPLAY_NAME = {"VP": "VRP", "const": "const"}
-
-    def reg_table(key):
-        r = reg_results.get(key, {})
-        rows = []
-        for v in r.get("vars", []):
-            coef = r["params"].get(v, np.nan)
-            se   = r["nw_se"].get(v, np.nan)
-            t    = r["t_stat"].get(v, np.nan)
-            sig  = "***" if abs(t) > 2.58 else ("**" if abs(t) > 1.96 else
-                   ("*" if abs(t) > 1.645 else ""))
-            label = DISPLAY_NAME.get(v, v)
-            rows.append(f"| `{label}` | {coef:.4f} | {se:.4f} | {t:.3f}{sig} |")
-        return "\n".join(rows)
-
-    def perf_row(stats):
-        if not stats:
-            return "| — | — | — | — | — | — |"
-        return (f"| **{stats['label']}** | {stats['ann_ret']*100:.2f}% | "
-                f"{stats['ann_vol']*100:.2f}% | {stats['sharpe']:.3f} | "
-                f"{stats['max_dd']*100:.2f}% | {stats['total_ret']*100:.2f}% |")
-
-    lines = [
-        "# Experiment 2 Results: Equity Index Timing via VRP, Term Structure, VVIX, and Trend",
-        "",
-        "> **Strategy universe:** S&P 500 E-mini futures (ES) — long / flat / short",
-        "> **Signal sources:** VRP (Exp 1), VIX futures term slope, Trend quotient, VVIX",
-        f"> **Sample period:** {panel.index.min().date()} – {panel.index.max().date()}",
-        f"> **Full-signal overlap:** 2006-03-06 onwards (VVIX availability limit) [DEV-2]",
-        "",
-        "---",
-        "",
-        "## Deviations from Plan",
-        "",
-        "| Code | Description |",
-        "|------|-------------|",
-        "| [DEV-1] | Spot S&P 500 price unavailable — front-month ES price level used as proxy; basis B_t ≈ 0 |",
-        "| [DEV-2] | Signal overlap limited to 2006-03-06+ by VVIX start date; VIX futures from 2004-04-02 |",
-        "| [DEV-5] | Random forest threshold optimisation (optional, Step 6) not implemented |",
-        "",
-        "---",
-        "",
-        "## Step 2: VIX Term Structure Slope",
-        "",
-        f"- Daily cross-sectional OLS: price_{{i,t}} = α_t + s_t · TtM_{{i,t}} + ε",
-        f"- Mean slope: {panel['term_slope'].mean():.3f} VIX pts/yr",
-        f"- % days contango (slope > 0): {(panel['term_slope'] > 0).mean()*100:.1f}%",
-        f"- % days backwardation (slope < 0): {(panel['term_slope'] < 0).mean()*100:.1f}%",
-        "",
-        "---",
-        "",
-        "## Step 3: Trend Quotient",
-        "",
-        f"- % days above SMA200 (trend > 1): {(panel['trend_q'] > 1).mean()*100:.1f}%",
-        f"- Min: {panel['trend_q'].min():.3f}  Max: {panel['trend_q'].max():.3f}",
-        "",
-        "---",
-        "",
-        "## Step 4: VVIX 5-Day MA",
-        "",
-        f"- Mean: {panel['vvix_ma5'].mean():.1f}  Std: {panel['vvix_ma5'].std():.1f}",
-        f"- % days VVIX_MA5 < 95: {(panel['vvix_ma5'] < 95).mean()*100:.1f}%",
-        f"- % days VVIX_MA5 > 110: {(panel['vvix_ma5'] > 110).mean()*100:.1f}%",
-        "",
-        "---",
-        "",
-        "## Step 5: Bivariate Predictive Regressions",
-        "",
-        "Dependent variable: 20-day forward S&P 500 return. Newey-West SEs (20 lags).",
-        "Significance: * p<0.10, ** p<0.05, *** p<0.01",
-        "",
-        "### Base Model (VRP only)",
-        f"n = {reg_results.get('Base', {}).get('n', '—')}  |  "
-        f"Adj R² = {reg_results.get('Base', {}).get('adj_r2', np.nan):.4f}",
-        "",
-        "| Variable | Coef | NW-SE | t-stat |",
-        "|----------|-----:|------:|-------:|",
-        reg_table("Base"),
-        "",
-        "### Model A: VRP + Term Structure Slope",
-        f"n = {reg_results.get('Model_A', {}).get('n', '—')}  |  "
-        f"Adj R² = {reg_results.get('Model_A', {}).get('adj_r2', np.nan):.4f}",
-        "",
-        "| Variable | Coef | NW-SE | t-stat |",
-        "|----------|-----:|------:|-------:|",
-        reg_table("Model_A"),
-        "",
-        "### Model B: VRP + Equity Trend Quotient",
-        f"n = {reg_results.get('Model_B', {}).get('n', '—')}  |  "
-        f"Adj R² = {reg_results.get('Model_B', {}).get('adj_r2', np.nan):.4f}",
-        "",
-        "| Variable | Coef | NW-SE | t-stat |",
-        "|----------|-----:|------:|-------:|",
-        reg_table("Model_B"),
-        "",
-        "### Model C: VRP + VVIX 5-day MA",
-        f"n = {reg_results.get('Model_C', {}).get('n', '—')}  |  "
-        f"Adj R² = {reg_results.get('Model_C', {}).get('adj_r2', np.nan):.4f}",
-        "",
-        "| Variable | Coef | NW-SE | t-stat |",
-        "|----------|-----:|------:|-------:|",
-        reg_table("Model_C"),
-        "",
-        "---",
-        "",
-        "## Step 6: Logic Gate Signal Statistics",
-        "",
-    ]
-    if "Logic Gate" in pos_dict:
-        pos = pos_dict["Logic Gate"]
-        long_frac  = (pos == 1).mean()
-        short_frac = (pos == -1).mean()
-        flat_frac  = (pos == 0).mean()
-        lines += [
-            f"- % days Long:  {long_frac*100:.1f}%",
-            f"- % days Short: {short_frac*100:.1f}%",
-            f"- % days Flat:  {flat_frac*100:.1f}%",
-        ]
-
-    lines += [
-        "",
-        "---",
-        "",
-        "## Steps 7–8: Strategy Performance",
-        "",
-        "Net of 0.05% slippage per trade. Sharpe ratio assumes 0% risk-free rate.",
-        "",
-        "| Strategy | Ann. Return | Ann. Vol | Sharpe | Max DD | Total Return |",
-        "|----------|:-----------:|:--------:|:------:|:------:|:------------:|",
-        perf_row(logic_stats),
-        perf_row(bah_stats),
-        perf_row(trend_stats),
-    ]
-    for stats in perf_stats:
-        if stats["label"] not in ("Logic Gate", "Buy-and-Hold", "MA Trend"):
-            lines.append(perf_row(stats))
-
-    lines += [
-        "",
-        "---",
-        "",
-        "## Output Files",
-        "",
-        "| File | Description |",
-        "|------|-------------|",
-        "| `signals.png` | Four-panel time-series plot of all signals |",
-        "| `regression_results.png` | Adj-R² and t-stats for Base / A / B / C models |",
-        "| `cumulative_returns.png` | Cumulative net returns (main strategies) |",
-        "| `all_cumulative_returns.png` | All strategies including regression-based |",
-        "| `position_history.png` | Long / short / flat history for main strategies |",
-        "| `signals.csv` | Full panel with all daily signals |",
-        "| `regression_results.csv` | Coefficient table for all models |",
-        "| `strategy_performance.csv` | Daily P&L for all strategies |",
-        "| `benchmark_comparison.csv` | Performance statistics table |",
-    ]
-
-    text = "\n".join(lines)
-    path = OUTPUT / "EXPERIMENT_RESULTS.md"
-    path.write_text(text, encoding="utf-8")
-    return path
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════════
-
-def main():
-    print("=" * 72)
-    print("  Experiment 2: Equity Index Timing via VRP, Term Structure, VVIX, Trend")
-    print("=" * 72)
-
-    # ── Step 1: Load data ─────────────────────────────────────────────────
-    print("\n[1] Loading data…")
-    vrp    = load_vrp_series()
-    es     = load_es_front_month()
-    vx_df  = load_vix_futures_term_structure()
-    vvix   = load_vvix()
-    vix_s  = load_vix_spot()
-    print(f"    VRP:  {vrp.index.min().date()} – {vrp.index.max().date()} "
-          f"({len(vrp):,} obs)")
-    print(f"    ES:   {es.index.min().date()} – {es.index.max().date()} "
-          f"({len(es):,} obs)")
-    print(f"    VX:   {vx_df['date'].min().date()} – {vx_df['date'].max().date()} "
-          f"({len(vx_df['date'].unique()):,} dates, {len(vx_df):,} rows)")
-    print(f"    VVIX: {vvix.index.min().date()} – {vvix.index.max().date()} "
-          f"({len(vvix):,} obs)")
-
-    # ── Step 2: VIX term structure slope ──────────────────────────────────
-    print("\n[2] Computing VIX term structure slope (daily cross-sectional OLS)…")
-    term_slope = compute_vix_term_slope(vx_df)
-    print(f"    Slope dates: {term_slope.index.min().date()} – "
-          f"{term_slope.index.max().date()}")
-    print(f"    Mean slope: {term_slope.mean():.3f} pts/yr  "
-          f"(contango {(term_slope > 0).mean()*100:.1f}% of days)")
-
-    # ── Step 3: Trend quotient ─────────────────────────────────────────────
-    print("\n[3] Computing equity trend quotient (P / SMA200)…")
-    trend_q = compute_trend_quotient(es)
-    print(f"    % days above SMA200: {(trend_q > 1).mean()*100:.1f}%")
-
-    # ── Step 4: VVIX 5-day MA ──────────────────────────────────────────────
-    print("\n[4] Computing VVIX 5-day moving average…")
-    vvix_ma5 = compute_vvix_ma5(vvix)
-    print(f"    VVIX MA5: mean={vvix_ma5.mean():.1f}  "
-          f"% days < 95: {(vvix_ma5 < 95).mean()*100:.1f}%  "
-          f"% days > 110: {(vvix_ma5 > 110).mean()*100:.1f}%")
-
-    # ── Build master panel ─────────────────────────────────────────────────
-    print("\n    Building master signal panel…")
-    panel = build_master_panel(vrp, es, term_slope, trend_q, vvix_ma5)
-    # Restrict to fully-overlapping period for all signals
-    panel_full = panel.copy()
-    panel_overlap = panel[panel.index >= "2006-03-06"].copy()   # [DEV-2]
-
-    print(f"    Full panel:    {panel_full.index.min().date()} – "
-          f"{panel_full.index.max().date()} ({len(panel_full):,} obs)")
-    print(f"    Overlap panel: {panel_overlap.index.min().date()} – "
-          f"{panel_overlap.index.max().date()} ({len(panel_overlap):,} obs)")
-
-    panel_full.to_csv(OUTPUT / "signals.csv")
-
-    # ── Step 5: Bivariate predictive regressions ──────────────────────────
-    print("\n[5] Bivariate predictive regressions (full-sample)…")
-    reg_results = run_bivariate_regressions(panel_overlap)
-
-    for m in ["Base", "Model_A", "Model_B", "Model_C"]:
-        r = reg_results.get(m, {})
-        vp_t  = r.get("t_stat", {}).get("VP", np.nan)
-        sec_v = {"Base": None, "Model_A": "term_slope",
-                 "Model_B": "trend_q", "Model_C": "vvix_ma5"}[m]
-        sec_t = r.get("t_stat", {}).get(sec_v, np.nan) if sec_v else np.nan
-        print(f"    {m}: adj-R²={r.get('adj_r2', np.nan):.4f}  "
-              f"VRP t={vp_t:.3f}  "
-              + (f"secondary t={sec_t:.3f}" if sec_v else ""))
-
-    # Save regression results CSV
-    reg_rows = []
-    for m in ["Base", "Model_A", "Model_B", "Model_C"]:
-        r = reg_results.get(m, {})
-        for v in r.get("vars", []):
-            reg_rows.append({
-                "model": m,
-                "variable": v,
-                "coef":   round(r["params"].get(v, np.nan), 6),
-                "nw_se":  round(r["nw_se"].get(v, np.nan), 6),
-                "t_stat": round(r["t_stat"].get(v, np.nan), 4),
-                "adj_r2": round(r.get("adj_r2", np.nan), 6),
-                "n":      r.get("n", np.nan),
-            })
-    pd.DataFrame(reg_rows).to_csv(OUTPUT / "regression_results.csv", index=False)
-
-    # ── Rolling regression positions (Step 5) ─────────────────────────────
-    print("\n[5] Rolling-window regression positions…")
-    reg_positions = {}
-    for m in ["Model_A", "Model_B", "Model_C"]:
-        for delta in [0.005, 0.01, 0.02]:
-            key = f"{m}_d{int(delta*1000)}bps"
-            print(f"    Generating positions: {key}…")
-            pos = run_rolling_regression_positions(panel_overlap, m, delta)
-            reg_positions[key] = pos
-            print(f"      Long={float((pos==1).mean())*100:.1f}%  "
-                  f"Short={float((pos==-1).mean())*100:.1f}%  "
-                  f"Flat={float((pos==0).mean())*100:.1f}%")
-
-    # ── Step 6: Logic gate positions ──────────────────────────────────────
-    print("\n[6] Logic gate positions…")
-    pos_logic = compute_logic_gate_positions(panel_overlap)
-    print(f"    Long={float((pos_logic==1).mean())*100:.1f}%  "
-          f"Short={float((pos_logic==-1).mean())*100:.1f}%  "
-          f"Flat={float((pos_logic==0).mean())*100:.1f}%")
-
-    # ── Step 7: Simulate strategies ───────────────────────────────────────
-    print("\n[7] Simulating strategy performance…")
-    daily_ret_ov = panel_overlap["daily_ret"].dropna()
-    es_ov = es.loc[panel_overlap.index[panel_overlap.index.isin(es.index)]]
-
-    pos_bah   = compute_buy_and_hold(daily_ret_ov)
-    pos_trend = compute_ma_trend(es_ov).reindex(daily_ret_ov.index).ffill().fillna(0)
-
-    sim_dict  = {}
-    pos_dict  = {}
-
-    for lbl, pos in [
-        ("Logic Gate",   pos_logic),
-        ("Buy-and-Hold", pos_bah),
-        ("MA Trend",     pos_trend),
-    ]:
-        sim = simulate_strategy(pos, daily_ret_ov, label=lbl)
-        sim_dict[lbl] = sim
-        pos_dict[lbl] = pos
-
-    for key, pos in reg_positions.items():
-        sim = simulate_strategy(pos, daily_ret_ov, label=key)
-        sim_dict[key] = sim
-        pos_dict[key] = pos
-
-    # Compute performance stats
-    perf_stats = [compute_performance_stats(sim, lbl)
-                  for lbl, sim in sim_dict.items()]
-
-    # Print summary
-    print(f"\n{'Strategy':<30} {'Ann.Ret':>8} {'Ann.Vol':>8} {'Sharpe':>7} {'MaxDD':>7}")
-    print("-" * 65)
-    for s in perf_stats:
-        print(f"  {s['label']:<28} {s['ann_ret']*100:>7.2f}% "
-              f"{s['ann_vol']*100:>7.2f}% {s['sharpe']:>7.3f} "
-              f"{s['max_dd']*100:>7.2f}%")
-
-    # Save P&L series
-    pnl_df = pd.DataFrame({lbl: s["net_pnl"]
-                            for lbl, s in sim_dict.items()})
-    pnl_df.to_csv(OUTPUT / "strategy_performance.csv")
-
-    pd.DataFrame(perf_stats).to_csv(OUTPUT / "benchmark_comparison.csv", index=False)
-
-    # ── Plots ──────────────────────────────────────────────────────────────
-    print("\n[8] Generating plots…")
-    plot_signals(panel_overlap)
-    plot_regression_results(reg_results)
-    plot_cumulative_returns({k: sim_dict[k] for k in
-                             ["Logic Gate", "Buy-and-Hold", "MA Trend"]
-                             if k in sim_dict})
-    plot_all_cumulative_returns(sim_dict)
-    plot_position_history(pos_dict, panel_overlap)
-
-    # ── Results markdown ───────────────────────────────────────────────────
-    print("\n[9] Writing EXPERIMENT_RESULTS.md…")
-    write_results_md(panel_overlap, reg_results, perf_stats, pos_dict)
-
-    print(f"\nAll outputs saved to {OUTPUT}/")
-    print("=" * 72)
-
-
-if __name__ == "__main__":
-    main()

@@ -20,7 +20,7 @@ Master script — generates all experiment 2 plots and organises them into:
 
 Out-of-sample guarantee (daily rolling regression):
   Training window for prediction at row i uses rows [i-window-20 : i-20],
-  so the most recent training label fwd_ret_20[i-21] covers days i-20..i-1
+  so the most recent training label fwd_20d[i-21] covers days i-20..i-1
   — all fully realised before prediction date i.
 """
 
@@ -124,12 +124,12 @@ def compute_rolling_betas_series(model, panel, window=500, nw_lags=20):
         cache_path.unlink()
 
     print(f"    Computing rolling betas for {model}...")
-    sub = panel.dropna(subset=feat_cols + ["fwd_ret_20"]).copy()
+    sub = panel.dropna(subset=feat_cols + ["fwd_20d"]).copy()
     N = len(sub)
     dates, records = [], []
     for i in range(window + 20, N):
         train = sub.iloc[i - window - 20 : i - 20]
-        y_tr  = train["fwd_ret_20"]
+        y_tr  = train["fwd_20d"]
         X_tr  = add_constant(train[feat_cols], has_constant="skip")
         try:
             res = OLS(y_tr, X_tr).fit()

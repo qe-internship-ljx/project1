@@ -15,10 +15,10 @@ Two expanding-window OOS evaluation designs for Base, Model A, Model C.
 
 OOS guarantee
 -------------
-  fwd_ret_20[t]  = cumulative return from day t+1 to t+20 (realised at t+20).
+  fwd_20d[t]  = cumulative return from day t+1 to t+20 (realised at t+20).
   Training window at prediction row i: sub.iloc[0 : i-20].
-    Last label = fwd_ret_20[i-21], which uses prices ending at day i-1. ✓
-  Rolling mu     = mean of fwd_ret_20 over the same training slice. ✓
+    Last label = fwd_20d[i-21], which uses prices ending at day i-1. ✓
+  Rolling mu     = mean of fwd_20d over the same training slice. ✓
   Position pos[i] applied to daily_ret[i+1] via pos.shift(1) in
     simulate_strategy. ✓
   Performance stats computed on OOS-only slice (>= OOS_START). ✓
@@ -52,13 +52,11 @@ EW_MODEL_DIR = {
     "Model_C":     DIR_EW      / "VRP + VVIX MA5",
     "Model_VVIX":  DIR_EW      / "VVIX MA5",
     "Model_Basis": DIR_EW_POOR / "VIX Basis",
-    "Model_G":     DIR_EW      / "VRP x VVIX",
     "Model_H":     DIR_EW      / "VRP Split",
 }
 DIR_RF = DIR_EW / "Random Forest"
 DIR_RF.mkdir(parents=True, exist_ok=True)
-DIR_EW_CMP = DIR_EW / "comparisons"
-for _d in [*EW_MODEL_DIR.values(), DIR_EW_CMP]:
+for _d in EW_MODEL_DIR.values():
     _d.mkdir(parents=True, exist_ok=True)
 
 CACHE_DIR = OUTPUT / "regression_cache"
@@ -98,7 +96,7 @@ NW_LAGS    = 20
 
 DELTAS    = [0.002, 0.005, 0.0075, 0.010]
 DELTA_LBL = ["d=0.2%", "d=0.5%", "d=0.75%", "d=1.0%"]
-MODELS             = ["Base", "Model_A", "Model_B", "Model_C", "Model_G", "Model_H"]
+MODELS             = ["Base", "Model_A", "Model_B", "Model_C", "Model_H"]
 COMPARISON_MODELS  = ["Base", "Model_A", "Model_C"]   # Model_B excluded: never activates
 
 MODEL_FEATURES = {
@@ -108,7 +106,6 @@ MODEL_FEATURES = {
     "Model_C":     ["VP", "vvix_ma5"],
     "Model_VVIX":  ["vvix_ma5"],
     "Model_Basis": ["vix_basis"],
-    "Model_G":     ["vrp_vvix"],
     "Model_H":     ["vrp_pos", "vrp_neg"],
 }
 MODEL_LABEL = {
@@ -118,7 +115,6 @@ MODEL_LABEL = {
     "Model_C":     "Model C — VRP + VVIX MA5",
     "Model_VVIX":  "Model VVIX — Univariate VVIX MA5",
     "Model_Basis": "Model Basis — Univariate VIX Basis",
-    "Model_G":     "Model G — VRP x VVIX MA5 (product)",
     "Model_H":     "Model H — VRP split (positive / negative)",
 }
 MODEL_PALETTE = {
@@ -128,7 +124,6 @@ MODEL_PALETTE = {
     "Model_C":     ["#3f007d", "#6a51a3", "#9e9ac8", "#dadaeb"],
     "Model_VVIX":  ["#7f2704", "#d94801", "#fd8d3c", "#fdbe85"],
     "Model_Basis": ["#004d40", "#00796b", "#26a69a", "#80cbc4"],
-    "Model_G":     ["#4d3000", "#8c5a00", "#cc8400", "#ffb84d"],
     "Model_H":     ["#1a3300", "#336600", "#5c9900", "#99cc33"],
 }
 LINESTYLE = ["-", "--", "-.", ":"]
@@ -153,7 +148,6 @@ panel["vol_trend"] = np.log(
     np.sqrt(_r2.rolling(5).mean()  * 252) /
     np.sqrt(_r2.rolling(22).mean() * 252)
 )
-panel["vrp_vvix"] = panel["VP"] * panel["vvix_ma5"]
 panel["vrp_pos"]  = panel["VP"].clip(lower=0)   # max(VRP, 0)
 panel["vrp_neg"]  = panel["VP"].clip(upper=0)   # min(VRP, 0)
 daily_ret = panel["daily_ret"].dropna()
@@ -177,7 +171,7 @@ def run_fixed_split(panel, model, delta):
     """
     Single OLS fit on training data; fixed coefficients applied to OOS.
 
-    OOS gap: the last training label fwd_ret_20[j] covers days j+1..j+20.
+    OOS gap: the last training label fwd_20d[j] covers days j+1..j+20.
     To avoid any overlap with the OOS period, training is cut 20 rows before
     the first OOS row, so the last label's 20-day window closes before OOS_START.
 
@@ -185,7 +179,7 @@ def run_fixed_split(panel, model, delta):
              n_train, n_oos).
     """
     feat_cols = MODEL_FEATURES[model]
-    sub = panel.dropna(subset=feat_cols + ["fwd_ret_20"]).copy()
+    sub = panel.dropna(subset=feat_cols + ["fwd_20d"]).copy()
 
     oos_start_row = sub.index.searchsorted(pd.Timestamp(OOS_START))
     # Last safe training row: oos_start_row - 21 (label ends at oos_start_row - 1)
@@ -193,14 +187,14 @@ def run_fixed_split(panel, model, delta):
     oos   = sub.iloc[oos_start_row :]
 
     X_tr = add_constant(train[feat_cols], has_constant="skip")
-    res  = OLS(train["fwd_ret_20"], X_tr).fit()
+    res  = OLS(train["fwd_20d"], X_tr).fit()
     nw   = _nw_se(res, nlags=NW_LAGS)
     t_stats = res.params.values[1:] / nw[1:]
 
     # Vectorised prediction on OOS rows
     X_oos = add_constant(oos[feat_cols], has_constant="skip")
     y_hat = res.predict(X_oos)
-    oos_rmse = float(np.sqrt(np.mean((y_hat.values - oos["fwd_ret_20"].values) ** 2)))
+    oos_rmse = float(np.sqrt(np.mean((y_hat.values - oos["fwd_20d"].values) ** 2)))
 
     pos = pd.Series(0.0, index=panel.index, name=f"pos_FS_{model}_d{delta}")
     pos.loc[oos.index] = np.where(y_hat >  delta,  1.0,
@@ -227,7 +221,7 @@ def run_expanding_window(panel, model, delta, t_threshold=T_THRESH):
         s.name = f"pos_EW_{model}_d{delta}"
         return s
 
-    sub = panel.dropna(subset=feat_cols + ["fwd_ret_20"]).copy()
+    sub = panel.dropna(subset=feat_cols + ["fwd_20d"]).copy()
     N   = len(sub)
     pos = pd.Series(0.0, index=sub.index, name=f"pos_EW_{model}_d{delta}")
 
@@ -238,7 +232,7 @@ def run_expanding_window(panel, model, delta, t_threshold=T_THRESH):
     for i in range(start_i, N):
         train = sub.iloc[0 : i - 20]          # all history up to i-21
         X_tr  = add_constant(train[feat_cols], has_constant="skip")
-        res   = OLS(train["fwd_ret_20"], X_tr).fit()
+        res   = OLS(train["fwd_20d"], X_tr).fit()
         nw    = _nw_se(res, nlags=NW_LAGS)
         t_stats = res.params.values[1:] / nw[1:]
         if not np.all(np.abs(t_stats) > t_threshold):
@@ -258,7 +252,7 @@ def run_expanding_window_rolmu(panel, model, delta, t_threshold=T_THRESH,
     """
     Same as run_expanding_window but with a rolling-mean-adjusted threshold.
     At prediction day i:
-        mu   = mean of fwd_ret_20 over the last `rolling_window` training rows
+        mu   = mean of fwd_20d over the last `rolling_window` training rows
         long  when y_hat > mu + delta
         short when y_hat < mu - delta
     This benchmarks the predicted return against the recent historical average
@@ -273,19 +267,19 @@ def run_expanding_window_rolmu(panel, model, delta, t_threshold=T_THRESH,
         s.name = f"pos_EWrm_{model}_d{delta}"
         return s
 
-    sub = panel.dropna(subset=feat_cols + ["fwd_ret_20"]).copy()
+    sub = panel.dropna(subset=feat_cols + ["fwd_20d"]).copy()
     N   = len(sub)
     pos = pd.Series(0.0, index=sub.index, name=f"pos_EWrm_{model}_d{delta}")
 
     oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
     start_i = max(MIN_WIN + 20, oos_idx)
 
-    fwd = sub["fwd_ret_20"].values   # pre-extract for speed
+    fwd = sub["fwd_20d"].values   # pre-extract for speed
 
     for i in range(start_i, N):
         train = sub.iloc[0 : i - 20]
         X_tr  = add_constant(train[feat_cols], has_constant="skip")
-        res   = OLS(train["fwd_ret_20"], X_tr).fit()
+        res   = OLS(train["fwd_20d"], X_tr).fit()
         nw    = _nw_se(res, nlags=NW_LAGS)
         t_stats = res.params.values[1:] / nw[1:]
         if not np.all(np.abs(t_stats) > t_threshold):
@@ -311,7 +305,7 @@ def run_expanding_window_asym(panel, model, t_threshold=T_THRESH,
     """
     Expanding window with asymmetric threshold (no delta parameter).
     At prediction day i:
-        mu500 = mean of fwd_ret_20 over the last `rolling_window` training rows
+        mu500 = mean of fwd_20d over the last `rolling_window` training rows
         long  when y_hat > mu500   (prediction beats recent historical mean)
         short when y_hat < 0       (prediction negative, regardless of magnitude)
         flat  otherwise
@@ -326,19 +320,19 @@ def run_expanding_window_asym(panel, model, t_threshold=T_THRESH,
         s.name = f"pos_EWasym_{model}"
         return s
 
-    sub = panel.dropna(subset=feat_cols + ["fwd_ret_20"]).copy()
+    sub = panel.dropna(subset=feat_cols + ["fwd_20d"]).copy()
     N   = len(sub)
     pos = pd.Series(0.0, index=sub.index, name=f"pos_EWasym_{model}")
 
     oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
     start_i = max(MIN_WIN + 20, oos_idx)
 
-    fwd = sub["fwd_ret_20"].values
+    fwd = sub["fwd_20d"].values
 
     for i in range(start_i, N):
         train = sub.iloc[0 : i - 20]
         X_tr  = add_constant(train[feat_cols], has_constant="skip")
-        res   = OLS(train["fwd_ret_20"], X_tr).fit()
+        res   = OLS(train["fwd_20d"], X_tr).fit()
         nw    = _nw_se(res, nlags=NW_LAGS)
         t_stats = res.params.values[1:] / nw[1:]
         if not np.all(np.abs(t_stats) > t_threshold):
@@ -572,10 +566,9 @@ def plot_expanding_detail(model, out_path, ew_dict=None, ew_sim_dict=None,
         gridspec_kw={"height_ratios": [2.5, 1.2] + [1.0] * n_d, "hspace": 0.35},
     )
     fig.subplots_adjust(top=0.955, bottom=0.03, left=0.10, right=0.93)
-    _r2_str = f"  R²_OOS = {r2_oos:+.4f}" if r2_oos is not None else ""
     fig.suptitle(
         f"{pred_str} -> 20-day Forward Return  "
-        f"(Expanding Window, OOS from {OOS_START}){_r2_str}{extra_title}\n"
+        f"(Expanding Window, OOS from {OOS_START}){extra_title}\n"
         f"Training grows daily; OOS gap = 20 days; "
         f"NW-HAC {NW_LAGS} lags; |t| > {T_THRESH:.2f} gate; 0.05% slippage",
         fontsize=10, y=0.998,
@@ -873,106 +866,6 @@ def plot_summary_table(out_path, ew_sim_dict=None, method_label="Expanding Windo
 # PLOT E: Post-2020 comparison — all models × both methods, best δ each
 # ════════════════════════════════════════════════════════════════════════════
 
-POST_START = "2020-01-01"
-
-def _post_stats(sim_df, label, start=POST_START):
-    """Compute performance stats over [start, end] only, rebasing cum_net."""
-    s = sim_df[sim_df.index >= start].copy()
-    s["cum_net"] = (1 + s["net_pnl"]).cumprod()
-    return compute_performance_stats(s, label)
-
-def _rebase(sim_df, start=POST_START):
-    net = sim_df["net_pnl"]
-    s = net[net.index >= start]
-    return (1 + s).cumprod()
-
-def plot_post2020_comparison(out_path, ew_dict=None, ew_sim_dict=None, models=None):
-    _ew     = ew_dict     if ew_dict     is not None else EW
-    _ew_sim = ew_sim_dict if ew_sim_dict is not None else EW_SIM
-    _models = models if models is not None else COMPARISON_MODELS
-
-    # Start at the first date either secondary-signal model (A or C) takes a position.
-    # Always use Model_A and Model_C for this check regardless of which models are plotted,
-    # so the reference date reflects secondary-signal activation, not Base's early activity.
-    _activation_models = [m for m in ["Model_A", "Model_C"] if (m, 0) in _ew_sim]
-    first_dates = []
-    for m in _activation_models:
-        di  = best_delta(_ew_sim, m)
-        pos = _ew[(m, di)]
-        active = pos[pos != 0]
-        if len(active):
-            first_dates.append(active.index.min())
-    START = min(first_dates) if first_dates else pd.Timestamp(POST_START)
-    start = START.strftime("%Y-%m-%d")
-
-    _MODEL_COLOR = {
-        "Base":        "#08306b",
-        "Model_A":     "#006d2c",
-        "Model_B":     "#7f3b08",
-        "Model_C":     "#3f007d",
-        "Model_VVIX":  "#7f2704",
-    }
-
-    fig, ax = plt.subplots(figsize=(14, 7))
-    fig.suptitle(
-        f"Performance from First Secondary-Signal Activation ({start}) — Best δ  ·  Expanding Window\n"
-        f"Rebased to 1.0 at {start} (first date Model A or C takes a position)  ·  "
-        f"|t| > {T_THRESH:.2f} gate  ·  0.05% slippage",
-        fontsize=10,
-    )
-
-    # Buy-and-Hold
-    bah_post = _post_stats(bah_sim, "BaH", start)
-    bah_cum  = _rebase(bah_sim, start)
-    ax.plot(bah_cum.index, bah_cum.values,
-            color=BAH_COLOR, lw=1.8, ls="-.", alpha=0.65,
-            label=(f"Buy-and-Hold  "
-                   f"[SR={bah_post['sharpe']:+.2f}  "
-                   f"ret={bah_post['ann_ret']*100:+.1f}%  "
-                   f"DD={bah_post['max_dd']*100:.1f}%]"))
-
-    def _pos_lbls(pos_series):
-        p = pos_series[pos_series.index >= start]
-        return int((p == 1).mean() * 100), int((p == -1).mean() * 100)
-
-    for m in _models:
-        col = _MODEL_COLOR.get(m, "#333333")
-        short_lbl = MODEL_LABEL[m].split("—")[1].strip()
-
-        di_ew = best_delta(_ew_sim, m)
-        _, sim_ew = _ew_sim[(m, di_ew)]
-        st_post_ew = _post_stats(sim_ew, f"EW_{m}", start)
-        cum_ew = _rebase(sim_ew, start)
-        pos_ew = _ew[(m, di_ew)]
-        pL_ew, pS_ew = _pos_lbls(pos_ew)
-        ax.plot(cum_ew.index, cum_ew.values,
-                color=col, lw=2.2, ls="-", alpha=0.92,
-                label=(f"{short_lbl} ({DELTA_LBL[di_ew]})  "
-                       f"[SR={st_post_ew['sharpe']:+.2f}  "
-                       f"ret={st_post_ew['ann_ret']*100:+.1f}%  "
-                       f"DD={st_post_ew['max_dd']*100:.1f}%  "
-                       f"L{pL_ew}%/S{pS_ew}%]"))
-
-    # ── Shade crises and format ────────────────────────────────────────
-    for a, b in [("2020-02-01","2020-06-01"), ("2022-01-01","2022-12-31")]:
-        ax.axvspan(pd.Timestamp(a), pd.Timestamp(b), alpha=0.07, color="grey", lw=0)
-
-    ax.axhline(1, color="black", lw=0.5, ls=":")
-    ax.set_yscale("log")
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}x"))
-    ax.set_ylabel("Cumulative Net Return (log, rebased to 1.0)", fontsize=10)
-    ax.set_xlim(START, e_dt)
-    ax.legend(fontsize=7.5, loc="upper left", ncol=1,
-              framealpha=0.92, edgecolor="#cccccc")
-    ax.xaxis.set_major_locator(mdates.YearLocator(1))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    plt.setp(ax.get_xticklabels(), visible=True, fontsize=9)
-    ax.grid(axis="y", alpha=0.2, lw=0.6)
-    ax.spines[["top", "right"]].set_visible(False)
-
-    fig.savefig(out_path, dpi=155, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {out_path.name}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1000,7 +893,7 @@ def compute_ew_betas(model):
             return df
 
     print(f"    Computing beta time series for {model} (one-time)...")
-    sub     = panel.dropna(subset=feat_cols + ["fwd_ret_20"]).copy()
+    sub     = panel.dropna(subset=feat_cols + ["fwd_20d"]).copy()
     N       = len(sub)
     oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
     start_i = max(MIN_WIN + 20, oos_idx)
@@ -1009,7 +902,7 @@ def compute_ew_betas(model):
     for i in range(start_i, N):
         train = sub.iloc[0 : i - 20]
         X_tr  = add_constant(train[feat_cols], has_constant="skip")
-        res   = OLS(train["fwd_ret_20"], X_tr).fit()
+        res   = OLS(train["fwd_20d"], X_tr).fit()
         nw    = _nw_se(res, nlags=NW_LAGS)
         b_alpha, se_alpha = float(res.params.iloc[0]), float(nw[0])
         b_vp,    se_vp    = float(res.params.iloc[1]), float(nw[1])
@@ -1042,7 +935,6 @@ FEAT_DISPLAY = {
     "vvix_ma5":   "VVIX MA5",
     "vix_basis":  "VIX Basis",
     "vix":        "VIX",
-    "vrp_vvix":   "VRP x VVIX MA5",
     "vrp_pos":    "VRP+",
     "vrp_neg":    "VRP-",
 }
@@ -1172,7 +1064,6 @@ _OOS_R2 = {
     "Model_A":     0.022006,
     "Model_B":    -0.000071,
     "Model_C":     0.020898,
-    "Model_G":     0.008088,
     "Model_H":    -0.019053,
     "Model_VVIX":  0.012834,
     "Model_Basis": -0.019952,
@@ -1184,7 +1075,6 @@ _SYMMETRIC_NAME = {
     "Model_A":  "symmetric_VRP_+_Term_Slope.png",
     "Model_B":  "symmetric_VRP_+_Trend.png",
     "Model_C":  "symmetric_VRP_+_VVIX_MA5.png",
-    "Model_G":  "symmetric_VRP_x_VVIX.png",
     "Model_H":  "symmetric_VRP_Split.png",
 }
 
@@ -1194,25 +1084,21 @@ _BASE_RETURN_SHIFT_NAME = {
     "Model_A":  "base_return_shift_VRP_+_Term_Slope.png",
     "Model_B":  "base_return_shift_VRP_+_Trend.png",
     "Model_C":  "base_return_shift_VRP_+_VVIX_MA5.png",
-    "Model_G":  "base_return_shift_VRP_x_VVIX.png",
     "Model_H":  "base_return_shift_VRP_Split.png",
 }
 
 print("\n--- expanding_window/ per-model detail plots ---")
-for m in ["Base", "Model_A", "Model_B", "Model_C", "Model_G", "Model_H"]:
+for m in ["Base", "Model_A", "Model_B", "Model_C", "Model_H"]:
     plot_expanding_detail(
         m, EW_MODEL_DIR[m] / _SYMMETRIC_NAME[m],
         r2_oos=_OOS_R2.get(m),
     )
 
-print("\n--- expanding_window/comparisons/ cross-model ---")
-plot_post2020_comparison(DIR_EW_CMP / "symmetric_comparisons.png")
-
 print("\nAll done.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# ROLLING-MU THRESHOLD: rerun EW with threshold = rolling_avg(fwd_ret_20) ± delta
+# ROLLING-MU THRESHOLD: rerun EW with threshold = rolling_avg(fwd_20d) ± delta
 # Threshold benchmarks the prediction against the 500-day rolling historical
 # average rather than a fixed zero-centred band.
 # ════════════════════════════════════════════════════════════════════════════
@@ -1220,7 +1106,7 @@ print("\nAll done.")
 print("\nComputing expanding-window (rolling-mu threshold) positions...")
 EW_RM     = {}
 EW_RM_SIM = {}
-_RM_MODELS = _RW_MODELS + ["Model_G", "Model_H"]
+_RM_MODELS = _RW_MODELS + ["Model_H"]
 for m in _RM_MODELS:
     for di, delta in enumerate(DELTAS):
         print(f"  EW-rolmu  {m}  {DELTA_LBL[di]}...")
@@ -1237,19 +1123,13 @@ for m in _RM_MODELS:
         EW_RM_SIM[(m, di)] = (st, sim)
 
 print("\n--- expanding_window/ rolling-mu per-model detail plots ---")
-for m in ["Base", "Model_A", "Model_B", "Model_C", "Model_G", "Model_H"]:
+for m in ["Base", "Model_A", "Model_B", "Model_C", "Model_H"]:
     plot_expanding_detail(
         m, EW_MODEL_DIR[m] / _BASE_RETURN_SHIFT_NAME[m],
         ew_dict=EW_RM, ew_sim_dict=EW_RM_SIM,
         extra_title=" · Threshold = rolling-avg(20d return) ± δ",
         r2_oos=_OOS_R2.get(m),
     )
-
-print("\n--- expanding_window/comparisons/ rolling-mu cross-model ---")
-plot_post2020_comparison(
-    DIR_EW_CMP / "base_return_shift_comparisons.png",
-    ew_dict=EW_RM, ew_sim_dict=EW_RM_SIM,
-)
 
 print("\nAll done (rolling-mu).")
 
@@ -1357,15 +1237,6 @@ plot_expanding_detail(
     ew_dict=EW_VVIX_DICT, ew_sim_dict=EW_VVIX_SIM_DICT,
     extra_title=" · Threshold = rolling-avg(20d return) ± δ",
     r2_oos=_OOS_R2.get("Model_VVIX"),
-)
-
-print("\n--- expanding_window/comparisons/ VVIX cross-model ---")
-_ew_vvix_combined     = {**EW_RM,     **EW_VVIX_DICT}
-_ew_vvix_sim_combined = {**EW_RM_SIM, **EW_VVIX_SIM_DICT}
-plot_post2020_comparison(
-    DIR_EW_CMP / "post2020_comparison_vvix.png",
-    ew_dict=_ew_vvix_combined, ew_sim_dict=_ew_vvix_sim_combined,
-    models=["Model_C", "Model_VVIX"],
 )
 
 print("\nAll done (univariate VVIX).")
@@ -1535,7 +1406,7 @@ def _rf_fit_and_predict(n_estimators=300):
         return pd.read_parquet(pred_path).squeeze(), pd.read_parquet(imp_path)
 
     print("  Fitting RF (monthly retrain, expanding window)...")
-    sub = panel.dropna(subset=RF_FEATURES + ["fwd_ret_20"]).copy()
+    sub = panel.dropna(subset=RF_FEATURES + ["fwd_20d"]).copy()
     N   = len(sub)
 
     oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
@@ -1556,7 +1427,7 @@ def _rf_fit_and_predict(n_estimators=300):
                 n_estimators=n_estimators, max_features="sqrt",
                 min_samples_leaf=20, random_state=42, n_jobs=-1,
             )
-            cur_rf.fit(train[RF_FEATURES].values, train["fwd_ret_20"].values)
+            cur_rf.fit(train[RF_FEATURES].values, train["fwd_20d"].values)
             cur_month = month_key
             imp_records.append({
                 "date": dt,
@@ -1711,7 +1582,7 @@ print("\nAll done (Random Forest).")
 # Short when ŷ < 0; Flat otherwise.  T-stat gate still applies.
 # ════════════════════════════════════════════════════════════════════════════
 
-_ASYM_MODELS = ["Base", "Model_A", "Model_C", "Model_VVIX", "Model_G", "Model_H"]
+_ASYM_MODELS = ["Base", "Model_A", "Model_C", "Model_VVIX", "Model_H"]
 
 print("\nComputing expanding-window (asymmetric threshold) positions...")
 EW_ASYM     = {}
@@ -1755,10 +1626,9 @@ def plot_expanding_asymmetric(model, out_path, r2_oos=None):
     )
     fig.subplots_adjust(top=0.955, bottom=0.03, left=0.10, right=0.93)
 
-    _r2_str = f"  R²_OOS = {r2_oos:+.4f}" if r2_oos is not None else ""
     fig.suptitle(
         f"{pred_str} -> 20-day Forward Return  "
-        f"(Expanding Window, OOS from {OOS_START}){_r2_str}\n"
+        f"(Expanding Window, OOS from {OOS_START})\n"
         f"Asymmetric: Long if ŷ > μ₅₀₀, Short if ŷ < 0  ·  "
         f"NW-HAC {NW_LAGS} lags; |t| > {T_THRESH:.2f} gate; 0.05% slippage",
         fontsize=10, y=0.998,
@@ -1913,7 +1783,6 @@ _ASYM_OOS_R2 = {
     "Model_A":   _OOS_R2.get("Model_A"),
     "Model_C":   _OOS_R2.get("Model_C"),
     "Model_VVIX": _OOS_R2.get("Model_VVIX"),
-    "Model_G":   _OOS_R2.get("Model_G"),
     "Model_H":   _OOS_R2.get("Model_H"),
 }
 for m in _ASYM_MODELS:

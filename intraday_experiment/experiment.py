@@ -104,7 +104,7 @@ def load_intraday_rv() -> pd.DataFrame:
     es = es.sort_values(["date", "BIN_START_TIME"])
     es["log_ret"] = (np.log(es["CLOSE"]).groupby(es["date"]).diff() * 100)
 
-    # Daily intraday RV = sum of squared within-day log returns
+    # Daily intraday RV = sum of squared demeaned within-day log returns
     daily_rv = (
         es.dropna(subset=["log_ret"])
         .groupby("date")["log_ret"]

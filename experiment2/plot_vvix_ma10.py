@@ -75,9 +75,9 @@ panel = panel.join(vvix_ma10, how="left")
 daily_ret = panel["daily_ret"].dropna()
 
 # ── Expanding window ───────────────────────────────────────────────────────────
-sub = panel.dropna(subset=["vvix_ma10", "fwd_ret_20"]).copy()
+sub = panel.dropna(subset=["vvix_ma10", "fwd_20d"]).copy()
 N   = len(sub)
-fwd = sub["fwd_ret_20"].values
+fwd = sub["fwd_20d"].values
 
 oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
 start_i = max(MIN_WIN + 20, oos_idx)
@@ -94,7 +94,7 @@ print(f"Running expanding window ({N - start_i} OOS steps)...")
 for i in range(start_i, N):
     train = sub.iloc[0 : i - 20]
     X_tr  = add_constant(train[["vvix_ma10"]], has_constant="skip")
-    res   = OLS(train["fwd_ret_20"], X_tr).fit()
+    res   = OLS(train["fwd_20d"], X_tr).fit()
     nw    = _nw_se(res, nlags=NW_LAGS)
     b     = float(res.params.iloc[1])
     se    = float(nw[1])
@@ -111,8 +111,8 @@ for i in range(start_i, N):
     test_row_r2.insert(0, "const", 1.0)
     y_hat_r2 = float(res.predict(test_row_r2).iloc[0])
     oos_r2_y_hat.append(y_hat_r2)
-    oos_r2_y_act.append(float(sub["fwd_ret_20"].iloc[i]))
-    oos_r2_y_bar.append(float(train["fwd_ret_20"].mean()))
+    oos_r2_y_act.append(float(sub["fwd_20d"].iloc[i]))
+    oos_r2_y_bar.append(float(train["fwd_20d"].mean()))
 
     if abs(t_b) <= T_THRESH:
         continue
@@ -181,12 +181,9 @@ def make_plot(pos_dict, title_suffix, out_path):
         gridspec_kw={"height_ratios": h_ratios, "hspace": 0.35},
     )
 
-    # OOS R² label in title
-    _oos_r2_str = f"\nOOS R² = {OOS_R2:.4f}" if not np.isnan(OOS_R2) else ""
-
     fig.suptitle(
         f"VVIX MA10 -> 20-day Forward Return  (Expanding Window, OOS from {OOS_START})"
-        f"{title_suffix}{_oos_r2_str}\n"
+        f"{title_suffix}\n"
         f"Training grows daily; OOS gap = 20 days; NW-HAC 20 lags; "
         f"|t| > {T_THRESH:.2f} gate; 0.05% slippage",
         fontsize=10, y=0.998,

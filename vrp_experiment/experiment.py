@@ -58,8 +58,8 @@ PAPER_START      = "1990-01-02"
 PAPER_END        = "2010-10-01"
 PAPER_SPLIT      = "2005-07-15"   # 75% train split (matching B&H)
 ROLL_WIN         = 500            # production-loop rolling window (trading days)
-EXP_TRAIN_START  = "2006-01-01"  # expanding-window anchor (matches experiment2 signal start)
-EXP_OOS_START    = "2013-01-01"  # first OOS prediction (after 2006-2012 initial training)
+EXP_TRAIN_START  = "1990-01-02"  # expanding-window anchor (full history from paper start)
+EXP_OOS_START    = "2006-01-01"  # first OOS prediction (after 1990-2005 initial training)
 
 # ── Paper benchmarks (Table 3, Model 8) ──────────────────────────────────────
 PAPER_COEFS = {"const": 3.730, "VIX2_lag": 0.108, "RV22_lag": 0.199,
@@ -1298,7 +1298,7 @@ def main():
           f"EW OOS RMSE={np.sqrt((prod_ew['error']**2).mean()):.3f}")
     plot_combined_vrp_summary(
         prod_ew, stats_ew, tag="expanding",
-        window_label="Expanding Window OLS (initial train 2006–2012)"
+        window_label="Expanding Window OLS (initial train 1990–2005)"
     )
     prod_ew.to_csv(OUTPUT / "production_loop_expanding.csv")
 

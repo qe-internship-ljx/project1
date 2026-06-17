@@ -169,7 +169,7 @@ print(f"Saved: {out1}")
 METRICS = [
     ("total_ret",    "Total Return (%)",                        100, False),
     ("ann_ret",      "Annualised Return (%)",                   100, False),
-    ("sharpe",       "Sharpe Ratio (0% risk-free)",               1, False),
+    ("sharpe",       "Sharpe Ratio (3% risk-free)",               1, False),
     ("max_dd",       "Max Drawdown (%)",                         100, True ),
     ("avg_position", "Average Position\n(+1 long / 0 flat / -1 short)", 1, False),
 ]

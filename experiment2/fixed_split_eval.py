@@ -50,6 +50,7 @@ EW_MODEL_DIR = {
     "Model_A":     DIR_EW      / "VRP + Term Slope",
     "Model_B":     DIR_EW_POOR / "VRP + Trend",
     "Model_C":     DIR_EW      / "VRP + VVIX MA5",
+    "Model_D":     DIR_EW      / "trivariate",
     "Model_VVIX":  DIR_EW      / "VVIX MA5",
     "Model_Basis": DIR_EW_POOR / "VIX Basis",
     "Model_H":     DIR_EW      / "VRP Split",
@@ -104,6 +105,7 @@ MODEL_FEATURES = {
     "Model_A":     ["VP", "term_slope"],
     "Model_B":     ["VP", "trend_q"],
     "Model_C":     ["VP", "vvix_ma5"],
+    "Model_D":     ["VP", "vvix_ma5", "term_slope"],
     "Model_VVIX":  ["vvix_ma5"],
     "Model_Basis": ["vix_basis"],
     "Model_H":     ["vrp_pos", "vrp_neg"],
@@ -113,6 +115,7 @@ MODEL_LABEL = {
     "Model_A":     "Model A — VRP + Term Slope",
     "Model_B":     "Model B — VRP + Trend Quotient",
     "Model_C":     "Model C — VRP + VVIX MA5",
+    "Model_D":     "Model D — VRP + VVIX MA5 + Term Slope",
     "Model_VVIX":  "Model VVIX — Univariate VVIX MA5",
     "Model_Basis": "Model Basis — Univariate VIX Basis",
     "Model_H":     "Model H — VRP split (positive / negative)",
@@ -122,6 +125,7 @@ MODEL_PALETTE = {
     "Model_A":     ["#00441b", "#238b45", "#74c476", "#c7e9c0"],
     "Model_B":     ["#7f3b08", "#b35806", "#e08214", "#fdb863"],
     "Model_C":     ["#3f007d", "#6a51a3", "#9e9ac8", "#dadaeb"],
+    "Model_D":     ["#2e1503", "#7f3c00", "#c45c00", "#f08030"],
     "Model_VVIX":  ["#7f2704", "#d94801", "#fd8d3c", "#fdbe85"],
     "Model_Basis": ["#004d40", "#00796b", "#26a69a", "#80cbc4"],
     "Model_H":     ["#1a3300", "#336600", "#5c9900", "#99cc33"],
@@ -300,29 +304,30 @@ def run_expanding_window_rolmu(panel, model, delta, t_threshold=T_THRESH,
     return pos
 
 
-def run_expanding_window_asym(panel, model, t_threshold=T_THRESH,
+def run_expanding_window_asym(panel, model, delta=0.0, t_threshold=T_THRESH,
                                rolling_window=500):
     """
-    Expanding window with asymmetric threshold (no delta parameter).
+    Expanding window with asymmetric threshold.
     At prediction day i:
         mu500 = mean of fwd_20d over the last `rolling_window` training rows
-        long  when y_hat > mu500   (prediction beats recent historical mean)
-        short when y_hat < 0       (prediction negative, regardless of magnitude)
+        long  when y_hat > mu500 + delta  (prediction clears mean by delta)
+        short when y_hat < -delta          (prediction is sufficiently negative)
         flat  otherwise
+    At delta=0 this reduces to the original rule: long if ŷ > μ₅₀₀, short if ŷ < 0.
     T-stat gate still applies; only t-stat gated positions enter the signal.
     """
     feat_cols = MODEL_FEATURES[model]
-    tag = (f"pos_EW_asym_{model}_t{int(t_threshold*100)}"
-           f"_rw{rolling_window}_oos{OOS_START}.parquet")
+    tag = (f"pos_EW_asym_{model}_d{int(delta*10000)}bps"
+           f"_t{int(t_threshold*100)}_rw{rolling_window}_oos{OOS_START}.parquet")
     cache_path = CACHE_DIR / tag
     if cache_path.exists():
         s = pd.read_parquet(cache_path).squeeze()
-        s.name = f"pos_EWasym_{model}"
+        s.name = f"pos_EWasym_{model}_d{delta}"
         return s
 
     sub = panel.dropna(subset=feat_cols + ["fwd_20d"]).copy()
     N   = len(sub)
-    pos = pd.Series(0.0, index=sub.index, name=f"pos_EWasym_{model}")
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_EWasym_{model}_d{delta}")
 
     oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
     start_i = max(MIN_WIN + 20, oos_idx)
@@ -345,8 +350,8 @@ def run_expanding_window_asym(panel, model, t_threshold=T_THRESH,
         test_row.insert(0, "const", 1.0)
         y_hat = float(res.predict(test_row).iloc[0])
 
-        if   y_hat > mu500: pos.iloc[i] =  1.0
-        elif y_hat < 0.0:   pos.iloc[i] = -1.0
+        if   y_hat > mu500 + delta: pos.iloc[i] =  1.0
+        elif y_hat < -delta:         pos.iloc[i] = -1.0
 
     pos.to_frame().to_parquet(cache_path)
     return pos
@@ -410,6 +415,16 @@ for m in _RW_MODELS:
 # ════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ════════════════════════════════════════════════════════════════════════════
+
+def _align_zero(ax_left, ax_right):
+    """Expand both twinx axes so their zero lines sit at the same visual height."""
+    lo1, hi1 = ax_left.get_ylim()
+    lo2, hi2 = ax_right.get_ylim()
+    half1 = max(abs(lo1), abs(hi1)) or 1.0
+    half2 = max(abs(lo2), abs(hi2)) or 1.0
+    ax_left.set_ylim(-half1, half1)
+    ax_right.set_ylim(-half2, half2)
+
 
 def shade(ax):
     for a, b in [("2008-09-01","2009-06-01"),
@@ -552,9 +567,10 @@ def plot_expanding_detail(model, out_path, ew_dict=None, ew_sim_dict=None,
                           extra_title="", r2_oos=None):
     _ew     = ew_dict     if ew_dict     is not None else EW
     _ew_sim = ew_sim_dict if ew_sim_dict is not None else EW_SIM
-    pal       = MODEL_PALETTE[model]
-    feat_cols = MODEL_FEATURES[model]
-    bivariate = len(feat_cols) >= 2
+    pal        = MODEL_PALETTE[model]
+    feat_cols  = MODEL_FEATURES[model]
+    bivariate  = len(feat_cols) >= 2
+    trivariate = len(feat_cols) >= 3
     pred_labels = [FEAT_DISPLAY.get(f, f) for f in feat_cols]
     pred_str    = " + ".join(pred_labels)
 
@@ -665,6 +681,10 @@ def plot_expanding_detail(model, out_path, ew_dict=None, ew_sim_dict=None,
         ax_tb.plot(betas["t_sec"].index, betas["t_sec"].values,
                    color=pal[1], lw=1.0, alpha=0.85, ls="--",
                    label=f"NW t-stat ({pred_labels[1]})")
+    if trivariate:
+        ax_tb.plot(betas["t_ter"].index, betas["t_ter"].values,
+                   color=pal[2], lw=1.0, alpha=0.85, ls="-.",
+                   label=f"NW t-stat ({pred_labels[2]})")
 
     ax_tb.fill_between(t_prim.index, -T_THRESH, T_THRESH,
                        color="firebrick", alpha=0.05, label="Below gate (flat zone)")
@@ -684,10 +704,15 @@ def plot_expanding_detail(model, out_path, ew_dict=None, ew_sim_dict=None,
         ax_tb2.plot(betas["beta_sec"].index, betas["beta_sec"].values,
                     color="dimgrey", lw=1.0, ls=":", alpha=0.50,
                     label=f"Beta ({pred_labels[1]})")
+    if trivariate:
+        ax_tb2.plot(betas["beta_ter"].index, betas["beta_ter"].values,
+                    color="dimgrey", lw=1.0, ls="-.", alpha=0.40,
+                    label=f"Beta ({pred_labels[2]})")
     ax_tb2.axhline(0, color="dimgrey", lw=0.4, ls=":")
     ax_tb2.set_ylabel(f"Beta ({pred_str})", fontsize=8, color="dimgrey")
     ax_tb2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
     ax_tb2.spines["top"].set_visible(False)
+    _align_zero(ax_tb, ax_tb2)
 
     lines1, labs1 = ax_tb.get_legend_handles_labels()
     lines2, labs2 = ax_tb2.get_legend_handles_labels()
@@ -799,7 +824,7 @@ def plot_summary_table(out_path, ew_sim_dict=None, method_label="Expanding Windo
     fig.suptitle(
         f"Performance Summary — {method_label}\n"
         "Best delta (highest OOS Sharpe) shown per method × model  ·  "
-        "Net of 0.05% slippage  ·  0% risk-free",
+        "Net of 0.05% slippage  ·  3% risk-free",
         fontsize=11,
     )
     ax.axis("off")
@@ -878,10 +903,11 @@ def compute_ew_betas(model):
     grows. Cached per model (betas don't depend on delta/threshold variant).
     Returns DataFrame indexed by daily prediction dates (>= OOS_START) with
     columns [beta_VP, se_VP, t_VP] for Base, plus [beta_sec, se_sec, t_sec]
-    for bivariate models.
+    for bivariate models, and [beta_ter, se_ter, t_ter] for trivariate models.
     """
-    feat_cols = MODEL_FEATURES[model]
-    bivariate = len(feat_cols) >= 2
+    feat_cols  = MODEL_FEATURES[model]
+    bivariate  = len(feat_cols) >= 2
+    trivariate = len(feat_cols) >= 3
 
     cache_path = CACHE_DIR / f"betas_EW_{model}_oos{OOS_START}.parquet"
     if cache_path.exists():
@@ -920,6 +946,13 @@ def compute_ew_betas(model):
                 "beta_sec": b_sec,
                 "se_sec":   se_sec,
                 "t_sec":    b_sec / se_sec if se_sec > 0 else 0.0,
+            })
+        if trivariate:
+            b_ter, se_ter = float(res.params.iloc[3]), float(nw[3])
+            rec.update({
+                "beta_ter": b_ter,
+                "se_ter":   se_ter,
+                "t_ter":    b_ter / se_ter if se_ter > 0 else 0.0,
             })
         records.append(rec)
 
@@ -1585,64 +1618,71 @@ print("\nAll done (Random Forest).")
 _ASYM_MODELS = ["Base", "Model_A", "Model_C", "Model_VVIX", "Model_H"]
 
 print("\nComputing expanding-window (asymmetric threshold) positions...")
-EW_ASYM     = {}
-EW_ASYM_SIM = {}
+EW_ASYM     = {}   # (model, di) -> pos
+EW_ASYM_SIM = {}   # (model, di) -> (st, sim)
 for m in _ASYM_MODELS:
-    print(f"  EW-asym  {m}...")
-    pos = run_expanding_window_asym(panel, m)
-    sim = simulate_strategy(pos, daily_ret)
-    sim_oos = sim[sim.index >= OOS_START]
-    st  = compute_performance_stats(sim_oos, f"EWasym_{m}")
-    oos_pos = pos[pos.index >= OOS_START]
-    st["avg_position"] = float(oos_pos.mean())
-    st["pct_long"]  = float((oos_pos ==  1).mean()) * 100
-    st["pct_short"] = float((oos_pos == -1).mean()) * 100
-    st["pct_flat"]  = float((oos_pos ==  0).mean()) * 100
-    EW_ASYM[m]     = pos
-    EW_ASYM_SIM[m] = (st, sim)
+    for di, delta in enumerate(DELTAS):
+        print(f"  EW-asym  {m}  {DELTA_LBL[di]}...")
+        pos = run_expanding_window_asym(panel, m, delta=delta)
+        sim = simulate_strategy(pos, daily_ret)
+        sim_oos = sim[sim.index >= OOS_START]
+        st  = compute_performance_stats(sim_oos, f"EWasym_{m}_{DELTA_LBL[di]}")
+        oos_pos = pos[pos.index >= OOS_START]
+        st["avg_position"] = float(oos_pos.mean())
+        st["pct_long"]  = float((oos_pos ==  1).mean()) * 100
+        st["pct_short"] = float((oos_pos == -1).mean()) * 100
+        st["pct_flat"]  = float((oos_pos ==  0).mean()) * 100
+        EW_ASYM[(m, di)]     = pos
+        EW_ASYM_SIM[(m, di)] = (st, sim)
 
 
 def plot_expanding_asymmetric(model, out_path, r2_oos=None):
     """
-    Two-panel plot for a single asymmetric position series.
-    Panel 1: cumulative net return (strategy vs B&H)
+    Per-model asymmetric threshold plot matching the layout of plot_expanding_detail.
+    Panel 1: cumulative net return — one curve per delta (4 total) + Buy-and-Hold
     Panel 2: NW t-stat and beta over time
-    Panel 3: position over time
+    Panels 3–6: position over time, one panel per delta
+    Long if ŷ > μ₅₀₀ + δ, Short if ŷ < −δ.
     """
-    pos     = EW_ASYM[model]
-    st, sim = EW_ASYM_SIM[model]
-
-    pal       = MODEL_PALETTE[model]
-    feat_cols = MODEL_FEATURES[model]
-    bivariate = len(feat_cols) >= 2
+    pal        = MODEL_PALETTE[model]
+    feat_cols  = MODEL_FEATURES[model]
+    bivariate  = len(feat_cols) >= 2
+    trivariate = len(feat_cols) >= 3
     pred_labels = [FEAT_DISPLAY.get(f, f) for f in feat_cols]
     pred_str    = " + ".join(pred_labels)
 
+    n_d = len(DELTAS)
     fig, axes = plt.subplots(
-        3, 1,
-        figsize=(14, 13),
+        2 + n_d, 1,
+        figsize=(14, 11 + 2.2 * n_d),
         sharex=True,
-        gridspec_kw={"height_ratios": [2.5, 1.2, 1.0], "hspace": 0.35},
+        gridspec_kw={"height_ratios": [2.5, 1.2] + [1.0] * n_d, "hspace": 0.35},
     )
     fig.subplots_adjust(top=0.955, bottom=0.03, left=0.10, right=0.93)
 
     fig.suptitle(
         f"{pred_str} -> 20-day Forward Return  "
         f"(Expanding Window, OOS from {OOS_START})\n"
-        f"Asymmetric: Long if ŷ > μ₅₀₀, Short if ŷ < 0  ·  "
+        f"Asymmetric: Long if ŷ > μ₅₀₀ + δ, Short if ŷ < −δ  ·  "
         f"NW-HAC {NW_LAGS} lags; |t| > {T_THRESH:.2f} gate; 0.05% slippage",
         fontsize=10, y=0.998,
     )
 
     ax_ret  = axes[0]
     ax_tb   = axes[1]
-    ax_p    = axes[2]
+    ax_poss = axes[2:]
     xlim    = (oos_dt, e_dt)
 
-    # stat-window: if signal first activates after 2020-01-01, stats start there
-    _p_oos  = pos[pos.index >= OOS_START]
-    _active = _p_oos[_p_oos != 0]
-    _activation = _active.index.min() if len(_active) else None
+    # stat-window: if signal first activates after 2020-01-01 across any delta, start there
+    _activation = None
+    for di in range(n_d):
+        _p = EW_ASYM[(model, di)]
+        _p_oos = _p[_p.index >= OOS_START]
+        _active = _p_oos[_p_oos != 0]
+        if len(_active):
+            _cand = _active.index.min()
+            if _activation is None or _cand < _activation:
+                _activation = _cand
 
     _rebase_start = None
     if _activation is not None and _activation > pd.Timestamp("2020-01-01"):
@@ -1680,19 +1720,22 @@ def plot_expanding_asymmetric(model, out_path, r2_oos=None):
                            f"ret={_bah_act_st['ann_ret']*100:+.1f}%  "
                            f"DD={_bah_act_st['max_dd']*100:.1f}%]"))
 
-    st_plot = compute_performance_stats(
-        sim[sim.index >= _stat_start], "plot_asym")
-    cum = oos_cumret(sim)
-    pos_stat = pos[pos.index >= _stat_start]
-    pL = float((pos_stat ==  1).mean() * 100)
-    pS = float((pos_stat == -1).mean() * 100)
-    ax_ret.plot(cum.index, cum.values,
-                color=pal[0], lw=1.8, alpha=0.9,
-                label=(f"Asymmetric{_stat_lbl}  "
-                       f"[SR={st_plot['sharpe']:+.2f}  "
-                       f"ret={st_plot['ann_ret']*100:+.1f}%  "
-                       f"DD={st_plot['max_dd']*100:.1f}%  "
-                       f"L{pL:.0f}%/S{pS:.0f}%]"))
+    for di in range(n_d):
+        _, sim_di = EW_ASYM_SIM[(model, di)]
+        st_plot   = compute_performance_stats(
+            sim_di[sim_di.index >= _stat_start], f"plot_asym_{di}")
+        cum     = oos_cumret(sim_di)
+        pos_oos = EW_ASYM[(model, di)]
+        pos_stat = pos_oos[pos_oos.index >= _stat_start]
+        pL = float((pos_stat ==  1).mean() * 100)
+        pS = float((pos_stat == -1).mean() * 100)
+        ax_ret.plot(cum.index, cum.values,
+                    color=pal[di], lw=1.8, ls=LINESTYLE[di], alpha=0.9,
+                    label=(f"{DELTA_LBL[di]}{_stat_lbl}  "
+                           f"[SR={st_plot['sharpe']:+.2f}  "
+                           f"ret={st_plot['ann_ret']*100:+.1f}%  "
+                           f"DD={st_plot['max_dd']*100:.1f}%  "
+                           f"L{pL:.0f}%/S{pS:.0f}%]"))
 
     ax_ret.axhline(1, color="black", lw=0.4, ls=":")
     ax_ret.set_yscale("log")
@@ -1716,6 +1759,10 @@ def plot_expanding_asymmetric(model, out_path, r2_oos=None):
         ax_tb.plot(betas["t_sec"].index, betas["t_sec"].values,
                    color=pal[1], lw=1.0, alpha=0.85, ls="--",
                    label=f"NW t-stat ({pred_labels[1]})")
+    if trivariate:
+        ax_tb.plot(betas["t_ter"].index, betas["t_ter"].values,
+                   color=pal[2], lw=1.0, alpha=0.85, ls="-.",
+                   label=f"NW t-stat ({pred_labels[2]})")
 
     ax_tb.fill_between(t_prim.index, -T_THRESH, T_THRESH,
                        color="firebrick", alpha=0.05, label="Below gate (flat zone)")
@@ -1735,38 +1782,45 @@ def plot_expanding_asymmetric(model, out_path, r2_oos=None):
         ax_tb2.plot(betas["beta_sec"].index, betas["beta_sec"].values,
                     color="dimgrey", lw=1.0, ls=":", alpha=0.50,
                     label=f"Beta ({pred_labels[1]})")
+    if trivariate:
+        ax_tb2.plot(betas["beta_ter"].index, betas["beta_ter"].values,
+                    color="dimgrey", lw=1.0, ls="-.", alpha=0.40,
+                    label=f"Beta ({pred_labels[2]})")
     ax_tb2.axhline(0, color="dimgrey", lw=0.4, ls=":")
     ax_tb2.set_ylabel(f"Beta ({pred_str})", fontsize=8, color="dimgrey")
     ax_tb2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
     ax_tb2.spines["top"].set_visible(False)
+    _align_zero(ax_tb, ax_tb2)
 
     lines1, labs1 = ax_tb.get_legend_handles_labels()
     lines2, labs2 = ax_tb2.get_legend_handles_labels()
     ax_tb.legend(lines1 + lines2, labs1 + labs2, fontsize=8, loc="upper left")
 
-    # ── Panel 3: Position Over Time ───────────────────────────────────────
-    pos_oos = pos[pos.index >= OOS_START]
-    shade(ax_p)
-    ax_p.fill_between(pos_oos.index, pos_oos.where(pos_oos ==  1, 0), 0,
-                      color=pal[0], alpha=0.75)
-    ax_p.fill_between(pos_oos.index, pos_oos.where(pos_oos == -1, 0), 0,
-                      color=pal[0], alpha=0.30, hatch="///")
-    ax_p.axhline(0, color="black", lw=0.4)
-    ax_p.set_ylim(-1.5, 1.5)
-    ax_p.set_yticks([-1, 0, 1])
-    ax_p.set_yticklabels(["Short", "Flat", "Long"], fontsize=8)
-    ax_p.set_ylabel("Asymmetric", fontsize=9, rotation=0,
-                    ha="right", va="center", labelpad=60, color=pal[0])
-    _pL = float((pos_oos ==  1).mean() * 100)
-    _pS = float((pos_oos == -1).mean() * 100)
-    _pF = float((pos_oos ==  0).mean() * 100)
-    ax_p.text(0.01, 0.97,
-              f"Long {_pL:.1f}%  Short {_pS:.1f}%  Flat {_pF:.1f}%  "
-              f"AvgPos={float(pos_oos.mean()):+.3f}",
-              transform=ax_p.transAxes, fontsize=7.5, va="top", color=pal[0])
-    ax_p.spines[["top", "right"]].set_visible(False)
+    # ── Panels 3–6: Position Over Time, one per delta ─────────────────────
+    for di, ax_p in enumerate(ax_poss):
+        pos_full = EW_ASYM[(model, di)]
+        pos_oos  = pos_full[pos_full.index >= OOS_START]
+        shade(ax_p)
+        ax_p.fill_between(pos_oos.index, pos_oos.where(pos_oos ==  1, 0), 0,
+                          color=pal[di], alpha=0.75)
+        ax_p.fill_between(pos_oos.index, pos_oos.where(pos_oos == -1, 0), 0,
+                          color=pal[di], alpha=0.30, hatch="///")
+        ax_p.axhline(0, color="black", lw=0.4)
+        ax_p.set_ylim(-1.5, 1.5)
+        ax_p.set_yticks([-1, 0, 1])
+        ax_p.set_yticklabels(["Short", "Flat", "Long"], fontsize=8)
+        ax_p.set_ylabel(DELTA_LBL[di], fontsize=9, rotation=0,
+                        ha="right", va="center", labelpad=56, color=pal[di])
+        pL = float((pos_oos ==  1).mean() * 100)
+        pS = float((pos_oos == -1).mean() * 100)
+        pF = float((pos_oos ==  0).mean() * 100)
+        ax_p.text(0.01, 0.97,
+                  f"Long {pL:.1f}%  Short {pS:.1f}%  Flat {pF:.1f}%  "
+                  f"AvgPos={float(pos_oos.mean()):+.3f}",
+                  transform=ax_p.transAxes, fontsize=7.5, va="top", color=pal[di])
+        ax_p.spines[["top", "right"]].set_visible(False)
 
-    for ax in [ax_ret, ax_tb, ax_p]:
+    for ax in [ax_ret, ax_tb] + list(ax_poss):
         ax.set_xlim(*xlim)
         ax.xaxis.set_major_locator(mdates.YearLocator(2))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
@@ -1791,3 +1845,1019 @@ for m in _ASYM_MODELS:
     plot_expanding_asymmetric(m, out_path, r2_oos=_ASYM_OOS_R2.get(m))
 
 print("\nAll done (asymmetric).")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MONTHLY VRP — Expanding window, no temporal overlap, no OOS gap
+#
+# Regression: monthly_ret_{t+1} ~ monthly_VRP_t
+#
+# At each month-end m (>= OOS_START):
+#   Training: all (VRP_t, ret_{t+1}) pairs for t < m  — expanding, no gap.
+#             Last training label fwd_ret[m-1] = ret[m], observed by end of
+#             month m (same date we observe VRP_m).  No lookahead. ✓
+#   Predict:  ret_{m+1} using VRP_m.
+#   Hold:     position constant for every trading day in month m+1.
+#
+# Non-overlapping monthly observations eliminate autocorrelation in the
+# regression errors, so NW lags = 3 is sufficient (versus 20 for daily
+# overlapping 20-day returns).
+#
+# Initial training: 2006-03 → 2011-12  (~69 months, well above min_train=36)
+# OOS: 2012-01-01 onwards
+#
+# Outputs:
+#   expanding_window/Monthly VRP/symmetric_Monthly_VRP.png
+#   expanding_window/Monthly VRP/asymmetric_Monthly_VRP.png
+# ════════════════════════════════════════════════════════════════════════════
+
+DIR_MONTHLY       = DIR_EW / "Monthly VRP"
+DIR_MONTHLY.mkdir(parents=True, exist_ok=True)
+
+NW_LAGS_MONTHLY   = 3    # non-overlapping monthly data
+MONTHLY_PAL       = ["#001f4d", "#003d99", "#3366cc", "#80aaff"]
+MONTHLY_ROLL_WIN  = 60   # rolling window (months) for asymmetric μ
+
+
+def _build_monthly_df():
+    """
+    Aggregate panel to monthly.
+    Returns DataFrame indexed by calendar month-ends with columns:
+      VRP     = last daily VRP of the month
+      ret     = compounded daily return of the month
+      fwd_ret = ret.shift(-1)  (next month's return — the regression target)
+    """
+    monthly_vrp = panel["VP"].resample("ME").last()
+    monthly_ret = (panel["daily_ret"] + 1).resample("ME").prod() - 1
+    df = pd.DataFrame({"VRP": monthly_vrp, "ret": monthly_ret}).dropna()
+    df["fwd_ret"] = df["ret"].shift(-1)
+    return df
+
+
+def run_monthly_ew_positions(delta, t_threshold=T_THRESH, min_train=36):
+    """
+    Expanding-window monthly VRP regression — symmetric fixed-delta threshold.
+
+    At prediction row i (month m):
+      Train on rows 0..i-1 (all have known fwd_ret; no gap required).
+      Gate: |NW t(VRP)| > t_threshold.
+      If ŷ > delta → long; ŷ < -delta → short; else flat.
+      Position applied to all trading days in month m+1.
+
+    Cached to CACHE_DIR.
+    """
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_key  = (f"pos_Monthly_EW_d{int(delta*10000)}bps"
+                  f"_t{int(t_threshold*100)}_oos{OOS_START}.parquet")
+    cache_path = CACHE_DIR / cache_key
+    if cache_path.exists():
+        s = pd.read_parquet(cache_path).squeeze()
+        s.name = f"pos_MonthlyEW_d{delta}"
+        return s
+
+    df_all   = _build_monthly_df()
+    df_train = df_all.dropna(subset=["fwd_ret"]).copy()
+    N        = len(df_train)
+
+    oos_start_ts = pd.Timestamp(OOS_START)
+    oos_idx  = df_train.index.searchsorted(oos_start_ts)
+    start_i  = max(min_train, oos_idx)
+
+    monthly_pos = pd.Series(0.0, index=df_train.index)
+
+    for i in range(start_i, N):
+        train = df_train.iloc[0:i]          # expanding: all prior months
+        y_tr  = train["fwd_ret"]
+        X_tr  = add_constant(train[["VRP"]], has_constant="skip")
+        if len(y_tr) < min_train:
+            continue
+        try:
+            res = OLS(y_tr, X_tr).fit()
+            nw  = _nw_se(res, nlags=NW_LAGS_MONTHLY)
+        except Exception:
+            continue
+
+        t_stat = float(res.params.iloc[1]) / nw[1] if nw[1] > 0 else 0.0
+        if abs(t_stat) <= t_threshold:
+            continue                        # stay 0 (flat)
+
+        test_row = df_train.iloc[[i]][["VRP"]].copy()
+        test_row.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test_row).iloc[0])
+
+        if   y_hat >  delta: monthly_pos.iloc[i] =  1.0
+        elif y_hat < -delta: monthly_pos.iloc[i] = -1.0
+
+    # Expand monthly signal → daily: position decided at end of month m
+    # is applied to all trading days in month m+1: (month_end[m], month_end[m+1]]
+    daily_pos  = pd.Series(0.0, index=panel.index, name=f"pos_MonthlyEW_d{delta}")
+    month_ends = df_train.index.tolist()
+    for k, me in enumerate(month_ends):
+        pos_val = monthly_pos.iloc[k]
+        next_me = month_ends[k + 1] if k + 1 < len(month_ends) else panel.index[-1]
+        mask = (panel.index > me) & (panel.index <= next_me)
+        daily_pos[mask] = pos_val
+
+    daily_pos.to_frame().to_parquet(cache_path)
+    return daily_pos
+
+
+def run_monthly_ew_positions_asym(t_threshold=T_THRESH, min_train=36,
+                                   rolling_window=MONTHLY_ROLL_WIN):
+    """
+    Expanding-window monthly VRP regression — asymmetric threshold.
+    Long  if ŷ > μ₆₀  (rolling 60-month mean of realised fwd returns in training)
+    Short if ŷ < 0
+    Flat  otherwise
+    """
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_key  = (f"pos_Monthly_EW_asym_t{int(t_threshold*100)}"
+                  f"_rw{rolling_window}_oos{OOS_START}.parquet")
+    cache_path = CACHE_DIR / cache_key
+    if cache_path.exists():
+        s = pd.read_parquet(cache_path).squeeze()
+        s.name = "pos_MonthlyEW_asym"
+        return s
+
+    df_all   = _build_monthly_df()
+    df_train = df_all.dropna(subset=["fwd_ret"]).copy()
+    N        = len(df_train)
+
+    oos_start_ts = pd.Timestamp(OOS_START)
+    oos_idx  = df_train.index.searchsorted(oos_start_ts)
+    start_i  = max(min_train, oos_idx)
+
+    fwd         = df_train["fwd_ret"].values
+    monthly_pos = pd.Series(0.0, index=df_train.index)
+
+    for i in range(start_i, N):
+        train = df_train.iloc[0:i]
+        y_tr  = train["fwd_ret"]
+        X_tr  = add_constant(train[["VRP"]], has_constant="skip")
+        if len(y_tr) < min_train:
+            continue
+        try:
+            res = OLS(y_tr, X_tr).fit()
+            nw  = _nw_se(res, nlags=NW_LAGS_MONTHLY)
+        except Exception:
+            continue
+
+        t_stat = float(res.params.iloc[1]) / nw[1] if nw[1] > 0 else 0.0
+        if abs(t_stat) <= t_threshold:
+            continue
+
+        lo  = max(0, i - rolling_window)
+        mu  = float(np.mean(fwd[lo:i]))
+
+        test_row = df_train.iloc[[i]][["VRP"]].copy()
+        test_row.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test_row).iloc[0])
+
+        if   y_hat > mu:  monthly_pos.iloc[i] =  1.0
+        elif y_hat < 0.0: monthly_pos.iloc[i] = -1.0
+
+    daily_pos  = pd.Series(0.0, index=panel.index, name="pos_MonthlyEW_asym")
+    month_ends = df_train.index.tolist()
+    for k, me in enumerate(month_ends):
+        pos_val = monthly_pos.iloc[k]
+        next_me = month_ends[k + 1] if k + 1 < len(month_ends) else panel.index[-1]
+        mask = (panel.index > me) & (panel.index <= next_me)
+        daily_pos[mask] = pos_val
+
+    daily_pos.to_frame().to_parquet(cache_path)
+    return daily_pos
+
+
+def compute_monthly_ew_betas(min_train=36):
+    """
+    VRP beta and NW t-stat at each OOS month-end.
+    Returns DataFrame indexed by month-end dates with columns
+    [beta_alpha, se_alpha, t_alpha, beta_VP, se_VP, t_VP].
+    """
+    cache_path = CACHE_DIR / f"betas_Monthly_EW_oos{OOS_START}.parquet"
+    if cache_path.exists():
+        return pd.read_parquet(cache_path)
+
+    print("    Computing monthly EW beta time series (one-time)...")
+    df_all   = _build_monthly_df()
+    df_train = df_all.dropna(subset=["fwd_ret"]).copy()
+    N        = len(df_train)
+
+    oos_start_ts = pd.Timestamp(OOS_START)
+    oos_idx  = df_train.index.searchsorted(oos_start_ts)
+    start_i  = max(min_train, oos_idx)
+
+    records = []
+    for i in range(start_i, N):
+        train = df_train.iloc[0:i]
+        y_tr  = train["fwd_ret"]
+        X_tr  = add_constant(train[["VRP"]], has_constant="skip")
+        try:
+            res = OLS(y_tr, X_tr).fit()
+            nw  = _nw_se(res, nlags=NW_LAGS_MONTHLY)
+            ba, sa = float(res.params.iloc[0]), float(nw[0])
+            bv, sv = float(res.params.iloc[1]), float(nw[1])
+            records.append({
+                "beta_alpha": ba, "se_alpha": sa,
+                "t_alpha":    ba / sa if sa > 0 else 0.0,
+                "beta_VP":    bv, "se_VP":    sv,
+                "t_VP":       bv / sv if sv > 0 else 0.0,
+            })
+        except Exception:
+            records.append({k: np.nan for k in
+                            ["beta_alpha", "se_alpha", "t_alpha",
+                             "beta_VP",    "se_VP",    "t_VP"]})
+
+    df_out = pd.DataFrame(records, index=df_train.index[start_i:])
+    df_out.to_parquet(cache_path)
+    return df_out
+
+
+def _monthly_beta_daily(betas, col):
+    """
+    Forward-fill a monthly-indexed Series onto the daily panel index.
+    For each daily date d, uses the most-recent monthly date <= d.
+    Returns a daily Series restricted to the OOS period.
+    """
+    src = betas[col].dropna()
+    # Union index guarantees every monthly date is present; then ffill and reindex
+    combined = src.reindex(src.index.union(panel.index)).ffill()
+    return combined.reindex(panel.index)
+
+
+def _monthly_t_stat_panel(ax, betas, xlim):
+    """Shared t-stat/beta panel logic for both monthly EW plots."""
+    shade(ax)
+    ax.set_xlim(*xlim)
+
+    t_vp = _monthly_beta_daily(betas, "t_VP")
+    b_vp = _monthly_beta_daily(betas, "beta_VP")
+
+    ax.plot(t_vp.index, t_vp.values,
+            color=MONTHLY_PAL[0], lw=1.0, alpha=0.85,
+            label=f"NW t-stat (VRP) — monthly, NW={NW_LAGS_MONTHLY} lags")
+    ax.fill_between(t_vp.index, -T_THRESH, T_THRESH,
+                    color="firebrick", alpha=0.05, label="Below gate (flat zone)")
+    ax.axhline( T_THRESH, color="firebrick", lw=1.2, ls="--",
+               label=f"|t| = {T_THRESH:.2f} gate")
+    ax.axhline(-T_THRESH, color="firebrick", lw=1.2, ls="--")
+    ax.axhline(0, color="black", lw=0.5, ls=":")
+    ax.set_ylabel("NW t-stat (VRP)", fontsize=9)
+    ax.grid(axis="y", alpha=0.2, lw=0.6)
+    ax.spines["top"].set_visible(False)
+
+    ax2 = ax.twinx()
+    ax2.plot(b_vp.index, b_vp.values,
+             color="dimgrey", lw=1.0, ls="--", alpha=0.60,
+             label="Beta (VRP)")
+    ax2.axhline(0, color="dimgrey", lw=0.4, ls=":")
+    ax2.set_ylabel("Beta (VRP)", fontsize=8, color="dimgrey")
+    ax2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
+    ax2.spines["top"].set_visible(False)
+    _align_zero(ax, ax2)
+
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper left")
+
+
+def plot_monthly_ew_symmetric(out_path):
+    """
+    Layout mirrors plot_expanding_detail (4 delta variants):
+      Panel 1: Cumulative net return (4 deltas + B&H)
+      Panel 2: NW t-stat and beta (monthly step function)
+      Panels 3–6: Position over time (one per delta)
+    """
+    n_d = len(DELTAS)
+
+    # Compute all positions and simulations first
+    MONTHLY_EW     = {}
+    MONTHLY_EW_SIM = {}
+    print("Computing Monthly EW positions (symmetric)...")
+    for di, delta in enumerate(DELTAS):
+        print(f"  Monthly EW  {DELTA_LBL[di]}...")
+        pos     = run_monthly_ew_positions(delta)
+        sim     = simulate_strategy(pos, daily_ret)
+        sim_oos = sim[sim.index >= OOS_START]
+        st      = compute_performance_stats(sim_oos, f"MonthlyEW_{DELTA_LBL[di]}")
+        oos_pos = pos[pos.index >= OOS_START]
+        st["avg_position"] = float(oos_pos.mean())
+        st["pct_long"]  = float((oos_pos ==  1).mean()) * 100
+        st["pct_short"] = float((oos_pos == -1).mean()) * 100
+        st["pct_flat"]  = float((oos_pos ==  0).mean()) * 100
+        MONTHLY_EW[di]     = pos
+        MONTHLY_EW_SIM[di] = (st, sim)
+
+    # Activation window (consistent stat start across deltas)
+    _activation = None
+    for di in range(n_d):
+        _p     = MONTHLY_EW[di]
+        _p_oos = _p[_p.index >= OOS_START]
+        _act   = _p_oos[_p_oos != 0]
+        if len(_act):
+            _cand = _act.index.min()
+            if _activation is None or _cand < _activation:
+                _activation = _cand
+
+    _rebase_start = None
+    if _activation is not None and _activation > pd.Timestamp("2020-01-01"):
+        _bah_idx      = bah_sim.index
+        _act_iloc     = _bah_idx.searchsorted(_activation)
+        _rebase_start = _bah_idx[min(_act_iloc + 1, len(_bah_idx) - 1)]
+    _stat_start = _rebase_start if _rebase_start is not None else pd.Timestamp(OOS_START)
+    _stat_lbl   = (f" · stats from {_stat_start.strftime('%Y-%m-%d')}"
+                   if _rebase_start is not None else "")
+
+    fig, axes = plt.subplots(
+        2 + n_d, 1,
+        figsize=(14, 11 + 2.2 * n_d),
+        sharex=True,
+        gridspec_kw={"height_ratios": [2.5, 1.2] + [1.0] * n_d, "hspace": 0.35},
+    )
+    fig.subplots_adjust(top=0.955, bottom=0.03, left=0.10, right=0.93)
+    fig.suptitle(
+        f"VRP → Next-Month Return  (Monthly Expanding Window, OOS from {OOS_START})\n"
+        f"Training grows 1 month at a time; no OOS gap (non-overlapping monthly obs); "
+        f"NW-HAC {NW_LAGS_MONTHLY} lags; |t| > {T_THRESH:.2f} gate; 0.05% slippage",
+        fontsize=10, y=0.998,
+    )
+
+    ax_ret  = axes[0]
+    ax_tb   = axes[1]
+    ax_poss = axes[2:]
+    xlim    = (oos_dt, e_dt)
+
+    # ── Panel 1: Cumulative Net Return ────────────────────────────────────
+    ax_ret.set_xlim(*xlim)
+    shade(ax_ret)
+
+    _bah_st_plot = compute_performance_stats(
+        bah_sim[bah_sim.index >= _stat_start], "BaH_plot")
+    bah_oos = oos_cumret(bah_sim)
+    ax_ret.plot(bah_oos.index, bah_oos.values,
+                color=BAH_COLOR, lw=1.5, ls="-.", alpha=0.6,
+                label=(f"Buy-and-Hold{_stat_lbl}  "
+                       f"[SR={_bah_st_plot['sharpe']:+.2f}  "
+                       f"ret={_bah_st_plot['ann_ret']*100:+.1f}%  "
+                       f"DD={_bah_st_plot['max_dd']*100:.1f}%]"))
+
+    for di in range(n_d):
+        st, sim_di = MONTHLY_EW_SIM[di]
+        st_plot    = compute_performance_stats(
+            sim_di[sim_di.index >= _stat_start], f"plot_{di}")
+        cum     = oos_cumret(sim_di)
+        pos_oos = MONTHLY_EW[di][MONTHLY_EW[di].index >= _stat_start]
+        pL = float((pos_oos ==  1).mean() * 100)
+        pS = float((pos_oos == -1).mean() * 100)
+        ax_ret.plot(cum.index, cum.values,
+                    color=MONTHLY_PAL[di], lw=1.8, alpha=0.9,
+                    label=(f"{DELTA_LBL[di]}  "
+                           f"[SR={st_plot['sharpe']:+.2f}  "
+                           f"ret={st_plot['ann_ret']*100:+.1f}%  "
+                           f"DD={st_plot['max_dd']*100:.1f}%  "
+                           f"L{pL:.0f}%/S{pS:.0f}%]"))
+
+    ax_ret.axhline(1, color="black", lw=0.4, ls=":")
+    ax_ret.set_yscale("log")
+    ax_ret.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}x"))
+    ax_ret.set_ylabel("Cumulative Net Return (log)", fontsize=9)
+    ax_ret.legend(fontsize=8, loc="upper left", framealpha=0.92)
+    ax_ret.grid(axis="y", alpha=0.2, lw=0.6)
+    ax_ret.spines[["top", "right"]].set_visible(False)
+
+    # ── Panel 2: NW t-stat and Beta Over Time (monthly step function) ─────
+    betas = compute_monthly_ew_betas()
+    _monthly_t_stat_panel(ax_tb, betas, xlim)
+
+    # ── Panels 3–6: Position Over Time ───────────────────────────────────
+    for di, ax_p in enumerate(ax_poss):
+        pos_full = MONTHLY_EW[di]
+        pos      = pos_full[pos_full.index >= OOS_START]
+        shade(ax_p)
+        ax_p.fill_between(pos.index, pos.where(pos ==  1, 0), 0,
+                          color=MONTHLY_PAL[di], alpha=0.75)
+        ax_p.fill_between(pos.index, pos.where(pos == -1, 0), 0,
+                          color=MONTHLY_PAL[di], alpha=0.30, hatch="///")
+        ax_p.axhline(0, color="black", lw=0.4)
+        ax_p.set_ylim(-1.5, 1.5)
+        ax_p.set_yticks([-1, 0, 1])
+        ax_p.set_yticklabels(["Short", "Flat", "Long"], fontsize=8)
+        ax_p.set_ylabel(DELTA_LBL[di], fontsize=9, rotation=0,
+                        ha="right", va="center", labelpad=56, color=MONTHLY_PAL[di])
+        pL = float((pos ==  1).mean() * 100)
+        pS = float((pos == -1).mean() * 100)
+        pF = float((pos ==  0).mean() * 100)
+        ax_p.text(0.01, 0.97,
+                  f"Long {pL:.1f}%  Short {pS:.1f}%  Flat {pF:.1f}%  "
+                  f"AvgPos={float(pos.mean()):+.3f}",
+                  transform=ax_p.transAxes, fontsize=7.5, va="top",
+                  color=MONTHLY_PAL[di])
+        ax_p.spines[["top", "right"]].set_visible(False)
+
+    for ax in [ax_ret, ax_tb] + list(ax_poss):
+        ax.xaxis.set_major_locator(mdates.YearLocator(2))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+        ax.tick_params(axis="x", which="major", labelbottom=True, labelsize=7, pad=2)
+
+    fig.savefig(out_path, dpi=155, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out_path.name}")
+
+
+def plot_monthly_ew_asymmetric(out_path):
+    """
+    Monthly EW asymmetric threshold — single position series.
+      Panel 1: cumulative return (strategy vs B&H)
+      Panel 2: NW t-stat and beta over time (monthly step function)
+      Panel 3: position over time
+    """
+    print("Computing Monthly EW positions (asymmetric)...")
+    pos     = run_monthly_ew_positions_asym()
+    sim     = simulate_strategy(pos, daily_ret)
+    sim_oos = sim[sim.index >= OOS_START]
+    st      = compute_performance_stats(sim_oos, "MonthlyEW_asym")
+    oos_pos = pos[pos.index >= OOS_START]
+
+    _active       = oos_pos[oos_pos != 0]
+    _activation   = _active.index.min() if len(_active) else None
+    _rebase_start = None
+    if _activation is not None and _activation > pd.Timestamp("2020-01-01"):
+        _bah_idx      = bah_sim.index
+        _act_iloc     = _bah_idx.searchsorted(_activation)
+        _rebase_start = _bah_idx[min(_act_iloc + 1, len(_bah_idx) - 1)]
+    _stat_start = _rebase_start if _rebase_start is not None else pd.Timestamp(OOS_START)
+    _stat_lbl   = (f" · stats from {_stat_start.strftime('%Y-%m-%d')}"
+                   if _rebase_start is not None else "")
+
+    fig, axes = plt.subplots(
+        3, 1,
+        figsize=(14, 13),
+        sharex=True,
+        gridspec_kw={"height_ratios": [2.5, 1.2, 1.0], "hspace": 0.35},
+    )
+    fig.subplots_adjust(top=0.955, bottom=0.03, left=0.10, right=0.93)
+    fig.suptitle(
+        f"VRP → Next-Month Return  (Monthly Expanding Window, OOS from {OOS_START})\n"
+        f"Asymmetric: Long if ŷ > μ₆₀, Short if ŷ < 0  ·  "
+        f"NW-HAC {NW_LAGS_MONTHLY} lags; |t| > {T_THRESH:.2f} gate; 0.05% slippage",
+        fontsize=10, y=0.998,
+    )
+
+    ax_ret = axes[0]
+    ax_tb  = axes[1]
+    ax_p   = axes[2]
+    xlim   = (oos_dt, e_dt)
+
+    # ── Panel 1: Cumulative Net Return ────────────────────────────────────
+    ax_ret.set_xlim(*xlim)
+    shade(ax_ret)
+
+    _bah_st_plot = compute_performance_stats(
+        bah_sim[bah_sim.index >= _stat_start], "BaH_plot")
+    bah_oos = oos_cumret(bah_sim)
+    ax_ret.plot(bah_oos.index, bah_oos.values,
+                color=BAH_COLOR, lw=1.5, ls="-.", alpha=0.6,
+                label=(f"Buy-and-Hold{_stat_lbl}  "
+                       f"[SR={_bah_st_plot['sharpe']:+.2f}  "
+                       f"ret={_bah_st_plot['ann_ret']*100:+.1f}%  "
+                       f"DD={_bah_st_plot['max_dd']*100:.1f}%]"))
+
+    st_plot  = compute_performance_stats(
+        sim[sim.index >= _stat_start], "plot_asym")
+    cum      = oos_cumret(sim)
+    pos_stat = pos[pos.index >= _stat_start]
+    pL = float((pos_stat ==  1).mean() * 100)
+    pS = float((pos_stat == -1).mean() * 100)
+    ax_ret.plot(cum.index, cum.values,
+                color=MONTHLY_PAL[0], lw=1.8, alpha=0.9,
+                label=(f"Asymmetric (μ₆₀){_stat_lbl}  "
+                       f"[SR={st_plot['sharpe']:+.2f}  "
+                       f"ret={st_plot['ann_ret']*100:+.1f}%  "
+                       f"DD={st_plot['max_dd']*100:.1f}%  "
+                       f"L{pL:.0f}%/S{pS:.0f}%]"))
+
+    ax_ret.axhline(1, color="black", lw=0.4, ls=":")
+    ax_ret.set_yscale("log")
+    ax_ret.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}x"))
+    ax_ret.set_ylabel("Cumulative Net Return (log)", fontsize=9)
+    ax_ret.legend(fontsize=8, loc="upper left", framealpha=0.92)
+    ax_ret.grid(axis="y", alpha=0.2, lw=0.6)
+    ax_ret.spines[["top", "right"]].set_visible(False)
+
+    # ── Panel 2: NW t-stat and Beta Over Time ────────────────────────────
+    betas = compute_monthly_ew_betas()
+    _monthly_t_stat_panel(ax_tb, betas, xlim)
+
+    # ── Panel 3: Position Over Time ───────────────────────────────────────
+    pos_oos = pos[pos.index >= OOS_START]
+    shade(ax_p)
+    ax_p.fill_between(pos_oos.index, pos_oos.where(pos_oos ==  1, 0), 0,
+                      color=MONTHLY_PAL[0], alpha=0.75)
+    ax_p.fill_between(pos_oos.index, pos_oos.where(pos_oos == -1, 0), 0,
+                      color=MONTHLY_PAL[0], alpha=0.30, hatch="///")
+    ax_p.axhline(0, color="black", lw=0.4)
+    ax_p.set_ylim(-1.5, 1.5)
+    ax_p.set_yticks([-1, 0, 1])
+    ax_p.set_yticklabels(["Short", "Flat", "Long"], fontsize=8)
+    ax_p.set_ylabel("Asymmetric", fontsize=9, rotation=0,
+                    ha="right", va="center", labelpad=60, color=MONTHLY_PAL[0])
+    _pL = float((pos_oos ==  1).mean() * 100)
+    _pS = float((pos_oos == -1).mean() * 100)
+    _pF = float((pos_oos ==  0).mean() * 100)
+    ax_p.text(0.01, 0.97,
+              f"Long {_pL:.1f}%  Short {_pS:.1f}%  Flat {_pF:.1f}%  "
+              f"AvgPos={float(pos_oos.mean()):+.3f}",
+              transform=ax_p.transAxes, fontsize=7.5, va="top", color=MONTHLY_PAL[0])
+    ax_p.spines[["top", "right"]].set_visible(False)
+
+    for ax in [ax_ret, ax_tb, ax_p]:
+        ax.set_xlim(*xlim)
+        ax.xaxis.set_major_locator(mdates.YearLocator(2))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+        ax.tick_params(axis="x", which="major", labelbottom=True, labelsize=7, pad=2)
+
+    fig.savefig(out_path, dpi=155, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out_path.name}")
+
+
+print("\n--- expanding_window/Monthly VRP/ ---")
+plot_monthly_ew_symmetric(DIR_MONTHLY / "symmetric_Monthly_VRP.png")
+plot_monthly_ew_asymmetric(DIR_MONTHLY / "asymmetric_Monthly_VRP.png")
+print("\nAll done (Monthly VRP expanding window).")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TRIVARIATE MODEL D — VRP + VVIX MA5 + Term Slope — expanding window
+# Three threshold variants: symmetric (fixed ±δ), rolling-mu (±δ shifted by
+# trailing 500-day mean), and asymmetric (long if ŷ > μ₅₀₀, short if ŷ < 0).
+# Output → output/expanding_window/trivariate/
+# ════════════════════════════════════════════════════════════════════════════
+
+print("\nComputing Model D (VRP + VVIX MA5 + Term Slope) symmetric positions...")
+EW_D     = {}
+EW_D_SIM = {}
+for di, delta in enumerate(DELTAS):
+    print(f"  EW  Model_D  {DELTA_LBL[di]}...")
+    pos = run_expanding_window(panel, "Model_D", delta)
+    sim = simulate_strategy(pos, daily_ret)
+    sim_oos = sim[sim.index >= OOS_START]
+    st = compute_performance_stats(sim_oos, f"EW_D_{DELTA_LBL[di]}")
+    oos_pos = pos[pos.index >= OOS_START]
+    st["avg_position"] = float(oos_pos.mean())
+    st["pct_long"]  = float((oos_pos ==  1).mean()) * 100
+    st["pct_short"] = float((oos_pos == -1).mean()) * 100
+    st["pct_flat"]  = float((oos_pos ==  0).mean()) * 100
+    EW_D[("Model_D", di)]     = pos
+    EW_D_SIM[("Model_D", di)] = (st, sim)
+
+print("\n--- expanding_window/trivariate/ symmetric ---")
+plot_expanding_detail(
+    "Model_D",
+    EW_MODEL_DIR["Model_D"] / "symmetric_VRP_+_VVIX_MA5_+_Term_Slope.png",
+    ew_dict=EW_D, ew_sim_dict=EW_D_SIM,
+)
+
+print("\nComputing Model D rolling-mu positions...")
+EW_D_RM     = {}
+EW_D_RM_SIM = {}
+for di, delta in enumerate(DELTAS):
+    print(f"  EW-rolmu  Model_D  {DELTA_LBL[di]}...")
+    pos = run_expanding_window_rolmu(panel, "Model_D", delta)
+    sim = simulate_strategy(pos, daily_ret)
+    sim_oos = sim[sim.index >= OOS_START]
+    st = compute_performance_stats(sim_oos, f"EWrm_D_{DELTA_LBL[di]}")
+    oos_pos = pos[pos.index >= OOS_START]
+    st["avg_position"] = float(oos_pos.mean())
+    st["pct_long"]  = float((oos_pos ==  1).mean()) * 100
+    st["pct_short"] = float((oos_pos == -1).mean()) * 100
+    st["pct_flat"]  = float((oos_pos ==  0).mean()) * 100
+    EW_D_RM[("Model_D", di)]     = pos
+    EW_D_RM_SIM[("Model_D", di)] = (st, sim)
+
+print("\n--- expanding_window/trivariate/ rolling-mu ---")
+plot_expanding_detail(
+    "Model_D",
+    EW_MODEL_DIR["Model_D"] / "base_return_shift_VRP_+_VVIX_MA5_+_Term_Slope.png",
+    ew_dict=EW_D_RM, ew_sim_dict=EW_D_RM_SIM,
+    extra_title=" · Threshold = rolling-avg(20d return) ± δ",
+)
+
+print("\nComputing Model D asymmetric positions...")
+for di, delta in enumerate(DELTAS):
+    print(f"  EW-asym  Model_D  {DELTA_LBL[di]}...")
+    pos_d_asym = run_expanding_window_asym(panel, "Model_D", delta=delta)
+    sim_d_asym = simulate_strategy(pos_d_asym, daily_ret)
+    sim_d_oos  = sim_d_asym[sim_d_asym.index >= OOS_START]
+    st_d_asym  = compute_performance_stats(sim_d_oos, f"EWasym_Model_D_{DELTA_LBL[di]}")
+    oos_pos_d  = pos_d_asym[pos_d_asym.index >= OOS_START]
+    st_d_asym["avg_position"] = float(oos_pos_d.mean())
+    st_d_asym["pct_long"]  = float((oos_pos_d ==  1).mean()) * 100
+    st_d_asym["pct_short"] = float((oos_pos_d == -1).mean()) * 100
+    st_d_asym["pct_flat"]  = float((oos_pos_d ==  0).mean()) * 100
+    EW_ASYM[("Model_D", di)]     = pos_d_asym
+    EW_ASYM_SIM[("Model_D", di)] = (st_d_asym, sim_d_asym)
+
+print("\n--- expanding_window/trivariate/ asymmetric ---")
+plot_expanding_asymmetric(
+    "Model_D",
+    EW_MODEL_DIR["Model_D"] / "asymmetric_VRP_+_VVIX_MA5_+_Term_Slope.png",
+)
+
+print("\nAll done (Model D trivariate).")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MONTHLY VRP UNBOUND — Multi-level position sizing (±1..4)
+#
+# Three threshold flavours mirroring leveraged_strategies.py, adapted for
+# monthly non-overlapping expanding-window data:
+#
+#   symmetric:         pos = ±level(|y_hat|)
+#   asymmetric:        long by level(y_hat − μ₆₀), short by level(−y_hat<0)
+#   base_return_shift: pos = ±level(|y_hat − μ₆₀|)
+#
+# Level schedule (same THRESHOLDS as leveraged_strategies.py):
+#   |excess| ≥ 1.0%  → ±4    |excess| ≥ 0.75% → ±3
+#   |excess| ≥ 0.5%  → ±2    |excess| ≥ 0.2%  → ±1    otherwise → 0
+#
+# No OOS gap (non-overlapping monthly obs).  NW lags = 3.
+# Outputs: expanding_window/Monthly VRP/
+#   unbound_symmetric_Monthly_VRP.png
+#   unbound_asymmetric_Monthly_VRP.png
+#   unbound_base_return_shift_Monthly_VRP.png
+# ════════════════════════════════════════════════════════════════════════════
+
+UB_MON_THRESHOLDS = [0.010, 0.0075, 0.005, 0.002]  # descending: highest → ±4
+UB_MON_LEVELS     = [4, 3, 2, 1]
+MONTHLY_UB_COLOR  = MONTHLY_PAL[0]                  # "#001f4d" dark navy
+BAND_COLS         = ["#cbc9e2", "#9e9ac8", "#807dba", "#6a51a3"]
+
+_UB_MON_THRESH_LBL = {
+    "sym":   "Symmetric (Unbound)",
+    "asym":  "Asymmetric (Unbound)",
+    "rolmu": "Base-Return-Shift (Unbound)",
+}
+_UB_MON_THRESH_DESC = {
+    "sym":   "Long/Short ±1..4 at |ŷ| ≥ 0.2/0.5/0.75/1.0%",
+    "asym":  "Long +1..4 at (ŷ−μ₆₀) ≥ 0.2..1.0%  |  Short −1..−4 at (−ŷ) ≥ 0.2..1.0%",
+    "rolmu": "Long/Short ±1..4 at |ŷ − μ₆₀| ≥ 0.2/0.5/0.75/1.0%",
+}
+
+
+def _ub_mon_level(excess_abs):
+    for thresh, lv in zip(UB_MON_THRESHOLDS, UB_MON_LEVELS):
+        if excess_abs >= thresh:
+            return lv
+    return 0
+
+
+def _expand_mon_to_daily(monthly_pos, df_train_idx, pos_name):
+    """Forward-fill monthly position (set at month-end m) into month m+1 days."""
+    daily_pos  = pd.Series(0.0, index=panel.index, name=pos_name)
+    month_ends = df_train_idx.tolist()
+    for k, me in enumerate(month_ends):
+        pos_val = monthly_pos.iloc[k]
+        next_me = month_ends[k + 1] if k + 1 < len(month_ends) else panel.index[-1]
+        mask    = (panel.index > me) & (panel.index <= next_me)
+        daily_pos[mask] = pos_val
+    return daily_pos
+
+
+def run_monthly_ew_unbound_sym(min_train=36):
+    """Symmetric unbound monthly EW: pos = ±level(|ŷ|)."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = CACHE_DIR / f"pos_Monthly_EW_unbound_sym_t{int(T_THRESH*100)}_oos{OOS_START}.parquet"
+    if cache_path.exists():
+        return pd.read_parquet(cache_path).squeeze().rename("pos_Monthly_EW_ub_sym")
+
+    df_all   = _build_monthly_df()
+    df_train = df_all.dropna(subset=["fwd_ret"]).copy()
+    N        = len(df_train)
+    oos_idx  = df_train.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i  = max(min_train, oos_idx)
+    monthly_pos = pd.Series(0.0, index=df_train.index)
+
+    for i in range(start_i, N):
+        train = df_train.iloc[0:i]
+        if len(train) < min_train:
+            continue
+        try:
+            res = OLS(train["fwd_ret"], add_constant(train[["VRP"]], has_constant="skip")).fit()
+            nw  = _nw_se(res, nlags=NW_LAGS_MONTHLY)
+        except Exception:
+            continue
+        t_stat = float(res.params.iloc[1]) / nw[1] if nw[1] > 0 else 0.0
+        if abs(t_stat) <= T_THRESH:
+            continue
+        test = df_train.iloc[[i]][["VRP"]].copy(); test.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test).iloc[0])
+        lv    = _ub_mon_level(abs(y_hat))
+        if lv > 0:
+            monthly_pos.iloc[i] = float(lv) if y_hat > 0 else float(-lv)
+
+    daily_pos = _expand_mon_to_daily(monthly_pos, df_train.index, "pos_Monthly_EW_ub_sym")
+    daily_pos.to_frame().to_parquet(cache_path)
+    return daily_pos
+
+
+def run_monthly_ew_unbound_asym(rolling_window=MONTHLY_ROLL_WIN, min_train=36):
+    """Asymmetric unbound monthly EW.
+    Long  = +level(ŷ − μ) when (ŷ − μ) > 0
+    Short = −level(−ŷ)   when  ŷ < 0
+    """
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = CACHE_DIR / (
+        f"pos_Monthly_EW_unbound_asym_t{int(T_THRESH*100)}_rw{rolling_window}_oos{OOS_START}.parquet")
+    if cache_path.exists():
+        return pd.read_parquet(cache_path).squeeze().rename("pos_Monthly_EW_ub_asym")
+
+    df_all   = _build_monthly_df()
+    df_train = df_all.dropna(subset=["fwd_ret"]).copy()
+    N        = len(df_train)
+    oos_idx  = df_train.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i  = max(min_train, oos_idx)
+    fwd      = df_train["fwd_ret"].values
+    monthly_pos = pd.Series(0.0, index=df_train.index)
+
+    for i in range(start_i, N):
+        train = df_train.iloc[0:i]
+        if len(train) < min_train:
+            continue
+        try:
+            res = OLS(train["fwd_ret"], add_constant(train[["VRP"]], has_constant="skip")).fit()
+            nw  = _nw_se(res, nlags=NW_LAGS_MONTHLY)
+        except Exception:
+            continue
+        t_stat = float(res.params.iloc[1]) / nw[1] if nw[1] > 0 else 0.0
+        if abs(t_stat) <= T_THRESH:
+            continue
+        mu    = float(np.mean(fwd[max(0, i - rolling_window):i]))
+        test  = df_train.iloc[[i]][["VRP"]].copy(); test.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test).iloc[0])
+        lv_l  = _ub_mon_level(y_hat - mu) if (y_hat - mu) > 0 else 0
+        lv_s  = _ub_mon_level(-y_hat)     if y_hat        < 0 else 0
+        if lv_l > 0:
+            monthly_pos.iloc[i] =  float(lv_l)
+        elif lv_s > 0:
+            monthly_pos.iloc[i] = -float(lv_s)
+
+    daily_pos = _expand_mon_to_daily(monthly_pos, df_train.index, "pos_Monthly_EW_ub_asym")
+    daily_pos.to_frame().to_parquet(cache_path)
+    return daily_pos
+
+
+def run_monthly_ew_unbound_rolmu(rolling_window=MONTHLY_ROLL_WIN, min_train=36):
+    """Base-return-shift unbound monthly EW: pos = ±level(|ŷ − μ₆₀|)."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = CACHE_DIR / (
+        f"pos_Monthly_EW_unbound_rolmu_t{int(T_THRESH*100)}_rw{rolling_window}_oos{OOS_START}.parquet")
+    if cache_path.exists():
+        return pd.read_parquet(cache_path).squeeze().rename("pos_Monthly_EW_ub_rolmu")
+
+    df_all   = _build_monthly_df()
+    df_train = df_all.dropna(subset=["fwd_ret"]).copy()
+    N        = len(df_train)
+    oos_idx  = df_train.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i  = max(min_train, oos_idx)
+    fwd      = df_train["fwd_ret"].values
+    monthly_pos = pd.Series(0.0, index=df_train.index)
+
+    for i in range(start_i, N):
+        train = df_train.iloc[0:i]
+        if len(train) < min_train:
+            continue
+        try:
+            res = OLS(train["fwd_ret"], add_constant(train[["VRP"]], has_constant="skip")).fit()
+            nw  = _nw_se(res, nlags=NW_LAGS_MONTHLY)
+        except Exception:
+            continue
+        t_stat = float(res.params.iloc[1]) / nw[1] if nw[1] > 0 else 0.0
+        if abs(t_stat) <= T_THRESH:
+            continue
+        mu     = float(np.mean(fwd[max(0, i - rolling_window):i]))
+        test   = df_train.iloc[[i]][["VRP"]].copy(); test.insert(0, "const", 1.0)
+        y_hat  = float(res.predict(test).iloc[0])
+        excess = y_hat - mu
+        lv     = _ub_mon_level(abs(excess))
+        if lv > 0:
+            monthly_pos.iloc[i] = float(lv) if excess > 0 else float(-lv)
+
+    daily_pos = _expand_mon_to_daily(monthly_pos, df_train.index, "pos_Monthly_EW_ub_rolmu")
+    daily_pos.to_frame().to_parquet(cache_path)
+    return daily_pos
+
+
+def compute_monthly_yhat_mu_series(rolling_window=MONTHLY_ROLL_WIN, min_train=36):
+    """
+    Compute y_hat and rolling-mu monthly series for the predicted-return panel.
+
+    y_hat[i] = α_i + β_i × VRP[i]   (expanding-window betas at OOS month-end i)
+    mu[i]    = mean(fwd_ret[max(0, i-rw) : i])
+
+    Returns (y_hat_monthly, mu_monthly) — monthly Series, forward-filled to
+    daily for plotting via _monthly_beta_daily().
+    """
+    betas    = compute_monthly_ew_betas(min_train=min_train)
+    df_all   = _build_monthly_df()
+    df_train = df_all.dropna(subset=["fwd_ret"]).copy()
+    N        = len(df_train)
+    oos_idx  = df_train.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i  = max(min_train, oos_idx)
+    fwd      = df_train["fwd_ret"].values
+
+    # y_hat from stored betas
+    common = betas.index.intersection(df_train.index)
+    y_hat  = (betas.loc[common, "beta_alpha"]
+              + betas.loc[common, "beta_VP"] * df_train.loc[common, "VRP"])
+    y_hat.name = "y_hat"
+
+    # Rolling mu
+    mu_vals = {}
+    for i in range(start_i, N):
+        mu_vals[df_train.index[i]] = float(np.mean(fwd[max(0, i - rolling_window):i]))
+    mu = pd.Series(mu_vals, name="rolling_mu")
+
+    return y_hat, mu
+
+
+def _to_daily(monthly_ser):
+    """Forward-fill a monthly series onto the daily panel index."""
+    return (monthly_ser
+            .reindex(monthly_ser.index.union(panel.index))
+            .ffill()
+            .reindex(panel.index))
+
+
+def plot_monthly_unbound(threshold_type, sim, y_hat_monthly, mu_monthly, out_path):
+    """
+    4-panel plot for monthly unbound strategies.
+    Panel 1: cumulative return (strategy vs B&H)
+    Panel 2: NW t-stat and beta (monthly step function, forward-filled)
+    Panel 3: position (±4 range)
+    Panel 4: predicted return with threshold bands
+    """
+    oos_dt   = pd.Timestamp(OOS_START)
+    e_dt_plot = daily_ret.index[-1]
+    xlim      = (oos_dt, e_dt_plot)
+
+    y_hat_daily = _to_daily(y_hat_monthly)
+    mu_daily    = _to_daily(mu_monthly)
+    betas       = compute_monthly_ew_betas()
+
+    fig, axes = plt.subplots(
+        4, 1, figsize=(14, 15.4), sharex=True,
+        gridspec_kw={"height_ratios": [2.5, 1.2, 1.0, 1.2], "hspace": 0.35},
+    )
+    fig.subplots_adjust(top=0.955, bottom=0.03, left=0.10, right=0.93)
+    fig.suptitle(
+        f"VRP → Next-Month Return  (Monthly Expanding Window, OOS from {OOS_START})  "
+        f"{_UB_MON_THRESH_LBL[threshold_type]}\n"
+        f"{_UB_MON_THRESH_DESC[threshold_type]}  |  "
+        f"NW-HAC {NW_LAGS_MONTHLY} lags; |t| > {T_THRESH:.2f} gate; 0.05% slippage",
+        fontsize=10, y=0.998,
+    )
+    ax_ret, ax_t, ax_p, ax_yh = axes
+    for ax in axes:
+        ax.set_xlim(*xlim)
+        shade(ax)
+
+    # ── Panel 1: Cumulative return ────────────────────────────────────────
+    pos_oos    = sim["position"][sim.index >= OOS_START]
+    active     = pos_oos[pos_oos != 0]
+    _activation = active.index.min() if len(active) else None
+    _rebase_start = None
+    if _activation is not None and _activation > pd.Timestamp("2020-01-01"):
+        _bah_idx      = bah_sim.index
+        _act_iloc     = _bah_idx.searchsorted(_activation)
+        _rebase_start = _bah_idx[min(_act_iloc + 1, len(_bah_idx) - 1)]
+    _stat_start = _rebase_start if _rebase_start is not None else oos_dt
+    _stat_lbl   = (f" stats from {_stat_start.strftime('%Y-%m-%d')}"
+                   if _rebase_start is not None else "")
+
+    _bah_st = compute_performance_stats(bah_sim[bah_sim.index >= _stat_start], "BaH")
+    bah_oos = oos_cumret(bah_sim)
+    ax_ret.plot(bah_oos.index, bah_oos.values,
+                color=BAH_COLOR, lw=1.5, ls="-.", alpha=0.6,
+                label=(f"Buy-and-Hold{_stat_lbl}  "
+                       f"[SR={_bah_st['sharpe']:+.2f}  "
+                       f"ret={_bah_st['ann_ret']*100:+.1f}%  "
+                       f"DD={_bah_st['max_dd']*100:.1f}%]"))
+
+    st      = compute_performance_stats(sim[sim.index >= _stat_start], "ub_mon")
+    p_stat  = sim["position"][sim.index >= _stat_start]
+    pL      = float((p_stat > 0).mean() * 100)
+    pS      = float((p_stat < 0).mean() * 100)
+    avg_pos = float(p_stat.mean())
+    ax_ret.plot(oos_cumret(sim).index, oos_cumret(sim).values,
+                color=MONTHLY_UB_COLOR, lw=1.8, alpha=0.9,
+                label=(f"Unbound ±1..4{_stat_lbl}  "
+                       f"[SR={st['sharpe']:+.2f}  "
+                       f"ret={st['ann_ret']*100:+.1f}%  "
+                       f"DD={st['max_dd']*100:.1f}%  "
+                       f"L{pL:.0f}%/S{pS:.0f}%  AvgPos={avg_pos:+.2f}]"))
+    ax_ret.axhline(1, color="black", lw=0.4, ls=":")
+    ax_ret.set_yscale("log")
+    ax_ret.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}x"))
+    ax_ret.set_ylabel("Cumulative Net Return (log)", fontsize=9)
+    ax_ret.legend(fontsize=8, loc="upper left", framealpha=0.92)
+    ax_ret.grid(axis="y", alpha=0.2, lw=0.6)
+    ax_ret.spines[["top", "right"]].set_visible(False)
+
+    # ── Panel 2: NW t-stat and beta (monthly step function) ───────────────
+    _monthly_t_stat_panel(ax_t, betas, xlim)
+
+    # ── Panel 3: Position ±4 ─────────────────────────────────────────────
+    pos_plot = sim["position"][sim.index >= OOS_START]
+    ax_p.fill_between(pos_plot.index, pos_plot.clip(lower=0), 0,
+                      color=MONTHLY_UB_COLOR, alpha=0.70)
+    ax_p.fill_between(pos_plot.index, pos_plot.clip(upper=0), 0,
+                      color=MONTHLY_UB_COLOR, alpha=0.30, hatch="///")
+    ax_p.axhline(0, color="black", lw=0.4)
+    ax_p.set_ylim(-4.5, 4.5)
+    ax_p.set_yticks([-4, -3, -2, -1, 0, 1, 2, 3, 4])
+    ax_p.tick_params(axis="y", labelsize=7)
+    ax_p.set_ylabel("Position", fontsize=9, rotation=0,
+                    ha="right", va="center", labelpad=56, color=MONTHLY_UB_COLOR)
+    pF = 100.0 - pL - pS
+    ax_p.text(0.01, 0.97,
+              f"Long {pL:.1f}%  Short {pS:.1f}%  Flat {pF:.1f}%  AvgPos={avg_pos:+.3f}",
+              transform=ax_p.transAxes, fontsize=7.5, va="top", color=MONTHLY_UB_COLOR)
+    ax_p.spines[["top", "right"]].set_visible(False)
+
+    # ── Panel 4: Predicted return with threshold bands ────────────────────
+    yh_oos = y_hat_daily[y_hat_daily.index >= oos_dt].dropna()
+    mu_oos = mu_daily[mu_daily.index >= oos_dt].dropna()
+
+    if threshold_type == "sym":
+        for tv, bc in zip(UB_MON_THRESHOLDS, BAND_COLS):
+            ax_yh.fill_between(yh_oos.index, -tv * 100, tv * 100,
+                               alpha=0.18, color=bc, linewidth=0)
+        ax_yh.axhline(0, color="black", lw=1.0, ls="--", alpha=0.5)
+        ax_yh.plot(yh_oos.index, yh_oos.values * 100,
+                   color=MONTHLY_UB_COLOR, lw=0.8, alpha=0.85,
+                   label="ŷ (predicted monthly return)")
+    else:
+        common_idx = yh_oos.index.intersection(mu_oos.index)
+        yh  = yh_oos.loc[common_idx]
+        mu_ = mu_oos.loc[common_idx]
+        if threshold_type == "asym":
+            for tv, bc in zip(UB_MON_THRESHOLDS, BAND_COLS):
+                ax_yh.fill_between(mu_.index,
+                                   mu_.values * 100, (mu_ + tv).values * 100,
+                                   alpha=0.15, color=bc, linewidth=0)
+                ax_yh.fill_between(yh.index, -tv * 100, 0,
+                                   alpha=0.08, color=bc, linewidth=0)
+            ax_yh.axhline(0, color="firebrick", lw=0.8, ls=":",
+                          alpha=0.6, label="Short threshold (0)")
+        else:   # rolmu
+            for tv, bc in zip(UB_MON_THRESHOLDS, BAND_COLS):
+                ax_yh.fill_between(mu_.index,
+                                   (mu_ - tv).values * 100,
+                                   (mu_ + tv).values * 100,
+                                   alpha=0.18, color=bc, linewidth=0)
+        ax_yh.plot(mu_.index, mu_.values * 100,
+                   color="black", lw=1.2, ls="--", alpha=0.75,
+                   label=f"Rolling μ ({MONTHLY_ROLL_WIN}-month fwd return)")
+        ax_yh.plot(yh.index, yh.values * 100,
+                   color=MONTHLY_UB_COLOR, lw=0.8, alpha=0.85,
+                   label="ŷ (predicted monthly return)")
+
+    bp = mpatches.Patch(facecolor="#6a51a3", alpha=0.4,
+                        label="Threshold bands ±0.2/0.5/0.75/1.0%")
+    ax_yh.axhline(0, color="black", lw=0.4, ls=":")
+    ax_yh.set_ylabel("Pred. Return (%)", fontsize=9)
+    ax_yh.grid(axis="y", alpha=0.2, lw=0.6)
+    ax_yh.spines[["top", "right"]].set_visible(False)
+    h, lb = ax_yh.get_legend_handles_labels()
+    ax_yh.legend(h + [bp], lb + [bp.get_label()], fontsize=8, loc="upper left")
+
+    for ax in axes:
+        ax.xaxis.set_major_locator(mdates.YearLocator(2))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+        ax.tick_params(axis="x", which="major", labelbottom=True, labelsize=7, pad=2)
+
+    fig.savefig(out_path, dpi=155, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out_path.name}")
+
+
+print("\n--- expanding_window/Monthly VRP/ unbound strategies ---")
+y_hat_m, mu_m = compute_monthly_yhat_mu_series()
+
+print("  Monthly EW unbound (symmetric)...")
+sim_ub_sym  = simulate_strategy(run_monthly_ew_unbound_sym(),   daily_ret)
+plot_monthly_unbound("sym",   sim_ub_sym,  y_hat_m, mu_m,
+                     DIR_MONTHLY / "leveraged_symmetric_Monthly_VRP.png")
+
+print("  Monthly EW unbound (asymmetric)...")
+sim_ub_asym = simulate_strategy(run_monthly_ew_unbound_asym(),  daily_ret)
+plot_monthly_unbound("asym",  sim_ub_asym, y_hat_m, mu_m,
+                     DIR_MONTHLY / "leveraged_asymmetric_Monthly_VRP.png")
+
+print("  Monthly EW unbound (base_return_shift)...")
+sim_ub_rolmu = simulate_strategy(run_monthly_ew_unbound_rolmu(), daily_ret)
+plot_monthly_unbound("rolmu", sim_ub_rolmu, y_hat_m, mu_m,
+                     DIR_MONTHLY / "leveraged_base_return_shift_Monthly_VRP.png")
+
+print("\nAll done (Monthly VRP unbound strategies).")

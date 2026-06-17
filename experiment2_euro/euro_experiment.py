@@ -546,12 +546,13 @@ def simulate_strategy(positions: pd.Series, daily_ret: pd.Series,
 
 
 def compute_performance_stats(sim: pd.DataFrame, label: str = "") -> dict:
-    """Annualised return, vol, Sharpe (0% rf), max drawdown, trade count."""
+    """Annualised return, vol, Sharpe (3% rf), max drawdown, trade count."""
     daily = sim["net_pnl"].dropna()
     n     = len(daily)
     ann   = float((1 + daily).prod() ** (252 / n) - 1) if n > 0 else np.nan
     vol   = float(daily.std() * np.sqrt(252))
-    sharpe = ann / vol if vol > 0 else np.nan
+    ann_excess = ann - 0.03
+    sharpe = ann_excess / vol if vol > 0 else np.nan
     cum   = sim["cum_net"].dropna()
     max_dd = float(((cum - cum.cummax()) / cum.cummax()).min())
     n_tr  = int((sim["position"].diff().abs() > 0).sum())
@@ -1065,7 +1066,7 @@ def plot_summary_table(out_path, ew_sim_dict, models, method_label, bah_st):
     fig.suptitle(
         f"Performance Summary -- {method_label}  (Euro Stoxx 50)\n"
         "Best delta (highest OOS Sharpe) shown per model  ·  "
-        "Net of 0.05% slippage  ·  0% risk-free rate",
+        "Net of 0.05% slippage  ·  3% risk-free rate",
         fontsize=11,
     )
     ax.axis("off")

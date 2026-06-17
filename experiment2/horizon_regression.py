@@ -387,6 +387,16 @@ def oos_cumret(sim, start=OOS_START):
     return (1 + s).cumprod()
 
 
+def _align_zero(ax_left, ax_right):
+    """Expand both twinx axes so their zero lines sit at the same visual height."""
+    lo1, hi1 = ax_left.get_ylim()
+    lo2, hi2 = ax_right.get_ylim()
+    half1 = max(abs(lo1), abs(hi1)) or 1.0
+    half2 = max(abs(lo2), abs(hi2)) or 1.0
+    ax_left.set_ylim(-half1, half1)
+    ax_right.set_ylim(-half2, half2)
+
+
 def _shade(ax, start, end):
     for a, b in [("2020-02-01", "2020-06-01"), ("2022-01-01", "2022-12-31")]:
         a, b = pd.Timestamp(a), pd.Timestamp(b)
@@ -431,8 +441,9 @@ def _stat_window(sim_dict_or_sim, bah_sim):
 
 def plot_2panel(pred_label, horizon_label, oos_gap, nw_lags,
                 color_palette, sim_dict, betas_df, bah_sim, out_path,
-                r2_oos=None):
-    oos_dt = pd.Timestamp(OOS_START)
+                r2_oos=None, oos_start=None):
+    _oos_start = oos_start if oos_start is not None else OOS_START
+    oos_dt = pd.Timestamp(_oos_start)
     e_dt   = betas_df.index[-1]
     xlim   = (oos_dt, e_dt)
     n_deltas = len(DELTAS)
@@ -452,7 +463,7 @@ def plot_2panel(pred_label, horizon_label, oos_gap, nw_lags,
 
     fig.suptitle(
         f"{pred_label} -> {horizon_label} Forward Return  "
-        f"(Expanding Window, OOS from {OOS_START}){r2_str}\n"
+        f"(Expanding Window, OOS from {_oos_start}){r2_str}\n"
         f"Training grows daily; OOS gap = {oos_gap} days; "
         f"NW-HAC {nw_lags} lags; |t| > {T_THRESH:.2f} gate; 0.05% slippage",
         fontsize=10, y=0.998,
@@ -464,7 +475,7 @@ def plot_2panel(pred_label, horizon_label, oos_gap, nw_lags,
 
     _bah_st_plot = compute_performance_stats(
         bah_sim[bah_sim.index >= _stat_start], "BaH_plot")
-    bah_oos = oos_cumret(bah_sim)
+    bah_oos = oos_cumret(bah_sim, start=_oos_start)
     ax_ret.plot(bah_oos.index, bah_oos.values,
                 color=BAH_COLOR, lw=1.5, ls="-.", alpha=0.6,
                 label=(f"Buy-and-Hold{_stat_lbl}  "
@@ -488,7 +499,7 @@ def plot_2panel(pred_label, horizon_label, oos_gap, nw_lags,
 
     for di, (delta, lbl) in enumerate(zip(DELTAS, DELTA_LBL)):
         _, sim = sim_dict[di]
-        cum    = oos_cumret(sim)
+        cum    = oos_cumret(sim, start=_oos_start)
         st_plot = compute_performance_stats(
             sim[sim.index >= _stat_start], f"EW_{di}_plot")
         pos_stat = sim["position"][sim.index >= _stat_start]
@@ -537,6 +548,7 @@ def plot_2panel(pred_label, horizon_label, oos_gap, nw_lags,
     ax_t2.set_ylabel(f"Beta ({pred_label})", fontsize=8, color="dimgrey")
     ax_t2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
     ax_t2.spines["top"].set_visible(False)
+    _align_zero(ax_t, ax_t2)
 
     lines1, labs1 = ax_t.get_legend_handles_labels()
     lines2, labs2 = ax_t2.get_legend_handles_labels()
@@ -544,7 +556,7 @@ def plot_2panel(pred_label, horizon_label, oos_gap, nw_lags,
 
     for di, (delta, lbl, ax_p) in enumerate(zip(DELTAS, DELTA_LBL, ax_pos)):
         _, sim = sim_dict[di]
-        pos = sim["position"][sim.index >= OOS_START]
+        pos = sim["position"][sim.index >= _oos_start]
         ax_p.set_xlim(*xlim)
         _shade(ax_p, oos_dt, e_dt)
         ax_p.fill_between(pos.index, pos.where(pos ==  1, 0), 0,
@@ -581,8 +593,9 @@ def plot_2panel(pred_label, horizon_label, oos_gap, nw_lags,
 
 def plot_2panel_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_lags,
                           color_palette, sim_dict, betas_df, bah_sim, out_path,
-                          r2_oos=None):
-    oos_dt = pd.Timestamp(OOS_START)
+                          r2_oos=None, oos_start=None):
+    _oos_start = oos_start if oos_start is not None else OOS_START
+    oos_dt = pd.Timestamp(_oos_start)
     e_dt   = betas_df.index[-1]
     xlim   = (oos_dt, e_dt)
     n_deltas = len(DELTAS)
@@ -602,7 +615,7 @@ def plot_2panel_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_l
 
     fig.suptitle(
         f"{pred1_label} + {pred2_label} -> {horizon_label} Forward Return  "
-        f"(Expanding Window, OOS from {OOS_START}){r2_str}\n"
+        f"(Expanding Window, OOS from {_oos_start}){r2_str}\n"
         f"Training grows daily; OOS gap = {oos_gap} days; "
         f"NW-HAC {nw_lags} lags; |t| > {T_THRESH:.2f} gate (both betas); 0.05% slippage",
         fontsize=10, y=0.998,
@@ -614,7 +627,7 @@ def plot_2panel_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_l
 
     _bah_st_plot = compute_performance_stats(
         bah_sim[bah_sim.index >= _stat_start], "BaH_plot")
-    bah_oos = oos_cumret(bah_sim)
+    bah_oos = oos_cumret(bah_sim, start=_oos_start)
     ax_ret.plot(bah_oos.index, bah_oos.values,
                 color=BAH_COLOR, lw=1.5, ls="-.", alpha=0.6,
                 label=(f"Buy-and-Hold{_stat_lbl}  "
@@ -638,7 +651,7 @@ def plot_2panel_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_l
 
     for di, (delta, lbl) in enumerate(zip(DELTAS, DELTA_LBL)):
         _, sim = sim_dict[di]
-        cum     = oos_cumret(sim)
+        cum     = oos_cumret(sim, start=_oos_start)
         st_plot = compute_performance_stats(
             sim[sim.index >= _stat_start], f"EWbiv_{di}_plot")
         pos_stat = sim["position"][sim.index >= _stat_start]
@@ -683,14 +696,19 @@ def plot_2panel_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_l
     ax_t.spines["top"].set_visible(False)
 
     ax_t2 = ax_t.twinx()
-    ax_t2.plot(b1.index, b1.values, color="dimgrey", lw=1.0, ls="-", alpha=0.60,
-               label=f"Beta: {pred1_label}")
-    ax_t2.plot(b2.index, b2.values, color="dimgrey", lw=1.0, ls=":", alpha=0.60,
-               label=f"Beta: {pred2_label}")
+    # Normalize each beta to its own peak so both are visible on the same axis
+    # (raw betas can differ by orders of magnitude across predictors with different units)
+    b1_peak = b1.abs().max() or 1.0
+    b2_peak = b2.abs().max() or 1.0
+    ax_t2.plot(b1.index, b1.values / b1_peak, color="dimgrey", lw=1.0, ls="-", alpha=0.60,
+               label=f"Beta: {pred1_label} (peak={b1_peak:.3g})")
+    ax_t2.plot(b2.index, b2.values / b2_peak, color="dimgrey", lw=1.0, ls=":", alpha=0.60,
+               label=f"Beta: {pred2_label} (peak={b2_peak:.3g})")
     ax_t2.axhline(0, color="dimgrey", lw=0.4, ls=":")
-    ax_t2.set_ylabel("Beta", fontsize=8, color="dimgrey")
+    ax_t2.set_ylabel("Beta (own scale)", fontsize=8, color="dimgrey")
     ax_t2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
     ax_t2.spines["top"].set_visible(False)
+    _align_zero(ax_t, ax_t2)
 
     lines1, labs1 = ax_t.get_legend_handles_labels()
     lines2, labs2 = ax_t2.get_legend_handles_labels()
@@ -698,7 +716,7 @@ def plot_2panel_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_l
 
     for di, (delta, lbl, ax_p) in enumerate(zip(DELTAS, DELTA_LBL, ax_pos)):
         _, sim = sim_dict[di]
-        pos = sim["position"][sim.index >= OOS_START]
+        pos = sim["position"][sim.index >= _oos_start]
         ax_p.set_xlim(*xlim)
         _shade(ax_p, oos_dt, e_dt)
         ax_p.fill_between(pos.index, pos.where(pos ==  1, 0), 0,
@@ -735,8 +753,9 @@ def plot_2panel_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_l
 
 def plot_asym(pred_label, horizon_label, oos_gap, nw_lags,
               main_color, sim, betas_df, bah_sim, out_path,
-              r2_oos=None, extra_title=""):
-    oos_dt = pd.Timestamp(OOS_START)
+              r2_oos=None, oos_start=None, extra_title=""):
+    _oos_start = oos_start if oos_start is not None else OOS_START
+    oos_dt = pd.Timestamp(_oos_start)
     e_dt   = betas_df.index[-1]
     xlim   = (oos_dt, e_dt)
 
@@ -753,7 +772,7 @@ def plot_asym(pred_label, horizon_label, oos_gap, nw_lags,
 
     fig.suptitle(
         f"{pred_label} -> {horizon_label} Forward Return  "
-        f"(Expanding Window, OOS from {OOS_START}, Asymmetric Threshold){r2_str}"
+        f"(Expanding Window, OOS from {_oos_start}, Asymmetric Threshold){r2_str}"
         f"{extra_title}\n"
         f"Long: ŷ > μ₅₀₀  Short: ŷ < 0  "
         f"NW-HAC {nw_lags} lags; |t| > {T_THRESH:.2f} gate; 0.05% slippage",
@@ -764,7 +783,7 @@ def plot_asym(pred_label, horizon_label, oos_gap, nw_lags,
     ax_ret.set_xlim(*xlim)
     _shade(ax_ret, oos_dt, e_dt)
 
-    bah_oos      = oos_cumret(bah_sim)
+    bah_oos      = oos_cumret(bah_sim, start=_oos_start)
     _bah_st_plot = compute_performance_stats(bah_sim[bah_sim.index >= _stat_start], "BaH_plot")
     ax_ret.plot(bah_oos.index, bah_oos.values,
                 color=BAH_COLOR, lw=1.5, ls="-.", alpha=0.6,
@@ -788,7 +807,7 @@ def plot_asym(pred_label, horizon_label, oos_gap, nw_lags,
         )
 
     st      = compute_performance_stats(sim[sim.index >= _stat_start], "asym")
-    cum     = oos_cumret(sim)
+    cum     = oos_cumret(sim, start=_oos_start)
     pos_oos = sim["position"][sim.index >= _stat_start]
     pL = float((pos_oos == 1).mean() * 100)
     pS = float((pos_oos == -1).mean() * 100)
@@ -835,12 +854,13 @@ def plot_asym(pred_label, horizon_label, oos_gap, nw_lags,
     ax_t2.set_ylabel(f"Beta ({pred_label})", fontsize=8, color="dimgrey")
     ax_t2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
     ax_t2.spines["top"].set_visible(False)
+    _align_zero(ax_t, ax_t2)
 
     lines1, labs1 = ax_t.get_legend_handles_labels()
     lines2, labs2 = ax_t2.get_legend_handles_labels()
     ax_t.legend(lines1 + lines2, labs1 + labs2, fontsize=8, loc="upper left")
 
-    pos = sim["position"][sim.index >= OOS_START]
+    pos = sim["position"][sim.index >= _oos_start]
     ax_p.set_xlim(*xlim)
     _shade(ax_p, oos_dt, e_dt)
     ax_p.fill_between(pos.index, pos.where(pos ==  1, 0), 0,
@@ -873,8 +893,9 @@ def plot_asym(pred_label, horizon_label, oos_gap, nw_lags,
 
 def plot_asym_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_lags,
                         main_color, sim, betas_df, bah_sim, out_path,
-                        r2_oos=None, extra_title=""):
-    oos_dt = pd.Timestamp(OOS_START)
+                        r2_oos=None, oos_start=None, extra_title=""):
+    _oos_start = oos_start if oos_start is not None else OOS_START
+    oos_dt = pd.Timestamp(_oos_start)
     e_dt   = betas_df.index[-1]
     xlim   = (oos_dt, e_dt)
 
@@ -891,7 +912,7 @@ def plot_asym_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_lag
 
     fig.suptitle(
         f"{pred1_label} + {pred2_label} -> {horizon_label} Forward Return  "
-        f"(Expanding Window, OOS from {OOS_START}, Asymmetric Threshold){r2_str}"
+        f"(Expanding Window, OOS from {_oos_start}, Asymmetric Threshold){r2_str}"
         f"{extra_title}\n"
         f"Long: ŷ > μ₅₀₀  Short: ŷ < 0  "
         f"NW-HAC {nw_lags} lags; |t| > {T_THRESH:.2f} gate (both betas); 0.05% slippage",
@@ -902,7 +923,7 @@ def plot_asym_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_lag
     ax_ret.set_xlim(*xlim)
     _shade(ax_ret, oos_dt, e_dt)
 
-    bah_oos      = oos_cumret(bah_sim)
+    bah_oos      = oos_cumret(bah_sim, start=_oos_start)
     _bah_st_plot = compute_performance_stats(bah_sim[bah_sim.index >= _stat_start], "BaH_plot")
     ax_ret.plot(bah_oos.index, bah_oos.values,
                 color=BAH_COLOR, lw=1.5, ls="-.", alpha=0.6,
@@ -926,7 +947,7 @@ def plot_asym_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_lag
         )
 
     st      = compute_performance_stats(sim[sim.index >= _stat_start], "asym_biv")
-    cum     = oos_cumret(sim)
+    cum     = oos_cumret(sim, start=_oos_start)
     pos_oos = sim["position"][sim.index >= _stat_start]
     pL = float((pos_oos == 1).mean() * 100)
     pS = float((pos_oos == -1).mean() * 100)
@@ -969,20 +990,24 @@ def plot_asym_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_lag
     ax_t.spines["top"].set_visible(False)
 
     ax_t2 = ax_t.twinx()
-    ax_t2.plot(b1.index, b1.values, color="dimgrey", lw=1.0, ls="-", alpha=0.60,
-               label=f"Beta: {pred1_label}")
-    ax_t2.plot(b2.index, b2.values, color="dimgrey", lw=1.0, ls=":", alpha=0.60,
-               label=f"Beta: {pred2_label}")
+    # Normalize each beta to its own peak so both are visible on the same axis
+    b1_peak = b1.abs().max() or 1.0
+    b2_peak = b2.abs().max() or 1.0
+    ax_t2.plot(b1.index, b1.values / b1_peak, color="dimgrey", lw=1.0, ls="-", alpha=0.60,
+               label=f"Beta: {pred1_label} (peak={b1_peak:.3g})")
+    ax_t2.plot(b2.index, b2.values / b2_peak, color="dimgrey", lw=1.0, ls=":", alpha=0.60,
+               label=f"Beta: {pred2_label} (peak={b2_peak:.3g})")
     ax_t2.axhline(0, color="dimgrey", lw=0.4, ls=":")
-    ax_t2.set_ylabel("Beta", fontsize=8, color="dimgrey")
+    ax_t2.set_ylabel("Beta (own scale)", fontsize=8, color="dimgrey")
     ax_t2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
     ax_t2.spines["top"].set_visible(False)
+    _align_zero(ax_t, ax_t2)
 
     lines1, labs1 = ax_t.get_legend_handles_labels()
     lines2, labs2 = ax_t2.get_legend_handles_labels()
     ax_t.legend(lines1 + lines2, labs1 + labs2, fontsize=8, loc="upper left")
 
-    pos = sim["position"][sim.index >= OOS_START]
+    pos = sim["position"][sim.index >= _oos_start]
     ax_p.set_xlim(*xlim)
     _shade(ax_p, oos_dt, e_dt)
     ax_p.fill_between(pos.index, pos.where(pos ==  1, 0), 0,

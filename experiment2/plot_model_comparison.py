@@ -237,7 +237,7 @@ tbl = ax_table.table(
 tbl.auto_set_font_size(False)
 tbl.set_fontsize(8)
 tbl.scale(1, 1.35)
-ax_table.set_title("Performance Summary (net of 0.05% slippage, 0% risk-free Sharpe)",
+ax_table.set_title("Performance Summary (net of 0.05% slippage, 3% risk-free Sharpe)",
                    fontsize=9, pad=4)
 
 out = OUTPUT / "model_comparison.png"

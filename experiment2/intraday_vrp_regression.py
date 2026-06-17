@@ -43,10 +43,12 @@ from experiment2 import (
     compute_buy_and_hold, simulate_strategy, compute_performance_stats,
 )
 from horizon_regression import (
-    OOS_START, MIN_WIN, T_THRESH, DELTAS, DELTA_LBL, BAH_COLOR,
+    MIN_WIN, T_THRESH, DELTAS, DELTA_LBL, BAH_COLOR,
     oos_cumret, _shade, _stat_window,
     plot_2panel, plot_asym,
 )
+
+OOS_START = "2021-01-01"  # train on all data through 2020, OOS from 2021
 
 INTRADAY_VRP_CSV = ROOT.parent / "intraday_experiment" / "output" / "production_loop_intraday.csv"
 
@@ -227,6 +229,7 @@ def main():
         sim_dict=vrp_sims, betas_df=betas_df,
         bah_sim=bah_sim,
         out_path=out_dir / "symmetric_Intraday_VRP.png",
+        oos_start=OOS_START,
     )
 
     # ── Asymmetric ────────────────────────────────────────────────────────────
@@ -249,6 +252,7 @@ def main():
         sim=sim_asym, betas_df=betas_df,
         bah_sim=bah_sim,
         out_path=out_dir / "asymmetric_Intraday_VRP.png",
+        oos_start=OOS_START,
     )
 
     print("\nDone.")

@@ -199,13 +199,13 @@ def load_vix_futures_term_structure() -> pd.DataFrame:
 
 
 def load_vvix() -> pd.Series:
-    """Load VVIX (VIX-of-VIX) daily closing index values, converted to monthly units (÷12)."""
+    """Load VVIX (VIX-of-VIX) daily closing index values, converted to monthly units (÷√12)."""
     df = pd.read_csv(DATA / "VolatilityIndexData.csv", parse_dates=["DATE"])
     vvix = (df[df["SECURITY"] == "VVIX Index"]
             .sort_values("DATE")
             .set_index("DATE")["INDEX_VALUE"])
     vvix.index.name = "date"
-    return vvix / 12.0
+    return vvix / np.sqrt(12)
 
 
 def load_vix_spot() -> pd.Series:
@@ -537,16 +537,18 @@ def simulate_strategy(positions: pd.Series,
     })
 
 
+
 def compute_performance_stats(sim: pd.DataFrame, label: str = "") -> dict:
     """
-    Annualised return, volatility, Sharpe (0% risk-free), max drawdown.
+    Annualised return, volatility, Sharpe (3% risk-free), max drawdown.
     Based on net P&L series.
     """
     daily = sim["net_pnl"].dropna()
     n     = len(daily)
     ann   = float((1 + daily).prod() ** (252 / n) - 1) if n > 0 else np.nan
     vol   = float(daily.std() * np.sqrt(252))
-    sharpe = ann / vol if vol > 0 else np.nan
+    ann_excess = ann-0.03
+    sharpe = ann_excess / vol if vol > 0 else np.nan
 
     cum_val = sim["cum_net"].dropna()
     roll_max = cum_val.cummax()

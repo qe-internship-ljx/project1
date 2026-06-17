@@ -7,7 +7,7 @@ across delta thresholds {0.1%, 0.5%, 1.0%, 2.0%}, plus Buy-and-Hold baseline.
 Panels (one row per metric):
   Row 1 — Total realised return (%)
   Row 2 — Annualised return (%)
-  Row 3 — Sharpe ratio (0% risk-free)
+  Row 3 — Sharpe ratio (3% risk-free)
   Row 4 — Maximum drawdown (%)
   Row 5 — Average position (+1=always long, 0=always flat, -1=always short)
 
@@ -113,7 +113,7 @@ GROUP_X = np.arange(N_MODELS) * GROUP_GAP   # x-centre for each model group
 METRICS = [
     ("total_ret",    "Total Return (%)",            100, False),
     ("ann_ret",      "Annualised Return (%)",        100, False),
-    ("sharpe",       "Sharpe Ratio\n(0% risk-free)",   1, False),
+    ("sharpe",       "Sharpe Ratio\n(3% risk-free)",   1, False),
     ("max_dd",       "Max Drawdown (%)",             100, True ),
     ("avg_position", "Average Position\n(-1 short / 0 flat / +1 long)", 1, False),
 ]

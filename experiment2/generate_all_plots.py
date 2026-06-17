@@ -458,7 +458,7 @@ def plot_comparison(t_threshold, out_path):
     tbl.scale(1, 1.35)
     ax_tbl.set_title(
         f"Performance Summary  |  {t_label(t_threshold)}  |  "
-        "Net of 0.05% slippage  |  0% risk-free Sharpe",
+        "Net of 0.05% slippage  |  3% risk-free Sharpe",
         fontsize=9, pad=4)
 
     fig.savefig(out_path, dpi=160, bbox_inches="tight")

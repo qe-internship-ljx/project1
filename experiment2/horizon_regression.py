@@ -66,7 +66,7 @@ from har_model import _nw_se
 sys.path.insert(0, str(ROOT))
 from experiment2 import (
     load_vrp_series, load_vrp_series_expanding,
-    load_es_front_month, load_vvix, compute_vvix_ma5,
+    load_es_front_month, load_vvix, compute_vvix_ma5, compute_vvix_ma10,
     load_vix_spot, load_vix_futures_term_structure,
     compute_buy_and_hold, simulate_strategy, compute_performance_stats,
     load_es_open_interest,
@@ -305,6 +305,79 @@ def run_ew_asym_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags):
         mu500 = float(actual_in_train.mean()) if len(actual_in_train) > 0 else 0.0
         if   y_hat >  mu500: pos.iloc[i] =  1.0
         elif y_hat <  0.0:   pos.iloc[i] = -1.0
+
+    pos.to_frame().to_parquet(cache)
+    return pos
+
+
+# ── Position computation: univariate base-return-shift ───────────────────────
+
+def run_ew_rolmu(panel, predictor, fwd_col, oos_gap, nw_lags):
+    """Long if ŷ > µ₅₀₀, short if ŷ < µ₅₀₀ (unit position). µ computed from training only."""
+    tag = (f"pos_EWrolmu_{predictor}_{fwd_col}"
+           f"_t{int(T_THRESH*100)}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(f"pos_rolmu_{predictor}")
+
+    sub = panel.dropna(subset=[predictor, fwd_col]).copy()
+    N   = len(sub)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_rolmu_{predictor}")
+
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, N):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[predictor]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        t_val = float(res.params.iloc[1]) / float(nw[1])
+        if abs(t_val) <= T_THRESH:
+            continue
+        mu500 = float(sub[fwd_col].iloc[max(0, i - oos_gap - 500) : i - oos_gap].mean())
+        test = sub.iloc[[i]][[predictor]].copy()
+        test.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test).iloc[0])
+        if   y_hat >  mu500: pos.iloc[i] =  1.0
+        elif y_hat <  mu500: pos.iloc[i] = -1.0
+
+    pos.to_frame().to_parquet(cache)
+    return pos
+
+
+# ── Position computation: bivariate base-return-shift ────────────────────────
+
+def run_ew_rolmu_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags):
+    """Both betas must pass gate. Long if ŷ > µ₅₀₀, short if ŷ < µ₅₀₀."""
+    tag = (f"pos_EWrolmu_{pred1}_{pred2}_{fwd_col}"
+           f"_t{int(T_THRESH*100)}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(f"pos_rolmu_{pred1}_{pred2}")
+
+    sub = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
+    N   = len(sub)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_rolmu_{pred1}_{pred2}")
+
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, N):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[pred1, pred2]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        t1    = float(res.params.iloc[1]) / float(nw[1])
+        t2    = float(res.params.iloc[2]) / float(nw[2])
+        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH:
+            continue
+        mu500 = float(sub[fwd_col].iloc[max(0, i - oos_gap - 500) : i - oos_gap].mean())
+        test = sub.iloc[[i]][[pred1, pred2]].copy()
+        test.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test).iloc[0])
+        if   y_hat >  mu500: pos.iloc[i] =  1.0
+        elif y_hat <  mu500: pos.iloc[i] = -1.0
 
     pos.to_frame().to_parquet(cache)
     return pos
@@ -577,6 +650,18 @@ def plot_2panel(pred_label, horizon_label, oos_gap, nw_lags,
                   f"AvgPos={float(pos.mean()):+.3f}",
                   transform=ax_p.transAxes, fontsize=7.5, va="top",
                   color=color_palette[di])
+        sim_oos   = sim[sim.index >= _oos_start]
+        prev_pos  = sim_oos["position"].shift(1)
+        long_mask  = prev_pos > 0
+        short_mask = prev_pos < 0
+        long_acc   = float((sim_oos.loc[long_mask,  "gross_pnl"] > 0).mean()) if long_mask.any()  else float("nan")
+        short_acc  = float((sim_oos.loc[short_mask, "gross_pnl"] > 0).mean()) if short_mask.any() else float("nan")
+        long_acc_str  = f"{long_acc  * 100:.1f}%" if not np.isnan(long_acc)  else "N/A"
+        short_acc_str = f"{short_acc * 100:.1f}%" if not np.isnan(short_acc) else "N/A"
+        ax_p.text(0.01, 0.83,
+                  f"Long accuracy={long_acc_str}  Short accuracy={short_acc_str}",
+                  transform=ax_p.transAxes, fontsize=7.5, va="top",
+                  color=color_palette[di])
         ax_p.spines[["top", "right"]].set_visible(False)
 
     for ax in [ax_ret, ax_t] + list(ax_pos):
@@ -737,6 +822,18 @@ def plot_2panel_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_l
                   f"AvgPos={float(pos.mean()):+.3f}",
                   transform=ax_p.transAxes, fontsize=7.5, va="top",
                   color=color_palette[di])
+        sim_oos   = sim[sim.index >= _oos_start]
+        prev_pos  = sim_oos["position"].shift(1)
+        long_mask  = prev_pos > 0
+        short_mask = prev_pos < 0
+        long_acc   = float((sim_oos.loc[long_mask,  "gross_pnl"] > 0).mean()) if long_mask.any()  else float("nan")
+        short_acc  = float((sim_oos.loc[short_mask, "gross_pnl"] > 0).mean()) if short_mask.any() else float("nan")
+        long_acc_str  = f"{long_acc  * 100:.1f}%" if not np.isnan(long_acc)  else "N/A"
+        short_acc_str = f"{short_acc * 100:.1f}%" if not np.isnan(short_acc) else "N/A"
+        ax_p.text(0.01, 0.83,
+                  f"Long accuracy={long_acc_str}  Short accuracy={short_acc_str}",
+                  transform=ax_p.transAxes, fontsize=7.5, va="top",
+                  color=color_palette[di])
         ax_p.spines[["top", "right"]].set_visible(False)
 
     for ax in [ax_ret, ax_t] + list(ax_pos):
@@ -876,6 +973,17 @@ def plot_asym(pred_label, horizon_label, oos_gap, nw_lags,
     ax_p.text(0.01, 0.97,
               f"Long {pL:.1f}%  Short {pS:.1f}%  Flat {pF:.1f}%  "
               f"AvgPos={float(pos_oos.mean()):+.3f}",
+              transform=ax_p.transAxes, fontsize=7.5, va="top", color=main_color)
+    sim_oos_p  = sim[sim.index >= _oos_start]
+    prev_pos_p = sim_oos_p["position"].shift(1)
+    long_mask_p  = prev_pos_p > 0
+    short_mask_p = prev_pos_p < 0
+    long_acc_p   = float((sim_oos_p.loc[long_mask_p,  "gross_pnl"] > 0).mean()) if long_mask_p.any()  else float("nan")
+    short_acc_p  = float((sim_oos_p.loc[short_mask_p, "gross_pnl"] > 0).mean()) if short_mask_p.any() else float("nan")
+    long_acc_str_p  = f"{long_acc_p  * 100:.1f}%" if not np.isnan(long_acc_p)  else "N/A"
+    short_acc_str_p = f"{short_acc_p * 100:.1f}%" if not np.isnan(short_acc_p) else "N/A"
+    ax_p.text(0.01, 0.83,
+              f"Long accuracy={long_acc_str_p}  Short accuracy={short_acc_str_p}",
               transform=ax_p.transAxes, fontsize=7.5, va="top", color=main_color)
     ax_p.spines[["top", "right"]].set_visible(False)
 
@@ -1024,6 +1132,320 @@ def plot_asym_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_lag
               f"Long {pL:.1f}%  Short {pS:.1f}%  Flat {pF:.1f}%  "
               f"AvgPos={float(pos_oos.mean()):+.3f}",
               transform=ax_p.transAxes, fontsize=7.5, va="top", color=main_color)
+    sim_oos_p  = sim[sim.index >= _oos_start]
+    prev_pos_p = sim_oos_p["position"].shift(1)
+    long_mask_p  = prev_pos_p > 0
+    short_mask_p = prev_pos_p < 0
+    long_acc_p   = float((sim_oos_p.loc[long_mask_p,  "gross_pnl"] > 0).mean()) if long_mask_p.any()  else float("nan")
+    short_acc_p  = float((sim_oos_p.loc[short_mask_p, "gross_pnl"] > 0).mean()) if short_mask_p.any() else float("nan")
+    long_acc_str_p  = f"{long_acc_p  * 100:.1f}%" if not np.isnan(long_acc_p)  else "N/A"
+    short_acc_str_p = f"{short_acc_p * 100:.1f}%" if not np.isnan(short_acc_p) else "N/A"
+    ax_p.text(0.01, 0.83,
+              f"Long accuracy={long_acc_str_p}  Short accuracy={short_acc_str_p}",
+              transform=ax_p.transAxes, fontsize=7.5, va="top", color=main_color)
+    ax_p.spines[["top", "right"]].set_visible(False)
+
+    for ax in [ax_ret, ax_t, ax_p]:
+        ax.xaxis.set_major_locator(mdates.YearLocator(2))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+        ax.tick_params(axis="x", which="major", labelbottom=True, labelsize=7, pad=2)
+
+    fig.savefig(out_path, dpi=155, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out_path.name}")
+
+
+def plot_rolmu(pred_label, horizon_label, oos_gap, nw_lags,
+               main_color, sim, betas_df, bah_sim, out_path,
+               r2_oos=None, oos_start=None, extra_title=""):
+    """Unit-position base-return-shift: Long if ŷ > µ₅₀₀, Short if ŷ < µ₅₀₀."""
+    _oos_start = oos_start if oos_start is not None else OOS_START
+    oos_dt = pd.Timestamp(_oos_start)
+    e_dt   = betas_df.index[-1]
+    xlim   = (oos_dt, e_dt)
+
+    _rebase_start, _stat_start, _stat_lbl = _stat_window(sim, bah_sim)
+
+    r2_str = f"  R²_OOS = {r2_oos:+.4f}" if r2_oos is not None else ""
+
+    h_ratios = [2.5, 1.2, 1.0]
+    fig, axes = plt.subplots(
+        3, 1, figsize=(14, 10), sharex=True,
+        gridspec_kw={"height_ratios": h_ratios, "hspace": 0.35},
+    )
+    ax_ret, ax_t, ax_p = axes
+
+    fig.suptitle(
+        f"{pred_label} -> {horizon_label} Forward Return  "
+        f"(Expanding Window, OOS from {_oos_start}, Base-Return-Shift){r2_str}"
+        f"{extra_title}\n"
+        f"Long/Short: ŷ > / < µ₅₀₀ (rolling 500-day mean)  "
+        f"NW-HAC {nw_lags} lags; |t| > {T_THRESH:.2f} gate; 0.05% slippage",
+        fontsize=10, y=0.998,
+    )
+    fig.subplots_adjust(top=0.945, bottom=0.04, left=0.10, right=0.93)
+
+    ax_ret.set_xlim(*xlim)
+    _shade(ax_ret, oos_dt, e_dt)
+
+    bah_oos      = oos_cumret(bah_sim, start=_oos_start)
+    _bah_st_plot = compute_performance_stats(bah_sim[bah_sim.index >= _stat_start], "BaH_plot")
+    ax_ret.plot(bah_oos.index, bah_oos.values,
+                color=BAH_COLOR, lw=1.5, ls="-.", alpha=0.6,
+                label=(f"Buy-and-Hold{_stat_lbl}  "
+                       f"[SR={_bah_st_plot['sharpe']:+.2f}  "
+                       f"ret={_bah_st_plot['ann_ret']*100:+.1f}%  "
+                       f"DD={_bah_st_plot['max_dd']*100:.1f}%]"))
+
+    if _rebase_start is not None:
+        _bah_from   = bah_sim["net_pnl"][bah_sim.index >= _rebase_start]
+        _bah_act    = (1 + _bah_from).cumprod()
+        _bah_act_st = compute_performance_stats(
+            bah_sim[bah_sim.index >= _rebase_start], "BaH_act")
+        ax_ret.plot(
+            _bah_act.index, _bah_act.values,
+            color=BAH_COLOR, lw=1.2, ls=":", alpha=0.85,
+            label=(f"Buy-and-Hold from {_rebase_start.strftime('%Y-%m-%d')}  "
+                   f"[SR={_bah_act_st['sharpe']:+.2f}  "
+                   f"ret={_bah_act_st['ann_ret']*100:+.1f}%  "
+                   f"DD={_bah_act_st['max_dd']*100:.1f}%]"),
+        )
+
+    st      = compute_performance_stats(sim[sim.index >= _stat_start], "rolmu")
+    cum     = oos_cumret(sim, start=_oos_start)
+    pos_oos = sim["position"][sim.index >= _stat_start]
+    pL = float((pos_oos == 1).mean() * 100)
+    pS = float((pos_oos == -1).mean() * 100)
+    ax_ret.plot(cum.index, cum.values,
+                color=main_color, lw=1.8, alpha=0.9,
+                label=(f"Base-Return-Shift  "
+                       f"[SR={st['sharpe']:+.2f}  "
+                       f"ret={st['ann_ret']*100:+.1f}%  "
+                       f"DD={st['max_dd']*100:.1f}%  "
+                       f"L{pL:.0f}%/S{pS:.0f}%]"))
+
+    ax_ret.axhline(1, color="black", lw=0.4, ls=":")
+    ax_ret.set_yscale("log")
+    ax_ret.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}x"))
+    ax_ret.set_ylabel("Cumulative Net Return (log)", fontsize=9)
+    ax_ret.legend(fontsize=8, loc="upper left", framealpha=0.92)
+    ax_ret.grid(axis="y", alpha=0.2, lw=0.6)
+    ax_ret.spines[["top", "right"]].set_visible(False)
+
+    ax_t.set_xlim(*xlim)
+    _shade(ax_t, oos_dt, e_dt)
+
+    t_s  = betas_df["t_stat"]
+    beta = betas_df["beta"]
+    ax_t.plot(t_s.index, t_s.values, color=main_color, lw=1.0, alpha=0.85,
+              label=f"NW t-stat: {pred_label} ({nw_lags}-lag HAC)")
+    ax_t.fill_between(t_s.index, -T_THRESH, T_THRESH,
+                      color="firebrick", alpha=0.05, label="Below gate (flat zone)")
+    ax_t.axhline( T_THRESH, color="firebrick", lw=1.2, ls="--",
+                 label=f"|t| = {T_THRESH:.2f} gate")
+    ax_t.axhline(-T_THRESH, color="firebrick", lw=1.2, ls="--")
+    ax_t.axhline(0, color="black", lw=0.5, ls=":")
+    ax_t.set_ylabel("NW t-stat", fontsize=9)
+    ax_t.grid(axis="y", alpha=0.2, lw=0.6)
+    ax_t.spines["top"].set_visible(False)
+
+    ax_t2 = ax_t.twinx()
+    ax_t2.plot(beta.index, beta.values, color="dimgrey", lw=1.0, alpha=0.55,
+               label=f"Beta: {pred_label}")
+    ax_t2.axhline(0, color="dimgrey", lw=0.4, ls=":")
+    ax_t2.set_ylabel("Beta", fontsize=8, color="dimgrey")
+    ax_t2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
+    ax_t2.spines["top"].set_visible(False)
+    _align_zero(ax_t, ax_t2)
+
+    lines1, labs1 = ax_t.get_legend_handles_labels()
+    lines2, labs2 = ax_t2.get_legend_handles_labels()
+    ax_t.legend(lines1 + lines2, labs1 + labs2, fontsize=8, loc="upper left")
+
+    pos = sim["position"][sim.index >= _oos_start]
+    ax_p.set_xlim(*xlim)
+    _shade(ax_p, oos_dt, e_dt)
+    ax_p.fill_between(pos.index, pos.where(pos ==  1, 0), 0,
+                      color=main_color, alpha=0.75, label="Long")
+    ax_p.fill_between(pos.index, pos.where(pos == -1, 0), 0,
+                      color=main_color, alpha=0.30, hatch="///", label="Short")
+    ax_p.axhline(0, color="black", lw=0.4)
+    ax_p.set_ylim(-1.5, 1.5)
+    ax_p.set_yticks([-1, 0, 1])
+    ax_p.set_yticklabels(["Short", "Flat", "Long"], fontsize=8)
+    ax_p.set_ylabel("Position", fontsize=9)
+    pF = float((pos_oos == 0).mean() * 100)
+    ax_p.text(0.01, 0.97,
+              f"Long {pL:.1f}%  Short {pS:.1f}%  Flat {pF:.1f}%  "
+              f"AvgPos={float(pos_oos.mean()):+.3f}",
+              transform=ax_p.transAxes, fontsize=7.5, va="top", color=main_color)
+    sim_oos_p  = sim[sim.index >= _oos_start]
+    prev_pos_p = sim_oos_p["position"].shift(1)
+    long_mask_p  = prev_pos_p > 0
+    short_mask_p = prev_pos_p < 0
+    long_acc_p   = float((sim_oos_p.loc[long_mask_p,  "gross_pnl"] > 0).mean()) if long_mask_p.any()  else float("nan")
+    short_acc_p  = float((sim_oos_p.loc[short_mask_p, "gross_pnl"] > 0).mean()) if short_mask_p.any() else float("nan")
+    long_acc_str_p  = f"{long_acc_p  * 100:.1f}%" if not np.isnan(long_acc_p)  else "N/A"
+    short_acc_str_p = f"{short_acc_p * 100:.1f}%" if not np.isnan(short_acc_p) else "N/A"
+    ax_p.text(0.01, 0.83,
+              f"Long accuracy={long_acc_str_p}  Short accuracy={short_acc_str_p}",
+              transform=ax_p.transAxes, fontsize=7.5, va="top", color=main_color)
+    ax_p.spines[["top", "right"]].set_visible(False)
+
+    for ax in [ax_ret, ax_t, ax_p]:
+        ax.xaxis.set_major_locator(mdates.YearLocator(2))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+        ax.tick_params(axis="x", which="major", labelbottom=True, labelsize=7, pad=2)
+
+    fig.savefig(out_path, dpi=155, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out_path.name}")
+
+
+def plot_rolmu_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_lags,
+                         main_color, sim, betas_df, bah_sim, out_path,
+                         r2_oos=None, oos_start=None, extra_title=""):
+    """Bivariate base-return-shift: both betas gated; Long if ŷ > µ₅₀₀, Short if ŷ < µ₅₀₀."""
+    _oos_start = oos_start if oos_start is not None else OOS_START
+    oos_dt = pd.Timestamp(_oos_start)
+    e_dt   = betas_df.index[-1]
+    xlim   = (oos_dt, e_dt)
+
+    _rebase_start, _stat_start, _stat_lbl = _stat_window(sim, bah_sim)
+
+    r2_str = f"  R²_OOS = {r2_oos:+.4f}" if r2_oos is not None else ""
+
+    h_ratios = [2.5, 1.2, 1.0]
+    fig, axes = plt.subplots(
+        3, 1, figsize=(14, 10), sharex=True,
+        gridspec_kw={"height_ratios": h_ratios, "hspace": 0.35},
+    )
+    ax_ret, ax_t, ax_p = axes
+
+    fig.suptitle(
+        f"{pred1_label} + {pred2_label} -> {horizon_label} Forward Return  "
+        f"(Expanding Window, OOS from {_oos_start}, Base-Return-Shift){r2_str}"
+        f"{extra_title}\n"
+        f"Long/Short: ŷ > / < µ₅₀₀ (rolling 500-day mean)  "
+        f"NW-HAC {nw_lags} lags; |t| > {T_THRESH:.2f} gate (both betas); 0.05% slippage",
+        fontsize=10, y=0.998,
+    )
+    fig.subplots_adjust(top=0.945, bottom=0.04, left=0.10, right=0.93)
+
+    ax_ret.set_xlim(*xlim)
+    _shade(ax_ret, oos_dt, e_dt)
+
+    bah_oos      = oos_cumret(bah_sim, start=_oos_start)
+    _bah_st_plot = compute_performance_stats(bah_sim[bah_sim.index >= _stat_start], "BaH_plot")
+    ax_ret.plot(bah_oos.index, bah_oos.values,
+                color=BAH_COLOR, lw=1.5, ls="-.", alpha=0.6,
+                label=(f"Buy-and-Hold{_stat_lbl}  "
+                       f"[SR={_bah_st_plot['sharpe']:+.2f}  "
+                       f"ret={_bah_st_plot['ann_ret']*100:+.1f}%  "
+                       f"DD={_bah_st_plot['max_dd']*100:.1f}%]"))
+
+    if _rebase_start is not None:
+        _bah_from   = bah_sim["net_pnl"][bah_sim.index >= _rebase_start]
+        _bah_act    = (1 + _bah_from).cumprod()
+        _bah_act_st = compute_performance_stats(
+            bah_sim[bah_sim.index >= _rebase_start], "BaH_act")
+        ax_ret.plot(
+            _bah_act.index, _bah_act.values,
+            color=BAH_COLOR, lw=1.2, ls=":", alpha=0.85,
+            label=(f"Buy-and-Hold from {_rebase_start.strftime('%Y-%m-%d')}  "
+                   f"[SR={_bah_act_st['sharpe']:+.2f}  "
+                   f"ret={_bah_act_st['ann_ret']*100:+.1f}%  "
+                   f"DD={_bah_act_st['max_dd']*100:.1f}%]"),
+        )
+
+    st      = compute_performance_stats(sim[sim.index >= _stat_start], "rolmu_biv")
+    cum     = oos_cumret(sim, start=_oos_start)
+    pos_oos = sim["position"][sim.index >= _stat_start]
+    pL = float((pos_oos == 1).mean() * 100)
+    pS = float((pos_oos == -1).mean() * 100)
+    ax_ret.plot(cum.index, cum.values,
+                color=main_color, lw=1.8, alpha=0.9,
+                label=(f"Base-Return-Shift  "
+                       f"[SR={st['sharpe']:+.2f}  "
+                       f"ret={st['ann_ret']*100:+.1f}%  "
+                       f"DD={st['max_dd']*100:.1f}%  "
+                       f"L{pL:.0f}%/S{pS:.0f}%]"))
+
+    ax_ret.axhline(1, color="black", lw=0.4, ls=":")
+    ax_ret.set_yscale("log")
+    ax_ret.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}x"))
+    ax_ret.set_ylabel("Cumulative Net Return (log)", fontsize=9)
+    ax_ret.legend(fontsize=8, loc="upper left", framealpha=0.92)
+    ax_ret.grid(axis="y", alpha=0.2, lw=0.6)
+    ax_ret.spines[["top", "right"]].set_visible(False)
+
+    ax_t.set_xlim(*xlim)
+    _shade(ax_t, oos_dt, e_dt)
+
+    t1 = betas_df["t_stat_1"]
+    t2 = betas_df["t_stat_2"]
+    b1 = betas_df["beta_1"]
+    b2 = betas_df["beta_2"]
+
+    ax_t.plot(t1.index, t1.values, color=main_color, lw=1.0, alpha=0.85,
+              label=f"NW t-stat: {pred1_label} ({nw_lags}-lag HAC)")
+    ax_t.plot(t2.index, t2.values, color=main_color, lw=1.0, alpha=0.60, ls="--",
+              label=f"NW t-stat: {pred2_label} ({nw_lags}-lag HAC)")
+    ax_t.fill_between(t1.index, -T_THRESH, T_THRESH,
+                      color="firebrick", alpha=0.05, label="Below gate (flat zone)")
+    ax_t.axhline( T_THRESH, color="firebrick", lw=1.2, ls="--",
+                 label=f"|t| = {T_THRESH:.2f} gate")
+    ax_t.axhline(-T_THRESH, color="firebrick", lw=1.2, ls="--")
+    ax_t.axhline(0, color="black", lw=0.5, ls=":")
+    ax_t.set_ylabel("NW t-stat", fontsize=9)
+    ax_t.grid(axis="y", alpha=0.2, lw=0.6)
+    ax_t.spines["top"].set_visible(False)
+
+    ax_t2 = ax_t.twinx()
+    b1_peak = b1.abs().max() or 1.0
+    b2_peak = b2.abs().max() or 1.0
+    ax_t2.plot(b1.index, b1.values / b1_peak, color="dimgrey", lw=1.0, ls="-", alpha=0.60,
+               label=f"Beta: {pred1_label} (peak={b1_peak:.3g})")
+    ax_t2.plot(b2.index, b2.values / b2_peak, color="dimgrey", lw=1.0, ls=":", alpha=0.60,
+               label=f"Beta: {pred2_label} (peak={b2_peak:.3g})")
+    ax_t2.axhline(0, color="dimgrey", lw=0.4, ls=":")
+    ax_t2.set_ylabel("Beta (own scale)", fontsize=8, color="dimgrey")
+    ax_t2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
+    ax_t2.spines["top"].set_visible(False)
+    _align_zero(ax_t, ax_t2)
+
+    lines1, labs1 = ax_t.get_legend_handles_labels()
+    lines2, labs2 = ax_t2.get_legend_handles_labels()
+    ax_t.legend(lines1 + lines2, labs1 + labs2, fontsize=8, loc="upper left")
+
+    pos = sim["position"][sim.index >= _oos_start]
+    ax_p.set_xlim(*xlim)
+    _shade(ax_p, oos_dt, e_dt)
+    ax_p.fill_between(pos.index, pos.where(pos ==  1, 0), 0,
+                      color=main_color, alpha=0.75, label="Long")
+    ax_p.fill_between(pos.index, pos.where(pos == -1, 0), 0,
+                      color=main_color, alpha=0.30, hatch="///", label="Short")
+    ax_p.axhline(0, color="black", lw=0.4)
+    ax_p.set_ylim(-1.5, 1.5)
+    ax_p.set_yticks([-1, 0, 1])
+    ax_p.set_yticklabels(["Short", "Flat", "Long"], fontsize=8)
+    ax_p.set_ylabel("Position", fontsize=9)
+    pF = float((pos_oos == 0).mean() * 100)
+    ax_p.text(0.01, 0.97,
+              f"Long {pL:.1f}%  Short {pS:.1f}%  Flat {pF:.1f}%  "
+              f"AvgPos={float(pos_oos.mean()):+.3f}",
+              transform=ax_p.transAxes, fontsize=7.5, va="top", color=main_color)
+    sim_oos_p  = sim[sim.index >= _oos_start]
+    prev_pos_p = sim_oos_p["position"].shift(1)
+    long_mask_p  = prev_pos_p > 0
+    short_mask_p = prev_pos_p < 0
+    long_acc_p   = float((sim_oos_p.loc[long_mask_p,  "gross_pnl"] > 0).mean()) if long_mask_p.any()  else float("nan")
+    short_acc_p  = float((sim_oos_p.loc[short_mask_p, "gross_pnl"] > 0).mean()) if short_mask_p.any() else float("nan")
+    long_acc_str_p  = f"{long_acc_p  * 100:.1f}%" if not np.isnan(long_acc_p)  else "N/A"
+    short_acc_str_p = f"{short_acc_p * 100:.1f}%" if not np.isnan(short_acc_p) else "N/A"
+    ax_p.text(0.01, 0.83,
+              f"Long accuracy={long_acc_str_p}  Short accuracy={short_acc_str_p}",
+              transform=ax_p.transAxes, fontsize=7.5, va="top", color=main_color)
     ax_p.spines[["top", "right"]].set_visible(False)
 
     for ax in [ax_ret, ax_t, ax_p]:
@@ -1041,22 +1463,26 @@ def plot_asym_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_lag
 def main():
     print("=" * 72)
     print("  Horizon Regression — Expanding Window")
-    print("  (B) VVIX MA5        -> 20-day  (symmetric)")
-    print("  (C) vol_trend       -> 20-day  (poor correlation baseline)")
-    print("  (D) VIX spot        -> 20-day  (poor correlation baseline)")
-    print("  (E) term_slope      -> 20-day  (poor correlation baseline)")
-    print("  (G) VRP + Open Int. -> 20-day  (symmetric + asymmetric)")
+    print("  (B) VVIX MA5              -> 20-day  (symmetric)")
+    print("  (C) vol_trend             -> 20-day  (poor correlation baseline)")
+    print("  (D) VIX spot              -> 20-day  (poor correlation baseline)")
+    print("  (E) term_slope            -> 20-day  (poor correlation baseline)")
+    print("  (G) VRP + Open Int.       -> 20-day  (symmetric + asymmetric)")
+    print("  (H) VRP + VVIX MA10       -> 20-day  (symmetric + asymmetric)")
     print("=" * 72)
 
     print("\n[1] Loading data...")
     vrp        = load_vrp_series()
     vrp_exp    = load_vrp_series_expanding()
     es         = load_es_front_month()
-    vvix_ma5   = compute_vvix_ma5(load_vvix())
+    vvix_raw   = load_vvix()
+    vvix_ma5   = compute_vvix_ma5(vvix_raw)
+    vvix_ma10  = compute_vvix_ma10(vvix_raw)
     vix_spot   = load_vix_spot()
     term_slope = compute_vix_term_slope(load_vix_futures_term_structure())
     oi         = load_es_open_interest()
     panel      = build_panel(vrp, es, vvix_ma5, vix_spot, term_slope, oi)
+    panel["vvix_ma10"] = vvix_ma10.reindex(panel.index)
     # Panel for expanding-VRP analyses: expanding-window HAR VRP renamed to VP_exp
     # so cache keys stay separate from the rolling-window VP analyses.
     panel_exp  = build_panel(vrp_exp, es, vvix_ma5, vix_spot, term_slope, oi)
@@ -1273,6 +1699,59 @@ def main():
         r2_oos=oi_r2_oos,
     )
 
+    # ── (H) VRP + VVIX MA10 -> 20-day symmetric ─────────────────────────────
+    print("\n[H-sym] VRP + VVIX MA10 -> 20-day expanding-window positions (symmetric)...")
+    biv10_sims = {}
+    for di, (delta, lbl) in enumerate(zip(DELTAS, DELTA_LBL)):
+        print(f"    {lbl}...", end="  ", flush=True)
+        pos = run_ew_bivariate(panel, "VP", "vvix_ma10",
+                               "fwd_20d", oos_gap=20, nw_lags=20, delta=delta)
+        sim = simulate_strategy(pos, daily_ret)
+        st  = compute_performance_stats(sim[sim.index >= OOS_START], f"EW_VRPMA10_20d_{lbl}")
+        biv10_sims[di] = (st, sim)
+        p   = pos[pos.index >= OOS_START]
+        print(f"SR={st['sharpe']:+.3f}  L={float((p==1).mean())*100:.1f}%  "
+              f"S={float((p==-1).mean())*100:.1f}%  "
+              f"F={float((p==0).mean())*100:.1f}%")
+
+    biv10_betas  = compute_betas_bivariate(panel, "VP", "vvix_ma10",
+                                           "fwd_20d", oos_gap=20, nw_lags=20)
+    biv10_r2_oos = compute_oos_r2_bivariate(panel, "VP", "vvix_ma10",
+                                             "fwd_20d", oos_gap=20, nw_lags=20)
+    print(f"    OOS R² (VRP + VVIX MA10 20d) = {biv10_r2_oos:+.4f}")
+
+    out_biv10 = OUTPUT / "expanding_window" / "VRP + VVIX MA10"
+    out_biv10.mkdir(parents=True, exist_ok=True)
+    plot_2panel_bivariate(
+        pred1_label="VRP", pred2_label="VVIX MA10", horizon_label="20-day",
+        oos_gap=20, nw_lags=20,
+        color_palette=["#ae017e", "#dd3497", "#f768a1", "#fbb4b9"],
+        sim_dict=biv10_sims, betas_df=biv10_betas,
+        bah_sim=bah_sim_,
+        out_path=out_biv10 / "symmetric_VRP_+_VVIX_MA10.png",
+        r2_oos=biv10_r2_oos,
+    )
+
+    # ── (H) VRP + VVIX MA10 -> 20-day asymmetric ─────────────────────────────
+    print("\n[H-asym] VRP + VVIX MA10 -> 20-day, asymmetric threshold...")
+    pos_asym_biv10 = run_ew_asym_bivariate(
+        panel, "VP", "vvix_ma10", "fwd_20d", oos_gap=20, nw_lags=20)
+    sim_asym_biv10 = simulate_strategy(pos_asym_biv10, daily_ret)
+    p_asym_biv10 = pos_asym_biv10[pos_asym_biv10.index >= OOS_START]
+    print(f"    L={float((p_asym_biv10==1).mean())*100:.1f}%  "
+          f"S={float((p_asym_biv10==-1).mean())*100:.1f}%  "
+          f"F={float((p_asym_biv10==0).mean())*100:.1f}%")
+
+    plot_asym_bivariate(
+        pred1_label="VRP", pred2_label="VVIX MA10", horizon_label="20-day",
+        oos_gap=20, nw_lags=20,
+        main_color="#ae017e",
+        sim=sim_asym_biv10, betas_df=biv10_betas,
+        bah_sim=bah_sim_,
+        out_path=out_biv10 / "asymmetric_VRP_+_VVIX_MA10.png",
+        r2_oos=biv10_r2_oos,
+    )
+
     # ── (8) Signal regressions (full-sample, NW-20 HAC SEs) ─────────────────
     print("\n[8] Signal regressions (full sample, NW-20 HAC SEs)...")
     sub = panel.dropna(subset=["VP", "vvix_ma5", "fwd_20d"]).copy()
@@ -1319,6 +1798,8 @@ def main():
     print(f"  output/expanding_window/poor_correlation/Term Slope/symmetric_Term_Slope.png")
     print(f"  output/expanding_window/VRP + Open Interest/symmetric_VRP_+_Open_Interest.png")
     print(f"  output/expanding_window/VRP + Open Interest/asymmetric_VRP_+_Open_Interest.png")
+    print(f"  output/expanding_window/VRP + VVIX MA10/symmetric_VRP_+_VVIX_MA10.png")
+    print(f"  output/expanding_window/VRP + VVIX MA10/asymmetric_VRP_+_VVIX_MA10.png")
     print("=" * 72)
 
 

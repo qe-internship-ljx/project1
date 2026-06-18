@@ -1,14 +1,14 @@
-"""
+﻿"""
 oos_r2_table.py
 ===============
-In-sample and out-of-sample R² for every standard 20-day-return regression.
+In-sample and out-of-sample RÂ² for every standard 20-day-return regression.
 
-In-sample  : static OLS on the full available sample (2006–2026).
-OOS R²     : static OLS trained through 2021-12-31, evaluated on 2022–2026.
+In-sample  : static OLS on the full available sample (2006â€“2026).
+OOS RÂ²     : static OLS trained through 2021-12-31, evaluated on 2022â€“2026.
              A 20-day gap is left between the last training day and the first
              OOS evaluation day to avoid label leakage from overlapping returns.
-             OOS R² = 1 - SS_res / SS_tot (benchmark is the OOS sample mean).
-No t-stat gate is applied — pure predictive accuracy, not strategy P&L.
+             OOS RÂ² = 1 - SS_res / SS_tot (benchmark is the in-sample mean).
+No t-stat gate is applied â€” pure predictive accuracy, not strategy P&L.
 """
 
 import warnings
@@ -36,9 +36,10 @@ from experiment2 import (
 )
 from fh_replication.fh_replication import compute_vix_term_slope
 
-TRAIN_END = "2021-12-31"   # last date included in the static training window
-OOS_GAP   = 20             # trading-day gap to avoid 20-day label leakage
-FWD_COL   = "fwd_20d"
+TRAIN_END      = "2021-12-31"   # last date included in the static training window
+OOS_GAP        = 20             # trading-day gap to avoid 20-day label leakage
+FWD_COL        = "fwd_20d"
+IS_MEAN_YEARS  = 5              # years of in-sample history used for the benchmark mean
 
 MODELS = {
     "VRP":                  ["VP"],
@@ -78,7 +79,7 @@ def build_panel():
 
 
 def compute_is(panel, predictors):
-    """Full-sample static OLS R² (2006–2026, or from first available data)."""
+    """Full-sample static OLS RÂ² (2006â€“2026, or from first available data)."""
     sub = panel.dropna(subset=predictors + [FWD_COL])
     X   = add_constant(sub[predictors], has_constant="skip")
     res = OLS(sub[FWD_COL], X).fit()
@@ -89,7 +90,7 @@ def compute_oos(panel, predictors):
     """
     Static OLS trained through TRAIN_END, evaluated on the window that
     starts OOS_GAP observations after the last training row.
-    OOS R² = 1 - SS_res / SS_tot  (benchmark: OOS sample mean).
+    OOS R² = 1 - SS_res / SS_tot  (benchmark: mean of the IS_MEAN_YEARS years up to TRAIN_END).
     """
     sub = panel.dropna(subset=predictors + [FWD_COL]).copy()
 
@@ -110,8 +111,10 @@ def compute_oos(panel, predictors):
     y_hat = res.predict(X_oos).values
     y_act = oos[FWD_COL].values
 
-    ss_res = np.sum((y_act - y_hat)     ** 2)
-    ss_tot = np.sum((y_act - y_act.mean()) ** 2)
+    mean_start = pd.Timestamp(TRAIN_END) - pd.DateOffset(years=IS_MEAN_YEARS)
+    y_bar_is = train.loc[train.index >= mean_start, FWD_COL].mean()
+    ss_res = np.sum((y_act - y_hat)    ** 2)
+    ss_tot = np.sum((y_act - y_bar_is) ** 2)
     return 1.0 - ss_res / ss_tot
 
 
@@ -129,7 +132,8 @@ def get_oos_residuals(panel, predictors):
     X_oos   = add_constant(oos[predictors], has_constant="skip")
     y_hat   = res.predict(X_oos).values
     y_act   = oos[FWD_COL].values
-    y_bar   = y_act.mean()   # OOS sample mean (consistent with R² denominator)
+    mean_start = pd.Timestamp(TRAIN_END) - pd.DateOffset(years=IS_MEAN_YEARS)
+    y_bar   = train.loc[train.index >= mean_start, FWD_COL].mean()  # IS mean (last 5 yrs, consistent with R² denominator)
 
     return pd.DataFrame({
         "model_resid": y_act - y_hat,
@@ -145,18 +149,18 @@ def plot_vrp_oos_residuals(panel, out_dir):
     ax2 = ax.twinx()
 
     ax.plot(resid.index, resid["model_resid"] * 100, color="#1a6faf", lw=1.0,
-            label="VRP model residual  (y − ŷ)", zorder=2)
+            label="VRP model residual  (y âˆ’ Å·)", zorder=2)
     ax.plot(resid.index, resid["mean_resid"]  * 100, color="#e05c2a", lw=1.0,
-            ls="--", label="Mean baseline residual  (y − ȳ_OOS)", zorder=3)
+            ls="--", label="Mean baseline residual  (y âˆ’ È³_OOS)", zorder=3)
     ax.axhline(0, color="black", lw=0.7, ls="--")
 
     ax2.plot(resid.index, resid["y_hat"] * 100, color="#2ca02c", lw=1.2,
-             ls="-", label="Predicted return  ŷ", zorder=1)
+             ls="-", label="Predicted return  Å·", zorder=1)
     ax2.axhline(0, color="#2ca02c", lw=0.4, ls=":")
 
     ax.set_title(
-        "OOS Prediction Residuals & Predicted Return — Univariate VRP  (static model trained ≤ 2021-12-31)\n"
-        f"OOS window: {resid.index.min().date()} – {resid.index.max().date()}  |  20-day gap applied",
+        "OOS Prediction Residuals & Predicted Return â€” Univariate VRP  (static model trained â‰¤ 2021-12-31)\n"
+        f"OOS window: {resid.index.min().date()} â€“ {resid.index.max().date()}  |  20-day gap applied",
         fontsize=10, fontweight="bold",
     )
     ax.set_ylabel("Residual (%)")
@@ -178,7 +182,7 @@ def plot_vrp_oos_residuals(panel, out_dir):
 def main():
     print("Loading data...")
     panel = build_panel()
-    print(f"  {len(panel):,} obs  [{panel.index.min().date()} — {panel.index.max().date()}]")
+    print(f"  {len(panel):,} obs  [{panel.index.min().date()} â€” {panel.index.max().date()}]")
     print()
 
     rows = []
@@ -192,15 +196,15 @@ def main():
         oos_r2 = compute_oos(panel, preds)
         rows.append({
             "Model":  name,
-            "IS R²":  is_r2,
-            "OOS R²": oos_r2,
+            "IS RÂ²":  is_r2,
+            "OOS RÂ²": oos_r2,
         })
 
     df = pd.DataFrame(rows).set_index("Model")
 
     out_dir = ROOT / "output" / "expanding_window"
 
-    # ── Table visualization: positive-OOS-R² models only ─────────────────────
+    # â”€â”€ Table visualization: positive-OOS-RÂ² models only â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     PRED_LABELS = {
         "VRP":                   "VRP",
         "VVIX MA5":              "VVIX MA5",
@@ -210,15 +214,15 @@ def main():
     }
 
     pos = df.copy()
-    pos = pos.sort_values("OOS R²", ascending=False)
+    pos = pos.sort_values("OOS RÂ²", ascending=False)
     pos.index = [PRED_LABELS.get(m, m) for m in pos.index]
 
-    col_headers = ["IS R²", "OOS R²"]
+    col_headers = ["IS RÂ²", "OOS RÂ²"]
     table_data = []
     for _, row in pos.iterrows():
         table_data.append([
-            f"{row['IS R²']*100:.2f}%",
-            f"{row['OOS R²']*100:+.2f}%",
+            f"{row['IS RÂ²']*100:.2f}%",
+            f"{row['OOS RÂ²']*100:+.2f}%",
         ])
 
     n_rows = len(pos)
@@ -250,7 +254,7 @@ def main():
         # row label
         tbl[row_i, -1].set_facecolor(bg)
         tbl[row_i, -1].set_text_props(ha="right", fontweight="semibold")
-        oos_val = pos.iloc[row_i - 1]["OOS R²"]
+        oos_val = pos.iloc[row_i - 1]["OOS RÂ²"]
         for col_i in range(len(col_headers)):
             cell = tbl[row_i, col_i]
             cell.set_facecolor(bg)
@@ -263,8 +267,8 @@ def main():
                     cell.set_text_props(fontweight="bold", color="#721c24")
 
     ax.set_title(
-        "In-Sample vs Out-of-Sample Fit  —  20-Day Static Regression\n"
-        "IS: full sample (2006–2026)  |  OOS: trained ≤2021, evaluated 2022–2026 (20-day gap)",
+        "In-Sample vs Out-of-Sample Fit  â€”  20-Day Static Regression\n"
+        "IS: full sample (2006â€“2026)  |  OOS: trained â‰¤2021, evaluated 2022â€“2026 (20-day gap)",
         fontsize=10, pad=14, fontweight="bold",
     )
 
@@ -276,6 +280,51 @@ def main():
 
     plot_vrp_oos_residuals(panel, out_dir)
 
+    # ── R² only table ─────────────────────────────────────────────────────────
+    r2_col = df.columns[0]   # "IS R²"
+    r2_sorted = df.copy().sort_values(r2_col, ascending=False)
+    r2_sorted.index = [PRED_LABELS.get(m, m) for m in r2_sorted.index]
+
+    r2_data = [[f"{row[r2_col]*100:.2f}%"] for _, row in r2_sorted.iterrows()]
+
+    n_rows2 = len(r2_sorted)
+    fig_h2  = 0.55 + n_rows2 * 0.42
+    fig2, ax2 = plt.subplots(figsize=(5.5, fig_h2))
+    ax2.axis("off")
+
+    tbl2 = ax2.table(
+        cellText=r2_data,
+        rowLabels=list(r2_sorted.index),
+        colLabels=["R²"],
+        loc="center",
+        cellLoc="center",
+    )
+    tbl2.auto_set_font_size(False)
+    tbl2.set_fontsize(10)
+    tbl2.scale(1, 1.55)
+
+    tbl2[0, 0].set_facecolor("#2c3e50")
+    tbl2[0, 0].set_text_props(color="white", fontweight="bold")
+
+    row_colors = ["#f0f4f8", "#ffffff"]
+    for row_i in range(1, n_rows2 + 1):
+        bg = row_colors[(row_i - 1) % 2]
+        tbl2[row_i, -1].set_facecolor(bg)
+        tbl2[row_i, -1].set_text_props(ha="right", fontweight="semibold")
+        tbl2[row_i, 0].set_facecolor(bg)
+
+    ax2.set_title(
+        "R²  —  20-Day Static Regression\n"
+        "Full sample (2006–2026)",
+        fontsize=10, pad=14, fontweight="bold",
+    )
+
+    out_r2_png = out_dir / "r2_table.png"
+    fig2.savefig(out_r2_png, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close(fig2)
+    print(f"  Saved: {out_r2_png}")
+
 
 if __name__ == "__main__":
     main()
+

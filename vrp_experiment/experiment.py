@@ -899,6 +899,51 @@ def plot_combined_vrp_summary(prod_df: pd.DataFrame, stats_df: pd.DataFrame,
     return path
 
 
+def plot_vrp_only(prod_df: pd.DataFrame, tag: str,
+                  window_label: str = "500-day rolling OLS") -> Path:
+    """
+    Standalone plot: predicted VRP (VP = IVar − CV) over time.
+    Shows long-run mean ± 1σ bands and shades known crisis periods.
+    """
+    vrp_mean = float(prod_df["VP"].mean())
+    vrp_std  = float(prod_df["VP"].std())
+    s, e     = prod_df.index[0], prod_df.index[-1]
+
+    fig, ax = plt.subplots(figsize=(15, 5))
+    _label_crises(ax, s, e)
+
+    ax.fill_between(prod_df.index, prod_df["VP"], 0,
+                    where=(prod_df["VP"] >= 0), color="steelblue",
+                    alpha=0.55, label="VRP > 0")
+    ax.fill_between(prod_df.index, prod_df["VP"], 0,
+                    where=(prod_df["VP"] < 0), color="salmon",
+                    alpha=0.55, label="VRP < 0")
+    ax.axhline(0, color="black", lw=0.6)
+    ax.axhline(vrp_mean, color="navy", lw=1.6, ls="--",
+               label=f"Long-run mean = {vrp_mean:.2f}")
+    ax.axhline(vrp_mean + vrp_std, color="steelblue", lw=1.1, ls=":",
+               label=f"+1σ  ({vrp_mean + vrp_std:.2f})")
+    ax.axhline(vrp_mean - vrp_std, color="salmon", lw=1.1, ls=":",
+               label=f"−1σ  ({vrp_mean - vrp_std:.2f})")
+
+    ax.set_ylabel("VRP = IVar − CV  (%² monthly)", fontsize=10)
+    ax.set_title(
+        f"Predicted Variance Risk Premium — {window_label}  [{s.date()} – {e.date()}]",
+        fontsize=11,
+    )
+    ax.legend(fontsize=9, loc="upper right", ncol=3)
+    ax.set_ylim(-280, 520)
+    ax.xaxis.set_major_locator(mdates.YearLocator(4))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+    plt.tight_layout()
+    path = OUTPUT / f"vrp_only_{tag}.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"    Saved {path}")
+    return path
+
+
 def _write_results_md_stub(
     panel_paper, panel_full,
     res_paper, res_full,
@@ -1284,6 +1329,8 @@ def main():
     print("\n[9] Generating combined VRP summary plot (VIX only)…")
     plot_combined_vrp_summary(prod_full, stats_full, tag="full",
                               window_label="500-day Rolling OLS")
+    plot_vrp_only(prod_full, tag="rolling",
+                  window_label="500-day Rolling OLS")
 
     # ── Expanding-window production loop (initial train 2006-2012) ──────────
     print(f"\n[EW] Expanding-window production loop "
@@ -1300,6 +1347,8 @@ def main():
         prod_ew, stats_ew, tag="expanding",
         window_label="Expanding Window OLS (initial train 1990–2005)"
     )
+    plot_vrp_only(prod_ew, tag="expanding",
+                  window_label="Expanding Window OLS (initial train 1990–2005)")
     prod_ew.to_csv(OUTPUT / "production_loop_expanding.csv")
 
     # ── VS-based parallel run (pure VS²/12, ~2008 onwards) ───────────────────

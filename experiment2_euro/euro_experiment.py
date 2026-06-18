@@ -1158,7 +1158,7 @@ if __name__ == "__main__":
     print("  EW Fixed-threshold positions")
     print("-"*55)
     EW, EW_SIM = {}, {}
-    for m in MODELS:
+    for m in ALL_MODELS:
         for di, delta in enumerate(DELTAS):
             print(f"  EW  {m:<12}  {DELTA_LBL[di]}  ...", end=" ", flush=True)
             pos     = run_expanding_window(panel, m, delta)
@@ -1174,7 +1174,7 @@ if __name__ == "__main__":
             print(f"SR={st['sharpe']:+.3f}")
 
     print("\n--- EW fixed-threshold detail plots ---")
-    for m in ["Base", "Model_A", "Model_C"]:
+    for m in ALL_MODELS:
         fname = "symmetric_" + EW_MODEL_DIR[m].name.replace(" ", "_") + ".png"
         plot_expanding_detail(
             m, EW_MODEL_DIR[m] / fname,
@@ -1184,11 +1184,11 @@ if __name__ == "__main__":
     print("\n--- EW comparisons: post-activation, fixed-threshold ---")
     plot_post2020_comparison(
         DIR_EW_CMP / "symmetric_comparisons.png",
-        EW, EW_SIM, MODELS, bah_sim, bah_st, s_dt, e_dt,
+        EW, EW_SIM, ALL_MODELS, bah_sim, bah_st, s_dt, e_dt,
     )
     plot_summary_table(
         DIR_EW_CMP / "performance_summary.png",
-        EW_SIM, MODELS, "EW Fixed Threshold", bah_st,
+        EW_SIM, ALL_MODELS, "EW Fixed Threshold", bah_st,
     )
 
     # =========================================================================

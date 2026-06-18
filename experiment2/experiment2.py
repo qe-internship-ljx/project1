@@ -286,6 +286,13 @@ def compute_vvix_ma5(vvix: pd.Series) -> pd.Series:
     return ma5
 
 
+def compute_vvix_ma10(vvix: pd.Series) -> pd.Series:
+    """10-day simple moving average of VVIX as tail-risk gauge."""
+    ma10 = vvix.rolling(10).mean()
+    ma10.name = "vvix_ma10"
+    return ma10
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # STEP 5 — Bivariate Predictive Regression
 # ═══════════════════════════════════════════════════════════════════════════

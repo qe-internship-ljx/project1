@@ -27,7 +27,8 @@ Models:
   VRP + Open Interest -> 20-day (bivariate)  -> output/expanding_window/VRP + Open Interest/
   VRP + VVIX MA5 + Term Slope (trivariate)   -> output/expanding_window/trivariate/
 
-All computation (position functions, betas, y_hat) is imported from regressions.py.
+Position functions are defined in this file; betas, y_hat helpers and constants
+are imported from regressions.py.
 """
 
 import warnings
@@ -44,12 +45,16 @@ import matplotlib.patches as mpatches
 import matplotlib.dates as mdates
 import matplotlib.ticker as mticker
 
-ROOT   = Path(__file__).parent
-OUTPUT = ROOT / "output"
+ROOT      = Path(__file__).parent
+OUTPUT    = ROOT / "output"
+CACHE_DIR = OUTPUT / "regression_cache"
 
 sys.path.insert(0, str(ROOT.parent / "bh_replication"))
 sys.path.insert(0, str(ROOT.parent))
 sys.path.insert(0, str(ROOT))
+
+from statsmodels.api import OLS, add_constant
+from har_model import _nw_se
 
 from experiment2 import (
     load_vrp_series, load_es_front_month, load_vvix, compute_vvix_ma5,
@@ -62,9 +67,6 @@ from fh_replication.fh_replication import compute_vix_term_slope
 from regressions import (
     build_panel,
     compute_betas, compute_betas_bivariate, compute_betas_trivariate,
-    run_ew_unbound_sym, run_ew_unbound_asym, run_ew_unbound_rolmu,
-    run_ew_biv_unbound_sym, run_ew_biv_unbound_asym, run_ew_biv_unbound_rolmu,
-    run_ew_triv_unbound_sym, run_ew_triv_unbound_asym, run_ew_triv_unbound_rolmu,
     _yhat_univariate, _yhat_bivariate, _yhat_trivariate, _rolling_mu,
     _level, _shade, oos_cumret,
     OOS_START, MIN_WIN, T_THRESH, VVIX_ACT, OOS_GAP, NW_LAGS, RW, THRESHOLDS, LEVELS,
@@ -341,6 +343,337 @@ def _finalize(fig, axes, out_path):
     fig.savefig(out_path, dpi=155, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {out_path.name}")
+
+
+# ─── Unbound: univariate ──────────────────────────────────────────────────────
+
+def run_ew_unbound_sym(panel, predictor, fwd_col, oos_gap, nw_lags):
+    """Level based on |ŷ|."""
+    tag = (f"pos_EW_unbound_sym_{predictor}_{fwd_col}"
+           f"_t{int(T_THRESH*100)}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(f"pos_ubsym_{predictor}")
+
+    sub = panel.dropna(subset=[predictor, fwd_col]).copy()
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubsym_{predictor}")
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, len(sub)):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[predictor]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        if abs(float(res.params.iloc[1]) / float(nw[1])) <= T_THRESH:
+            continue
+        test  = sub.iloc[[i]][[predictor]].copy(); test.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test).iloc[0])
+        lv    = _level(abs(y_hat))
+        if lv > 0:
+            pos.iloc[i] = float(lv) if y_hat > 0 else float(-lv)
+
+    pos.to_frame().to_parquet(cache)
+    return pos
+
+
+def run_ew_unbound_asym(panel, predictor, fwd_col, oos_gap, nw_lags,
+                        rolling_window=500):
+    """Long: level by (ŷ-µ); short: level by |ŷ| when ŷ<0."""
+    tag = (f"pos_EW_unbound_asym_{predictor}_{fwd_col}"
+           f"_t{int(T_THRESH*100)}_rw{rolling_window}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(f"pos_ubasym_{predictor}")
+
+    sub = panel.dropna(subset=[predictor, fwd_col]).copy()
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubasym_{predictor}")
+    fwd = sub[fwd_col].values
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, len(sub)):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[predictor]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        if abs(float(res.params.iloc[1]) / float(nw[1])) <= T_THRESH:
+            continue
+        lo    = max(0, i - oos_gap - rolling_window)
+        mu    = float(np.mean(fwd[lo : i - oos_gap]))
+        test  = sub.iloc[[i]][[predictor]].copy(); test.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test).iloc[0])
+        lv_long  = _level(y_hat - mu) if (y_hat - mu) > 0 else 0
+        lv_short = _level(-y_hat)     if y_hat         < 0 else 0
+        if lv_long > 0:
+            pos.iloc[i] =  float(lv_long)
+        elif lv_short > 0:
+            pos.iloc[i] = -float(lv_short)
+
+    pos.to_frame().to_parquet(cache)
+    return pos
+
+
+def run_ew_unbound_rolmu(panel, predictor, fwd_col, oos_gap, nw_lags,
+                         rolling_window=500):
+    """Level based on |ŷ - µ|."""
+    tag = (f"pos_EW_rolmu_unbound_{predictor}_{fwd_col}"
+           f"_t{int(T_THRESH*100)}_rw{rolling_window}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(f"pos_ubrolmu_{predictor}")
+
+    sub = panel.dropna(subset=[predictor, fwd_col]).copy()
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubrolmu_{predictor}")
+    fwd = sub[fwd_col].values
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, len(sub)):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[predictor]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        if abs(float(res.params.iloc[1]) / float(nw[1])) <= T_THRESH:
+            continue
+        lo     = max(0, i - oos_gap - rolling_window)
+        mu     = float(np.mean(fwd[lo : i - oos_gap]))
+        test   = sub.iloc[[i]][[predictor]].copy(); test.insert(0, "const", 1.0)
+        y_hat  = float(res.predict(test).iloc[0])
+        excess = y_hat - mu
+        lv     = _level(abs(excess))
+        if lv > 0:
+            pos.iloc[i] = float(lv) if excess > 0 else float(-lv)
+
+    pos.to_frame().to_parquet(cache)
+    return pos
+
+
+# ─── Unbound: bivariate ───────────────────────────────────────────────────────
+
+def run_ew_biv_unbound_sym(panel, pred1, pred2, fwd_col, oos_gap, nw_lags):
+    tag = (f"pos_EW_unbound_sym_{pred1}_{pred2}_{fwd_col}"
+           f"_t{int(T_THRESH*100)}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(f"pos_ubsym_{pred1}_{pred2}")
+
+    sub = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubsym_{pred1}_{pred2}")
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, len(sub)):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[pred1, pred2]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        t1    = float(res.params.iloc[1]) / float(nw[1])
+        t2    = float(res.params.iloc[2]) / float(nw[2])
+        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH:
+            continue
+        test  = sub.iloc[[i]][[pred1, pred2]].copy(); test.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test).iloc[0])
+        lv    = _level(abs(y_hat))
+        if lv > 0:
+            pos.iloc[i] = float(lv) if y_hat > 0 else float(-lv)
+
+    pos.to_frame().to_parquet(cache)
+    return pos
+
+
+def run_ew_biv_unbound_asym(panel, pred1, pred2, fwd_col, oos_gap, nw_lags,
+                             rolling_window=500):
+    tag = (f"pos_EW_unbound_asym_{pred1}_{pred2}_{fwd_col}"
+           f"_t{int(T_THRESH*100)}_rw{rolling_window}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(f"pos_ubasym_{pred1}_{pred2}")
+
+    sub = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubasym_{pred1}_{pred2}")
+    fwd = sub[fwd_col].values
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, len(sub)):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[pred1, pred2]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        t1    = float(res.params.iloc[1]) / float(nw[1])
+        t2    = float(res.params.iloc[2]) / float(nw[2])
+        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH:
+            continue
+        lo    = max(0, i - oos_gap - rolling_window)
+        mu    = float(np.mean(fwd[lo : i - oos_gap]))
+        test  = sub.iloc[[i]][[pred1, pred2]].copy(); test.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test).iloc[0])
+        lv_long  = _level(y_hat - mu) if (y_hat - mu) > 0 else 0
+        lv_short = _level(-y_hat)     if y_hat         < 0 else 0
+        if lv_long > 0:
+            pos.iloc[i] =  float(lv_long)
+        elif lv_short > 0:
+            pos.iloc[i] = -float(lv_short)
+
+    pos.to_frame().to_parquet(cache)
+    return pos
+
+
+def run_ew_biv_unbound_rolmu(panel, pred1, pred2, fwd_col, oos_gap, nw_lags,
+                              rolling_window=500):
+    tag = (f"pos_EW_rolmu_unbound_{pred1}_{pred2}_{fwd_col}"
+           f"_t{int(T_THRESH*100)}_rw{rolling_window}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(f"pos_ubrolmu_{pred1}_{pred2}")
+
+    sub = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubrolmu_{pred1}_{pred2}")
+    fwd = sub[fwd_col].values
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, len(sub)):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[pred1, pred2]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        t1    = float(res.params.iloc[1]) / float(nw[1])
+        t2    = float(res.params.iloc[2]) / float(nw[2])
+        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH:
+            continue
+        lo     = max(0, i - oos_gap - rolling_window)
+        mu     = float(np.mean(fwd[lo : i - oos_gap]))
+        test   = sub.iloc[[i]][[pred1, pred2]].copy(); test.insert(0, "const", 1.0)
+        y_hat  = float(res.predict(test).iloc[0])
+        excess = y_hat - mu
+        lv     = _level(abs(excess))
+        if lv > 0:
+            pos.iloc[i] = float(lv) if excess > 0 else float(-lv)
+
+    pos.to_frame().to_parquet(cache)
+    return pos
+
+
+# ─── Unbound: trivariate ──────────────────────────────────────────────────────
+
+def run_ew_triv_unbound_sym(panel, pred1, pred2, pred3, fwd_col, oos_gap, nw_lags):
+    """All three t-stats must exceed gate; level based on |ŷ|."""
+    tag = (f"pos_EW_unbound_sym_{pred1}_{pred2}_{pred3}_{fwd_col}"
+           f"_t{int(T_THRESH*100)}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(
+            f"pos_ubsym_{pred1}_{pred2}_{pred3}")
+
+    sub = panel.dropna(subset=[pred1, pred2, pred3, fwd_col]).copy()
+    pos = pd.Series(0.0, index=sub.index,
+                    name=f"pos_ubsym_{pred1}_{pred2}_{pred3}")
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, len(sub)):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[pred1, pred2, pred3]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        t1 = float(res.params.iloc[1]) / float(nw[1])
+        t2 = float(res.params.iloc[2]) / float(nw[2])
+        t3 = float(res.params.iloc[3]) / float(nw[3])
+        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH or abs(t3) <= T_THRESH:
+            continue
+        test  = sub.iloc[[i]][[pred1, pred2, pred3]].copy()
+        test.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test).iloc[0])
+        lv    = _level(abs(y_hat))
+        if lv > 0:
+            pos.iloc[i] = float(lv) if y_hat > 0 else float(-lv)
+
+    pos.to_frame().to_parquet(cache)
+    return pos
+
+
+def run_ew_triv_unbound_asym(panel, pred1, pred2, pred3, fwd_col, oos_gap, nw_lags,
+                              rolling_window=500):
+    tag = (f"pos_EW_unbound_asym_{pred1}_{pred2}_{pred3}_{fwd_col}"
+           f"_t{int(T_THRESH*100)}_rw{rolling_window}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(
+            f"pos_ubasym_{pred1}_{pred2}_{pred3}")
+
+    sub = panel.dropna(subset=[pred1, pred2, pred3, fwd_col]).copy()
+    pos = pd.Series(0.0, index=sub.index,
+                    name=f"pos_ubasym_{pred1}_{pred2}_{pred3}")
+    fwd = sub[fwd_col].values
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, len(sub)):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[pred1, pred2, pred3]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        t1 = float(res.params.iloc[1]) / float(nw[1])
+        t2 = float(res.params.iloc[2]) / float(nw[2])
+        t3 = float(res.params.iloc[3]) / float(nw[3])
+        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH or abs(t3) <= T_THRESH:
+            continue
+        lo    = max(0, i - oos_gap - rolling_window)
+        mu    = float(np.mean(fwd[lo : i - oos_gap]))
+        test  = sub.iloc[[i]][[pred1, pred2, pred3]].copy()
+        test.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test).iloc[0])
+        lv_long  = _level(y_hat - mu) if (y_hat - mu) > 0 else 0
+        lv_short = _level(-y_hat)     if y_hat         < 0 else 0
+        if lv_long > 0:
+            pos.iloc[i] =  float(lv_long)
+        elif lv_short > 0:
+            pos.iloc[i] = -float(lv_short)
+
+    pos.to_frame().to_parquet(cache)
+    return pos
+
+
+def run_ew_triv_unbound_rolmu(panel, pred1, pred2, pred3, fwd_col, oos_gap, nw_lags,
+                               rolling_window=500):
+    tag = (f"pos_EW_rolmu_unbound_{pred1}_{pred2}_{pred3}_{fwd_col}"
+           f"_t{int(T_THRESH*100)}_rw{rolling_window}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(
+            f"pos_ubrolmu_{pred1}_{pred2}_{pred3}")
+
+    sub = panel.dropna(subset=[pred1, pred2, pred3, fwd_col]).copy()
+    pos = pd.Series(0.0, index=sub.index,
+                    name=f"pos_ubrolmu_{pred1}_{pred2}_{pred3}")
+    fwd = sub[fwd_col].values
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, len(sub)):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[pred1, pred2, pred3]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        t1 = float(res.params.iloc[1]) / float(nw[1])
+        t2 = float(res.params.iloc[2]) / float(nw[2])
+        t3 = float(res.params.iloc[3]) / float(nw[3])
+        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH or abs(t3) <= T_THRESH:
+            continue
+        lo     = max(0, i - oos_gap - rolling_window)
+        mu     = float(np.mean(fwd[lo : i - oos_gap]))
+        test   = sub.iloc[[i]][[pred1, pred2, pred3]].copy()
+        test.insert(0, "const", 1.0)
+        y_hat  = float(res.predict(test).iloc[0])
+        excess = y_hat - mu
+        lv     = _level(abs(excess))
+        if lv > 0:
+            pos.iloc[i] = float(lv) if excess > 0 else float(-lv)
+
+    pos.to_frame().to_parquet(cache)
+    return pos
 
 
 def plot_unbound_asymmetric_comparison(sim_vvix, sim_biv, sim_term, bah_sim, out_path,

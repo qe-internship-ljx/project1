@@ -28,11 +28,17 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.ticker as mticker
 
-ROOT   = Path(__file__).parent
-OUTPUT = ROOT / "output"
+ROOT      = Path(__file__).parent
+OUTPUT    = ROOT / "output"
+CACHE_DIR = OUTPUT / "regression_cache"
 
+sys.path.insert(0, str(ROOT.parent / "bh_replication"))
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent))
+
+from statsmodels.api import OLS, add_constant
+from har_model import _nw_se
+
 from experiment2 import (
     load_vrp_series, load_es_front_month, load_vvix,
     compute_vvix_ma5, compute_vvix_ma10,
@@ -43,13 +49,11 @@ from experiment2 import (
 from fh_replication.fh_replication import compute_vix_term_slope
 from regressions import (
     build_panel,
-    run_ew, run_ew_bivariate,
-    run_ew_asym, run_ew_asym_bivariate,
-    run_ew_rolmu, run_ew_rolmu_bivariate,
     compute_betas, compute_betas_bivariate,
     compute_oos_r2, compute_oos_r2_bivariate,
+    _yhat_univariate, _yhat_bivariate, _rolling_mu,
     _shade, oos_cumret,
-    OOS_START, T_THRESH, DELTAS, DELTA_LBL, OOS_GAP, NW_LAGS,
+    OOS_START, MIN_WIN, T_THRESH, DELTAS, DELTA_LBL, OOS_GAP, NW_LAGS,
 )
 
 BAH_COLOR = "#d62728"
@@ -1092,6 +1096,206 @@ def plot_rolmu_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_la
     fig.savefig(out_path, dpi=155, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {out_path.name}")
+
+
+# ─── Unit-position: symmetric ─────────────────────────────────────────────────
+
+def run_ew(panel, predictor, fwd_col, oos_gap, nw_lags, delta):
+    """±1 when |ŷ| > delta and t-stat gate passes."""
+    tag = (f"pos_EW_{predictor}_{fwd_col}_d{int(delta*10000)}bps"
+           f"_t{int(T_THRESH*100)}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(f"pos_{predictor}_{delta}")
+
+    sub = panel.dropna(subset=[predictor, fwd_col]).copy()
+    N   = len(sub)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_{predictor}_{delta}")
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, N):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[predictor]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        if abs(float(res.params.iloc[1]) / float(nw[1])) <= T_THRESH:
+            continue
+        test  = sub.iloc[[i]][[predictor]].copy(); test.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test).iloc[0])
+        if   y_hat >  delta: pos.iloc[i] =  1.0
+        elif y_hat < -delta: pos.iloc[i] = -1.0
+
+    pos.to_frame().to_parquet(cache)
+    return pos
+
+
+def run_ew_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, delta):
+    """Both betas must pass the |t| > T_THRESH gate."""
+    tag = (f"pos_EWbiv_{pred1}_{pred2}_{fwd_col}_d{int(delta*10000)}bps"
+           f"_t{int(T_THRESH*100)}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(f"pos_{pred1}_{pred2}_{delta}")
+
+    sub = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
+    N   = len(sub)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_{pred1}_{pred2}_{delta}")
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, N):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[pred1, pred2]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        t1    = float(res.params.iloc[1]) / float(nw[1])
+        t2    = float(res.params.iloc[2]) / float(nw[2])
+        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH:
+            continue
+        test  = sub.iloc[[i]][[pred1, pred2]].copy(); test.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test).iloc[0])
+        if   y_hat >  delta: pos.iloc[i] =  1.0
+        elif y_hat < -delta: pos.iloc[i] = -1.0
+
+    pos.to_frame().to_parquet(cache)
+    return pos
+
+
+# ─── Unit-position: asymmetric ────────────────────────────────────────────────
+
+def run_ew_asym(panel, predictor, fwd_col, oos_gap, nw_lags, delta=0.0):
+    """Long if (ŷ-µ₅₀₀) > delta, short if -ŷ > delta."""
+    d_sfx = f"_d{int(round(delta * 10000))}" if delta > 0 else ""
+    tag = (f"pos_EWasym_{predictor}_{fwd_col}"
+           f"_t{int(T_THRESH*100)}{d_sfx}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(f"pos_asym_{predictor}")
+
+    sub = panel.dropna(subset=[predictor, fwd_col]).copy()
+    N   = len(sub)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_asym_{predictor}")
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, N):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[predictor]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        if abs(float(res.params.iloc[1]) / float(nw[1])) <= T_THRESH:
+            continue
+        test  = sub.iloc[[i]][[predictor]].copy(); test.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test).iloc[0])
+        mu500 = float(sub[fwd_col].iloc[max(0, i - oos_gap - 500) : i - oos_gap].mean())
+        if   (y_hat - mu500) > delta: pos.iloc[i] =  1.0
+        elif       (-y_hat)  > delta: pos.iloc[i] = -1.0
+
+    pos.to_frame().to_parquet(cache)
+    return pos
+
+
+def run_ew_asym_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, delta=0.0):
+    """Both betas must pass gate. Long if (ŷ-µ₅₀₀) > delta, short if -ŷ > delta."""
+    d_sfx = f"_d{int(round(delta * 10000))}" if delta > 0 else ""
+    tag = (f"pos_EWasym_{pred1}_{pred2}_{fwd_col}"
+           f"_t{int(T_THRESH*100)}{d_sfx}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(f"pos_asym_{pred1}_{pred2}")
+
+    sub = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
+    N   = len(sub)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_asym_{pred1}_{pred2}")
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, N):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[pred1, pred2]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        t1    = float(res.params.iloc[1]) / float(nw[1])
+        t2    = float(res.params.iloc[2]) / float(nw[2])
+        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH:
+            continue
+        test  = sub.iloc[[i]][[pred1, pred2]].copy(); test.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test).iloc[0])
+        mu500 = float(sub[fwd_col].iloc[max(0, i - oos_gap - 500) : i - oos_gap].mean())
+        if   (y_hat - mu500) > delta: pos.iloc[i] =  1.0
+        elif       (-y_hat)  > delta: pos.iloc[i] = -1.0
+
+    pos.to_frame().to_parquet(cache)
+    return pos
+
+
+# ─── Unit-position: base-return-shift ────────────────────────────────────────
+
+def run_ew_rolmu(panel, predictor, fwd_col, oos_gap, nw_lags, delta=0.0):
+    """Long if (ŷ-µ₅₀₀) > delta, short if (µ₅₀₀-ŷ) > delta."""
+    d_sfx = f"_d{int(round(delta * 10000))}" if delta > 0 else ""
+    tag = (f"pos_EWrolmu_{predictor}_{fwd_col}"
+           f"_t{int(T_THRESH*100)}{d_sfx}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(f"pos_rolmu_{predictor}")
+
+    sub = panel.dropna(subset=[predictor, fwd_col]).copy()
+    N   = len(sub)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_rolmu_{predictor}")
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, N):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[predictor]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        if abs(float(res.params.iloc[1]) / float(nw[1])) <= T_THRESH:
+            continue
+        mu500 = float(sub[fwd_col].iloc[max(0, i - oos_gap - 500) : i - oos_gap].mean())
+        test  = sub.iloc[[i]][[predictor]].copy(); test.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test).iloc[0])
+        if   (y_hat - mu500) >  delta: pos.iloc[i] =  1.0
+        elif (mu500 - y_hat) >  delta: pos.iloc[i] = -1.0
+
+    pos.to_frame().to_parquet(cache)
+    return pos
+
+
+def run_ew_rolmu_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, delta=0.0):
+    """Both betas must pass gate. Long if (ŷ-µ₅₀₀) > delta, short if (µ₅₀₀-ŷ) > delta."""
+    d_sfx = f"_d{int(round(delta * 10000))}" if delta > 0 else ""
+    tag = (f"pos_EWrolmu_{pred1}_{pred2}_{fwd_col}"
+           f"_t{int(T_THRESH*100)}{d_sfx}_oos{OOS_START}.parquet")
+    cache = CACHE_DIR / tag
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(f"pos_rolmu_{pred1}_{pred2}")
+
+    sub = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
+    N   = len(sub)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_rolmu_{pred1}_{pred2}")
+    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
+    start_i = max(MIN_WIN + oos_gap, oos_idx)
+
+    for i in range(start_i, N):
+        train = sub.iloc[0 : i - oos_gap]
+        X_tr  = add_constant(train[[pred1, pred2]], has_constant="skip")
+        res   = OLS(train[fwd_col], X_tr).fit()
+        nw    = _nw_se(res, nlags=nw_lags)
+        t1    = float(res.params.iloc[1]) / float(nw[1])
+        t2    = float(res.params.iloc[2]) / float(nw[2])
+        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH:
+            continue
+        mu500 = float(sub[fwd_col].iloc[max(0, i - oos_gap - 500) : i - oos_gap].mean())
+        test  = sub.iloc[[i]][[pred1, pred2]].copy(); test.insert(0, "const", 1.0)
+        y_hat = float(res.predict(test).iloc[0])
+        if   (y_hat - mu500) >  delta: pos.iloc[i] =  1.0
+        elif (mu500 - y_hat) >  delta: pos.iloc[i] = -1.0
+
+    pos.to_frame().to_parquet(cache)
+    return pos
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────

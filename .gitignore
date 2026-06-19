@@ -1,6 +1,10 @@
 # Raw data
 data/
 
+.claude/
+
+report
+
 # Python bytecode
 __pycache__/
 *.py[cod]
@@ -19,3 +23,6 @@ Thumbs.db
 
 # Markdown docs
 *.md
+
+# CSV files
+*.csv

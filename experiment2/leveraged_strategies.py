@@ -53,10 +53,7 @@ sys.path.insert(0, str(ROOT.parent / "bh_replication"))
 sys.path.insert(0, str(ROOT.parent))
 sys.path.insert(0, str(ROOT))
 
-from statsmodels.api import OLS, add_constant
-from har_model import _nw_se
-
-from experiment2 import (
+from helpers import (
     load_vrp_series, load_es_front_month, load_vvix, compute_vvix_ma5,
     compute_vvix_ma10,
     load_vix_spot, load_vix_futures_term_structure, load_es_open_interest,
@@ -68,8 +65,8 @@ from regressions import (
     build_panel,
     compute_betas, compute_betas_bivariate, compute_betas_trivariate,
     _yhat_univariate, _yhat_bivariate, _yhat_trivariate, _rolling_mu,
-    _level, _shade, oos_cumret,
-    OOS_START, MIN_WIN, T_THRESH, VVIX_ACT, OOS_GAP, NW_LAGS, RW, THRESHOLDS, LEVELS,
+    _shade, oos_cumret, stat_start, window_stats, draw_tstat_beta_panel,
+    OOS_START, T_THRESH, VVIX_ACT, OOS_GAP, NW_LAGS, RW, THRESHOLDS, LEVELS,
 )
 
 # ─── Color constants ──────────────────────────────────────────────────────────
@@ -96,20 +93,13 @@ C_BIV102 = "#f768a1"   # second t-stat colour for VRP+VVIX MA10 bivariate
 
 def _draw_cumret(ax, sim, bah_sim, main_color, label):
     """Panel 1. Returns (_stat_start, pL, pS, avg_pos)."""
-    oos_dt = pd.Timestamp(OOS_START)
-    pos_oos    = sim["position"][sim.index >= OOS_START]
-    active     = pos_oos[pos_oos != 0]
-    _activation = active.index.min() if len(active) else None
-    _rebase_start = None
-    if _activation is not None and _activation > pd.Timestamp("2020-01-01"):
-        idx_arr       = bah_sim.index
-        act_i         = idx_arr.searchsorted(_activation)
-        _rebase_start = idx_arr[min(act_i + 1, len(idx_arr) - 1)]
-    _stat_start = _rebase_start if _rebase_start is not None else oos_dt
+    oos_dt      = pd.Timestamp(OOS_START)
+    _stat_start = stat_start(sim, bah_sim.index)
+    _rebased    = _stat_start > oos_dt
     _stat_lbl   = (f" stats from {_stat_start.strftime('%Y-%m-%d')}"
-                   if _rebase_start is not None else "")
+                   if _rebased else "")
 
-    _bah_st = compute_performance_stats(bah_sim[bah_sim.index >= _stat_start], "BaH")
+    _bah_st = window_stats(bah_sim, "BaH", bah_sim.index, start=_stat_start)
     ax.plot(oos_cumret(bah_sim).index,
             oos_cumret(bah_sim).values,
             color=BAH_COLOR, lw=1.5, ls="-.", alpha=0.6,
@@ -118,18 +108,18 @@ def _draw_cumret(ax, sim, bah_sim, main_color, label):
                    f"ret={_bah_st['ann_ret']*100:+.1f}%  "
                    f"DD={_bah_st['max_dd']*100:.1f}%]"))
 
-    if _rebase_start is not None:
-        _bah_from   = bah_sim["net_pnl"][bah_sim.index >= _rebase_start]
+    if _rebased:
+        _bah_from   = bah_sim["net_pnl"][bah_sim.index >= _stat_start]
         _bah_act    = (1 + _bah_from).cumprod()
-        _bah_act_st = compute_performance_stats(bah_sim[bah_sim.index >= _rebase_start], "BaH2")
+        _bah_act_st = window_stats(bah_sim, "BaH2", bah_sim.index, start=_stat_start)
         ax.plot(_bah_act.index, _bah_act.values,
                 color=BAH_COLOR, lw=1.2, ls=":", alpha=0.85,
-                label=(f"Buy-and-Hold from {_rebase_start.strftime('%Y-%m-%d')}  "
+                label=(f"Buy-and-Hold from {_stat_start.strftime('%Y-%m-%d')}  "
                        f"[SR={_bah_act_st['sharpe']:+.2f}  "
                        f"ret={_bah_act_st['ann_ret']*100:+.1f}%  "
                        f"DD={_bah_act_st['max_dd']*100:.1f}%]"))
 
-    st      = compute_performance_stats(sim[sim.index >= _stat_start], "ub")
+    st      = window_stats(sim, "ub", bah_sim.index, start=_stat_start)
     p_stat  = sim["position"][sim.index >= _stat_start]
     pL, pS  = float((p_stat > 0).mean() * 100), float((p_stat < 0).mean() * 100)
     avg_pos = float(p_stat.mean())
@@ -152,102 +142,21 @@ def _draw_cumret(ax, sim, bah_sim, main_color, label):
 
 
 def _draw_tstat_univ(ax, betas_df, main_color, pred_label, nw_lags):
-    """Panel 2 — univariate."""
-    t_ser, b_ser = betas_df["t_stat"], betas_df["beta"]
-    ax.plot(t_ser.index, t_ser.values, color=main_color, lw=1.0, alpha=0.85,
-            label=f"NW t-stat ({pred_label}, {nw_lags}-lag HAC)")
-    ax.fill_between(t_ser.index, -T_THRESH, T_THRESH,
-                    color="firebrick", alpha=0.05, label="Below gate (flat zone)")
-    for y in (T_THRESH, -T_THRESH):
-        ax.axhline(y, color="firebrick", lw=1.2, ls="--")
-    ax.axhline(0, color="black", lw=0.5, ls=":")
-    ax.axhline(T_THRESH, color="firebrick", lw=0, label=f"|t| = {T_THRESH:.2f} gate")
-    ax.set_ylabel(f"NW t-stat ({pred_label})", fontsize=9)
-    ax.grid(axis="y", alpha=0.2, lw=0.6); ax.spines["top"].set_visible(False)
-
-    ax2 = ax.twinx()
-    ax2.plot(b_ser.index, b_ser.values, color="dimgrey", lw=1.0, ls="--", alpha=0.60,
-             label=f"Beta ({pred_label})")
-    ax2.axhline(0, color="dimgrey", lw=0.4, ls=":")
-    ax2.set_ylabel(f"Beta ({pred_label})", fontsize=8, color="dimgrey")
-    ax2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
-    ax2.spines["top"].set_visible(False)
-    if "r2_insample" in betas_df.columns:
-        ax2.plot(betas_df["r2_insample"].index, betas_df["r2_insample"].values,
-                 color="forestgreen", lw=0.9, ls=":", alpha=0.75, label="In-sample R2")
-    l1, lb1 = ax.get_legend_handles_labels()
-    l2, lb2 = ax2.get_legend_handles_labels()
-    ax.legend(l1 + l2, lb1 + lb2, fontsize=8, loc="upper left")
+    """Panel 2 — univariate. Delegates to the shared canonical panel."""
+    return draw_tstat_beta_panel(ax, betas_df, [pred_label], [main_color], nw_lags)
 
 
 def _draw_tstat_biv(ax, betas_df, c1, c2, pred1_label, pred2_label, nw_lags):
-    """Panel 2 — bivariate (two t-stats)."""
-    t1, t2 = betas_df["t_stat_1"], betas_df["t_stat_2"]
-    b1, b2 = betas_df["beta_1"],   betas_df["beta_2"]
-    ax.plot(t1.index, t1.values, color=c1, lw=1.0, alpha=0.85,
-            label=f"NW t-stat: {pred1_label} ({nw_lags}-lag HAC)")
-    ax.plot(t2.index, t2.values, color=c2, lw=1.0, alpha=0.85, ls="--",
-            label=f"NW t-stat: {pred2_label} ({nw_lags}-lag HAC)")
-    ax.fill_between(t1.index, -T_THRESH, T_THRESH,
-                    color="firebrick", alpha=0.05, label="Below gate (flat zone)")
-    for y in (T_THRESH, -T_THRESH):
-        ax.axhline(y, color="firebrick", lw=1.2, ls="--")
-    ax.axhline(0, color="black", lw=0.5, ls=":")
-    ax.axhline(T_THRESH, color="firebrick", lw=0, label=f"|t| = {T_THRESH:.2f} gate")
-    ax.set_ylabel("NW t-stat", fontsize=9)
-    ax.grid(axis="y", alpha=0.2, lw=0.6); ax.spines["top"].set_visible(False)
-
-    ax2 = ax.twinx()
-    ax2.plot(b1.index, b1.values, color="dimgrey", lw=1.0, ls="-", alpha=0.60,
-             label=f"Beta: {pred1_label}")
-    ax2.plot(b2.index, b2.values, color="dimgrey", lw=1.0, ls=":", alpha=0.60,
-             label=f"Beta: {pred2_label}")
-    ax2.axhline(0, color="dimgrey", lw=0.4, ls=":")
-    ax2.set_ylabel("Beta", fontsize=8, color="dimgrey")
-    ax2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
-    ax2.spines["top"].set_visible(False)
-    if "r2_insample" in betas_df.columns:
-        ax2.plot(betas_df["r2_insample"].index, betas_df["r2_insample"].values,
-                 color="forestgreen", lw=0.9, ls=":", alpha=0.75, label="In-sample R2")
-    l1, lb1 = ax.get_legend_handles_labels()
-    l2, lb2 = ax2.get_legend_handles_labels()
-    ax.legend(l1 + l2, lb1 + lb2, fontsize=8, loc="upper left")
+    """Panel 2 — bivariate. Delegates to the shared canonical panel."""
+    return draw_tstat_beta_panel(ax, betas_df, [pred1_label, pred2_label],
+                                 [c1, c2], nw_lags)
 
 
 def _draw_tstat_triv(ax, betas_df, c1, c2, c3, pred1_label, pred2_label, pred3_label, nw_lags):
-    """Panel 2 — trivariate (three t-stats)."""
-    t1, t2, t3 = betas_df["t_stat_1"], betas_df["t_stat_2"], betas_df["t_stat_3"]
-    b1, b2, b3 = betas_df["beta_1"],   betas_df["beta_2"],   betas_df["beta_3"]
-    ax.plot(t1.index, t1.values, color=c1, lw=1.0, alpha=0.85,
-            label=f"NW t-stat: {pred1_label} ({nw_lags}-lag HAC)")
-    ax.plot(t2.index, t2.values, color=c2, lw=1.0, alpha=0.85, ls="--",
-            label=f"NW t-stat: {pred2_label} ({nw_lags}-lag HAC)")
-    ax.plot(t3.index, t3.values, color=c3, lw=1.0, alpha=0.85, ls="-.",
-            label=f"NW t-stat: {pred3_label} ({nw_lags}-lag HAC)")
-    ax.fill_between(t1.index, -T_THRESH, T_THRESH,
-                    color="firebrick", alpha=0.05, label="Below gate (flat zone)")
-    for y in (T_THRESH, -T_THRESH):
-        ax.axhline(y, color="firebrick", lw=1.2, ls="--")
-    ax.axhline(0, color="black", lw=0.5, ls=":")
-    ax.axhline(T_THRESH, color="firebrick", lw=0, label=f"|t| = {T_THRESH:.2f} gate")
-    ax.set_ylabel("NW t-stat", fontsize=9)
-    ax.grid(axis="y", alpha=0.2, lw=0.6)
-    ax.spines["top"].set_visible(False)
-
-    ax2 = ax.twinx()
-    ax2.plot(b1.index, b1.values, color="dimgrey", lw=1.0, ls="-", alpha=0.60,
-             label=f"Beta: {pred1_label}")
-    ax2.plot(b2.index, b2.values, color="dimgrey", lw=1.0, ls=":", alpha=0.55,
-             label=f"Beta: {pred2_label}")
-    ax2.plot(b3.index, b3.values, color="dimgrey", lw=1.0, ls="-.", alpha=0.40,
-             label=f"Beta: {pred3_label}")
-    ax2.axhline(0, color="dimgrey", lw=0.4, ls=":")
-    ax2.set_ylabel("Beta", fontsize=8, color="dimgrey")
-    ax2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
-    ax2.spines["top"].set_visible(False)
-    l1, lb1 = ax.get_legend_handles_labels()
-    l2, lb2 = ax2.get_legend_handles_labels()
-    ax.legend(l1 + l2, lb1 + lb2, fontsize=8, loc="upper left")
+    """Panel 2 — trivariate. Delegates to the shared canonical panel."""
+    return draw_tstat_beta_panel(ax, betas_df,
+                                 [pred1_label, pred2_label, pred3_label],
+                                 [c1, c2, c3], nw_lags)
 
 
 def _draw_position(ax, sim, main_color, pL, pS, avg_pos):
@@ -345,6 +254,31 @@ def _finalize(fig, axes, out_path):
     print(f"  Saved: {out_path.name}")
 
 
+# ─── Unbound: position-sizing helpers ─────────────────────────────────────────
+
+def _level(excess_abs):
+    """Position multiplier (1..4) for |excess| against THRESHOLDS; 0 if below all."""
+    for thresh, lv in zip(THRESHOLDS, LEVELS):
+        if excess_abs >= thresh:
+            return lv
+    return 0
+
+
+def _signed_levels(excess):
+    """Vectorized signed level: sign(excess) × _level(|excess|)."""
+    return np.sign(excess) * excess.abs().apply(_level)
+
+
+def _asym_levels(y_hat, mu):
+    """Long: _level(ŷ-µ) when ŷ>µ; Short: -_level(-ŷ) when ŷ<0 (long wins ties)."""
+    lv_long  = (y_hat - mu).clip(lower=0).apply(_level).astype(float)
+    lv_short = (-y_hat).clip(lower=0).apply(_level).astype(float)
+    out = pd.Series(0.0, index=y_hat.index)
+    out = out.mask(lv_short > 0, -lv_short)
+    out = out.mask(lv_long  > 0,  lv_long)
+    return out
+
+
 # ─── Unbound: univariate ──────────────────────────────────────────────────────
 
 def run_ew_unbound_sym(panel, predictor, fwd_col, oos_gap, nw_lags):
@@ -355,23 +289,14 @@ def run_ew_unbound_sym(panel, predictor, fwd_col, oos_gap, nw_lags):
     if cache.exists():
         return pd.read_parquet(cache).squeeze().rename(f"pos_ubsym_{predictor}")
 
-    sub = panel.dropna(subset=[predictor, fwd_col]).copy()
-    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubsym_{predictor}")
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
+    sub      = panel.dropna(subset=[predictor, fwd_col]).copy()
+    betas_df = compute_betas(panel, predictor, fwd_col, oos_gap, nw_lags)
+    y_hat    = _yhat_univariate(panel, predictor, fwd_col, betas_df)
+    fire     = betas_df["t_stat"].abs() > T_THRESH
 
-    for i in range(start_i, len(sub)):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[predictor]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        nw    = _nw_se(res, nlags=nw_lags)
-        if abs(float(res.params.iloc[1]) / float(nw[1])) <= T_THRESH:
-            continue
-        test  = sub.iloc[[i]][[predictor]].copy(); test.insert(0, "const", 1.0)
-        y_hat = float(res.predict(test).iloc[0])
-        lv    = _level(abs(y_hat))
-        if lv > 0:
-            pos.iloc[i] = float(lv) if y_hat > 0 else float(-lv)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubsym_{predictor}")
+    idx = y_hat.index[fire.reindex(y_hat.index, fill_value=False)]
+    pos.loc[idx] = _signed_levels(y_hat.loc[idx])
 
     pos.to_frame().to_parquet(cache)
     return pos
@@ -386,29 +311,16 @@ def run_ew_unbound_asym(panel, predictor, fwd_col, oos_gap, nw_lags,
     if cache.exists():
         return pd.read_parquet(cache).squeeze().rename(f"pos_ubasym_{predictor}")
 
-    sub = panel.dropna(subset=[predictor, fwd_col]).copy()
-    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubasym_{predictor}")
-    fwd = sub[fwd_col].values
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
+    sub      = panel.dropna(subset=[predictor, fwd_col]).copy()
+    betas_df = compute_betas(panel, predictor, fwd_col, oos_gap, nw_lags)
+    y_hat    = _yhat_univariate(panel, predictor, fwd_col, betas_df)
+    mu       = _rolling_mu(panel, fwd_col, oos_gap, rolling_window=rolling_window,
+                           predictor=predictor)
+    fire     = betas_df["t_stat"].abs() > T_THRESH
 
-    for i in range(start_i, len(sub)):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[predictor]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        nw    = _nw_se(res, nlags=nw_lags)
-        if abs(float(res.params.iloc[1]) / float(nw[1])) <= T_THRESH:
-            continue
-        lo    = max(0, i - oos_gap - rolling_window)
-        mu    = float(np.mean(fwd[lo : i - oos_gap]))
-        test  = sub.iloc[[i]][[predictor]].copy(); test.insert(0, "const", 1.0)
-        y_hat = float(res.predict(test).iloc[0])
-        lv_long  = _level(y_hat - mu) if (y_hat - mu) > 0 else 0
-        lv_short = _level(-y_hat)     if y_hat         < 0 else 0
-        if lv_long > 0:
-            pos.iloc[i] =  float(lv_long)
-        elif lv_short > 0:
-            pos.iloc[i] = -float(lv_short)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubasym_{predictor}")
+    idx = y_hat.index[fire.reindex(y_hat.index, fill_value=False)]
+    pos.loc[idx] = _asym_levels(y_hat.loc[idx], mu.reindex(idx))
 
     pos.to_frame().to_parquet(cache)
     return pos
@@ -423,27 +335,16 @@ def run_ew_unbound_rolmu(panel, predictor, fwd_col, oos_gap, nw_lags,
     if cache.exists():
         return pd.read_parquet(cache).squeeze().rename(f"pos_ubrolmu_{predictor}")
 
-    sub = panel.dropna(subset=[predictor, fwd_col]).copy()
-    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubrolmu_{predictor}")
-    fwd = sub[fwd_col].values
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
+    sub      = panel.dropna(subset=[predictor, fwd_col]).copy()
+    betas_df = compute_betas(panel, predictor, fwd_col, oos_gap, nw_lags)
+    y_hat    = _yhat_univariate(panel, predictor, fwd_col, betas_df)
+    mu       = _rolling_mu(panel, fwd_col, oos_gap, rolling_window=rolling_window,
+                           predictor=predictor)
+    fire     = betas_df["t_stat"].abs() > T_THRESH
 
-    for i in range(start_i, len(sub)):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[predictor]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        nw    = _nw_se(res, nlags=nw_lags)
-        if abs(float(res.params.iloc[1]) / float(nw[1])) <= T_THRESH:
-            continue
-        lo     = max(0, i - oos_gap - rolling_window)
-        mu     = float(np.mean(fwd[lo : i - oos_gap]))
-        test   = sub.iloc[[i]][[predictor]].copy(); test.insert(0, "const", 1.0)
-        y_hat  = float(res.predict(test).iloc[0])
-        excess = y_hat - mu
-        lv     = _level(abs(excess))
-        if lv > 0:
-            pos.iloc[i] = float(lv) if excess > 0 else float(-lv)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubrolmu_{predictor}")
+    idx = y_hat.index[fire.reindex(y_hat.index, fill_value=False)]
+    pos.loc[idx] = _signed_levels(y_hat.loc[idx] - mu.reindex(idx))
 
     pos.to_frame().to_parquet(cache)
     return pos
@@ -458,25 +359,15 @@ def run_ew_biv_unbound_sym(panel, pred1, pred2, fwd_col, oos_gap, nw_lags):
     if cache.exists():
         return pd.read_parquet(cache).squeeze().rename(f"pos_ubsym_{pred1}_{pred2}")
 
-    sub = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
-    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubsym_{pred1}_{pred2}")
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
+    sub      = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
+    betas_df = compute_betas_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags)
+    y_hat    = _yhat_bivariate(panel, pred1, pred2, fwd_col, betas_df)
+    fire     = ((betas_df["t_stat_1"].abs() > T_THRESH)
+                & (betas_df["t_stat_2"].abs() > T_THRESH))
 
-    for i in range(start_i, len(sub)):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[pred1, pred2]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        nw    = _nw_se(res, nlags=nw_lags)
-        t1    = float(res.params.iloc[1]) / float(nw[1])
-        t2    = float(res.params.iloc[2]) / float(nw[2])
-        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH:
-            continue
-        test  = sub.iloc[[i]][[pred1, pred2]].copy(); test.insert(0, "const", 1.0)
-        y_hat = float(res.predict(test).iloc[0])
-        lv    = _level(abs(y_hat))
-        if lv > 0:
-            pos.iloc[i] = float(lv) if y_hat > 0 else float(-lv)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubsym_{pred1}_{pred2}")
+    idx = y_hat.index[fire.reindex(y_hat.index, fill_value=False)]
+    pos.loc[idx] = _signed_levels(y_hat.loc[idx])
 
     pos.to_frame().to_parquet(cache)
     return pos
@@ -490,31 +381,17 @@ def run_ew_biv_unbound_asym(panel, pred1, pred2, fwd_col, oos_gap, nw_lags,
     if cache.exists():
         return pd.read_parquet(cache).squeeze().rename(f"pos_ubasym_{pred1}_{pred2}")
 
-    sub = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
-    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubasym_{pred1}_{pred2}")
-    fwd = sub[fwd_col].values
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
+    sub      = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
+    betas_df = compute_betas_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags)
+    y_hat    = _yhat_bivariate(panel, pred1, pred2, fwd_col, betas_df)
+    mu       = _rolling_mu(panel, fwd_col, oos_gap, rolling_window=rolling_window,
+                           predictor=[pred1, pred2])
+    fire     = ((betas_df["t_stat_1"].abs() > T_THRESH)
+                & (betas_df["t_stat_2"].abs() > T_THRESH))
 
-    for i in range(start_i, len(sub)):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[pred1, pred2]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        nw    = _nw_se(res, nlags=nw_lags)
-        t1    = float(res.params.iloc[1]) / float(nw[1])
-        t2    = float(res.params.iloc[2]) / float(nw[2])
-        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH:
-            continue
-        lo    = max(0, i - oos_gap - rolling_window)
-        mu    = float(np.mean(fwd[lo : i - oos_gap]))
-        test  = sub.iloc[[i]][[pred1, pred2]].copy(); test.insert(0, "const", 1.0)
-        y_hat = float(res.predict(test).iloc[0])
-        lv_long  = _level(y_hat - mu) if (y_hat - mu) > 0 else 0
-        lv_short = _level(-y_hat)     if y_hat         < 0 else 0
-        if lv_long > 0:
-            pos.iloc[i] =  float(lv_long)
-        elif lv_short > 0:
-            pos.iloc[i] = -float(lv_short)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubasym_{pred1}_{pred2}")
+    idx = y_hat.index[fire.reindex(y_hat.index, fill_value=False)]
+    pos.loc[idx] = _asym_levels(y_hat.loc[idx], mu.reindex(idx))
 
     pos.to_frame().to_parquet(cache)
     return pos
@@ -528,29 +405,17 @@ def run_ew_biv_unbound_rolmu(panel, pred1, pred2, fwd_col, oos_gap, nw_lags,
     if cache.exists():
         return pd.read_parquet(cache).squeeze().rename(f"pos_ubrolmu_{pred1}_{pred2}")
 
-    sub = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
-    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubrolmu_{pred1}_{pred2}")
-    fwd = sub[fwd_col].values
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
+    sub      = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
+    betas_df = compute_betas_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags)
+    y_hat    = _yhat_bivariate(panel, pred1, pred2, fwd_col, betas_df)
+    mu       = _rolling_mu(panel, fwd_col, oos_gap, rolling_window=rolling_window,
+                           predictor=[pred1, pred2])
+    fire     = ((betas_df["t_stat_1"].abs() > T_THRESH)
+                & (betas_df["t_stat_2"].abs() > T_THRESH))
 
-    for i in range(start_i, len(sub)):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[pred1, pred2]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        nw    = _nw_se(res, nlags=nw_lags)
-        t1    = float(res.params.iloc[1]) / float(nw[1])
-        t2    = float(res.params.iloc[2]) / float(nw[2])
-        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH:
-            continue
-        lo     = max(0, i - oos_gap - rolling_window)
-        mu     = float(np.mean(fwd[lo : i - oos_gap]))
-        test   = sub.iloc[[i]][[pred1, pred2]].copy(); test.insert(0, "const", 1.0)
-        y_hat  = float(res.predict(test).iloc[0])
-        excess = y_hat - mu
-        lv     = _level(abs(excess))
-        if lv > 0:
-            pos.iloc[i] = float(lv) if excess > 0 else float(-lv)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubrolmu_{pred1}_{pred2}")
+    idx = y_hat.index[fire.reindex(y_hat.index, fill_value=False)]
+    pos.loc[idx] = _signed_levels(y_hat.loc[idx] - mu.reindex(idx))
 
     pos.to_frame().to_parquet(cache)
     return pos
@@ -567,28 +432,16 @@ def run_ew_triv_unbound_sym(panel, pred1, pred2, pred3, fwd_col, oos_gap, nw_lag
         return pd.read_parquet(cache).squeeze().rename(
             f"pos_ubsym_{pred1}_{pred2}_{pred3}")
 
-    sub = panel.dropna(subset=[pred1, pred2, pred3, fwd_col]).copy()
-    pos = pd.Series(0.0, index=sub.index,
-                    name=f"pos_ubsym_{pred1}_{pred2}_{pred3}")
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
+    sub      = panel.dropna(subset=[pred1, pred2, pred3, fwd_col]).copy()
+    betas_df = compute_betas_trivariate(panel, pred1, pred2, pred3, fwd_col, oos_gap, nw_lags)
+    y_hat    = _yhat_trivariate(panel, pred1, pred2, pred3, fwd_col, betas_df)
+    fire     = ((betas_df["t_stat_1"].abs() > T_THRESH)
+                & (betas_df["t_stat_2"].abs() > T_THRESH)
+                & (betas_df["t_stat_3"].abs() > T_THRESH))
 
-    for i in range(start_i, len(sub)):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[pred1, pred2, pred3]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        nw    = _nw_se(res, nlags=nw_lags)
-        t1 = float(res.params.iloc[1]) / float(nw[1])
-        t2 = float(res.params.iloc[2]) / float(nw[2])
-        t3 = float(res.params.iloc[3]) / float(nw[3])
-        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH or abs(t3) <= T_THRESH:
-            continue
-        test  = sub.iloc[[i]][[pred1, pred2, pred3]].copy()
-        test.insert(0, "const", 1.0)
-        y_hat = float(res.predict(test).iloc[0])
-        lv    = _level(abs(y_hat))
-        if lv > 0:
-            pos.iloc[i] = float(lv) if y_hat > 0 else float(-lv)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubsym_{pred1}_{pred2}_{pred3}")
+    idx = y_hat.index[fire.reindex(y_hat.index, fill_value=False)]
+    pos.loc[idx] = _signed_levels(y_hat.loc[idx])
 
     pos.to_frame().to_parquet(cache)
     return pos
@@ -603,34 +456,18 @@ def run_ew_triv_unbound_asym(panel, pred1, pred2, pred3, fwd_col, oos_gap, nw_la
         return pd.read_parquet(cache).squeeze().rename(
             f"pos_ubasym_{pred1}_{pred2}_{pred3}")
 
-    sub = panel.dropna(subset=[pred1, pred2, pred3, fwd_col]).copy()
-    pos = pd.Series(0.0, index=sub.index,
-                    name=f"pos_ubasym_{pred1}_{pred2}_{pred3}")
-    fwd = sub[fwd_col].values
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
+    sub      = panel.dropna(subset=[pred1, pred2, pred3, fwd_col]).copy()
+    betas_df = compute_betas_trivariate(panel, pred1, pred2, pred3, fwd_col, oos_gap, nw_lags)
+    y_hat    = _yhat_trivariate(panel, pred1, pred2, pred3, fwd_col, betas_df)
+    mu       = _rolling_mu(panel, fwd_col, oos_gap, rolling_window=rolling_window,
+                           predictor=[pred1, pred2, pred3])
+    fire     = ((betas_df["t_stat_1"].abs() > T_THRESH)
+                & (betas_df["t_stat_2"].abs() > T_THRESH)
+                & (betas_df["t_stat_3"].abs() > T_THRESH))
 
-    for i in range(start_i, len(sub)):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[pred1, pred2, pred3]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        nw    = _nw_se(res, nlags=nw_lags)
-        t1 = float(res.params.iloc[1]) / float(nw[1])
-        t2 = float(res.params.iloc[2]) / float(nw[2])
-        t3 = float(res.params.iloc[3]) / float(nw[3])
-        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH or abs(t3) <= T_THRESH:
-            continue
-        lo    = max(0, i - oos_gap - rolling_window)
-        mu    = float(np.mean(fwd[lo : i - oos_gap]))
-        test  = sub.iloc[[i]][[pred1, pred2, pred3]].copy()
-        test.insert(0, "const", 1.0)
-        y_hat = float(res.predict(test).iloc[0])
-        lv_long  = _level(y_hat - mu) if (y_hat - mu) > 0 else 0
-        lv_short = _level(-y_hat)     if y_hat         < 0 else 0
-        if lv_long > 0:
-            pos.iloc[i] =  float(lv_long)
-        elif lv_short > 0:
-            pos.iloc[i] = -float(lv_short)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubasym_{pred1}_{pred2}_{pred3}")
+    idx = y_hat.index[fire.reindex(y_hat.index, fill_value=False)]
+    pos.loc[idx] = _asym_levels(y_hat.loc[idx], mu.reindex(idx))
 
     pos.to_frame().to_parquet(cache)
     return pos
@@ -645,32 +482,18 @@ def run_ew_triv_unbound_rolmu(panel, pred1, pred2, pred3, fwd_col, oos_gap, nw_l
         return pd.read_parquet(cache).squeeze().rename(
             f"pos_ubrolmu_{pred1}_{pred2}_{pred3}")
 
-    sub = panel.dropna(subset=[pred1, pred2, pred3, fwd_col]).copy()
-    pos = pd.Series(0.0, index=sub.index,
-                    name=f"pos_ubrolmu_{pred1}_{pred2}_{pred3}")
-    fwd = sub[fwd_col].values
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
+    sub      = panel.dropna(subset=[pred1, pred2, pred3, fwd_col]).copy()
+    betas_df = compute_betas_trivariate(panel, pred1, pred2, pred3, fwd_col, oos_gap, nw_lags)
+    y_hat    = _yhat_trivariate(panel, pred1, pred2, pred3, fwd_col, betas_df)
+    mu       = _rolling_mu(panel, fwd_col, oos_gap, rolling_window=rolling_window,
+                           predictor=[pred1, pred2, pred3])
+    fire     = ((betas_df["t_stat_1"].abs() > T_THRESH)
+                & (betas_df["t_stat_2"].abs() > T_THRESH)
+                & (betas_df["t_stat_3"].abs() > T_THRESH))
 
-    for i in range(start_i, len(sub)):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[pred1, pred2, pred3]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        nw    = _nw_se(res, nlags=nw_lags)
-        t1 = float(res.params.iloc[1]) / float(nw[1])
-        t2 = float(res.params.iloc[2]) / float(nw[2])
-        t3 = float(res.params.iloc[3]) / float(nw[3])
-        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH or abs(t3) <= T_THRESH:
-            continue
-        lo     = max(0, i - oos_gap - rolling_window)
-        mu     = float(np.mean(fwd[lo : i - oos_gap]))
-        test   = sub.iloc[[i]][[pred1, pred2, pred3]].copy()
-        test.insert(0, "const", 1.0)
-        y_hat  = float(res.predict(test).iloc[0])
-        excess = y_hat - mu
-        lv     = _level(abs(excess))
-        if lv > 0:
-            pos.iloc[i] = float(lv) if excess > 0 else float(-lv)
+    pos = pd.Series(0.0, index=sub.index, name=f"pos_ubrolmu_{pred1}_{pred2}_{pred3}")
+    idx = y_hat.index[fire.reindex(y_hat.index, fill_value=False)]
+    pos.loc[idx] = _signed_levels(y_hat.loc[idx] - mu.reindex(idx))
 
     pos.to_frame().to_parquet(cache)
     return pos
@@ -926,11 +749,16 @@ def plot_unbound_trivariate(pred1_label, pred2_label, pred3_label,
 # Main
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _report(pos, daily_ret, label):
-    sim = simulate_strategy(pos, daily_ret)
-    st  = compute_performance_stats(sim[sim.index >= OOS_START], label)
-    p   = pos[pos.index >= OOS_START]
-    print(f"    {label}: SR={st['sharpe']:+.3f}  "
+def _report(pos, daily_ret, label, bah_sim):
+    """Print SR / position mix over the same activation window the plot uses
+    (see stat_start), so printed stats match the figure legend."""
+    sim   = simulate_strategy(pos, daily_ret)
+    start = stat_start(sim, bah_sim.index)
+    st    = window_stats(sim, label, bah_sim.index, start=start)
+    p     = pos[pos.index >= start]
+    from_lbl = (f" (from {start.strftime('%Y-%m-%d')})"
+                if start > pd.Timestamp(OOS_START) else "")
+    print(f"    {label}{from_lbl}: SR={st['sharpe']:+.3f}  "
           f"L%={(p>0).mean()*100:.1f}  S%={(p<0).mean()*100:.1f}  "
           f"F%={(p==0).mean()*100:.1f}  AvgPos={p.mean():+.3f}")
     return sim
@@ -1000,7 +828,7 @@ def main():
     print("\n[A] VVIX MA5 unbound symmetric...")
     pos = run_ew_unbound_sym(panel, "vvix_ma5", FWD, OOS_GAP, NW_LAGS)
     pos = pos.copy(); pos[pos.index < VVIX_ACT] = 0.0
-    sim = _report(pos, daily_ret, "ub_sym_VVIX")
+    sim = _report(pos, daily_ret, "ub_sym_VVIX", bah_sim)
     plot_unbound_univariate(
         "VVIX MA5", "20-day", "sym", C_VVIX,
         sim, betas_vvix, bah_sim, yh_vvix, mu_20d,
@@ -1012,7 +840,7 @@ def main():
     print("\n[B] VVIX MA5 unbound asymmetric...")
     pos = run_ew_unbound_asym(panel, "vvix_ma5", FWD, OOS_GAP, NW_LAGS)
     pos = pos.copy(); pos[pos.index < VVIX_ACT] = 0.0
-    sim_vvix_asym = _report(pos, daily_ret, "ub_asym_VVIX")
+    sim_vvix_asym = _report(pos, daily_ret, "ub_asym_VVIX", bah_sim)
     plot_unbound_univariate(
         "VVIX MA5", "20-day", "asym", C_VVIX,
         sim_vvix_asym, betas_vvix, bah_sim, yh_vvix, mu_20d,
@@ -1024,7 +852,7 @@ def main():
     print("\n[MA5-rolmu] VVIX MA5 unbound base_return_shift...")
     pos = run_ew_unbound_rolmu(panel, "vvix_ma5", FWD, OOS_GAP, NW_LAGS)
     pos = pos.copy(); pos[pos.index < VVIX_ACT] = 0.0
-    sim = _report(pos, daily_ret, "ub_rolmu_VVIX_MA5")
+    sim = _report(pos, daily_ret, "ub_rolmu_VVIX_MA5", bah_sim)
     plot_unbound_univariate(
         "VVIX MA5", "20-day", "rolmu", C_VVIX,
         sim, betas_vvix, bah_sim, yh_vvix, mu_20d,
@@ -1036,7 +864,7 @@ def main():
     print("\n[R] VVIX MA10 unbound symmetric...")
     pos = run_ew_unbound_sym(panel, "vvix_ma10", FWD, OOS_GAP, NW_LAGS)
     pos = pos.copy(); pos[pos.index < VVIX_ACT] = 0.0
-    sim = _report(pos, daily_ret, "ub_sym_VVIX_MA10")
+    sim = _report(pos, daily_ret, "ub_sym_VVIX_MA10", bah_sim)
     plot_unbound_univariate(
         "VVIX MA10", "20-day", "sym", C_MA10,
         sim, betas_ma10, bah_sim, yh_ma10, mu_20d,
@@ -1048,7 +876,7 @@ def main():
     print("\n[S] VVIX MA10 unbound asymmetric...")
     pos = run_ew_unbound_asym(panel, "vvix_ma10", FWD, OOS_GAP, NW_LAGS)
     pos = pos.copy(); pos[pos.index < VVIX_ACT] = 0.0
-    sim_ma10_asym = _report(pos, daily_ret, "ub_asym_VVIX_MA10")
+    sim_ma10_asym = _report(pos, daily_ret, "ub_asym_VVIX_MA10", bah_sim)
     plot_unbound_univariate(
         "VVIX MA10", "20-day", "asym", C_MA10,
         sim_ma10_asym, betas_ma10, bah_sim, yh_ma10, mu_20d,
@@ -1060,7 +888,7 @@ def main():
     print("\n[T] VVIX MA10 unbound base_return_shift...")
     pos = run_ew_unbound_rolmu(panel, "vvix_ma10", FWD, OOS_GAP, NW_LAGS)
     pos = pos.copy(); pos[pos.index < VVIX_ACT] = 0.0
-    sim = _report(pos, daily_ret, "ub_rolmu_VVIX_MA10")
+    sim = _report(pos, daily_ret, "ub_rolmu_VVIX_MA10", bah_sim)
     plot_unbound_univariate(
         "VVIX MA10", "20-day", "rolmu", C_MA10,
         sim, betas_ma10, bah_sim, yh_ma10, mu_20d,
@@ -1071,7 +899,7 @@ def main():
     # ── C: VRP symmetric ─────────────────────────────────────────────────────
     print("\n[C] VRP unbound symmetric...")
     pos = run_ew_unbound_sym(panel, "VP", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_sym_VRP")
+    sim = _report(pos, daily_ret, "ub_sym_VRP", bah_sim)
     plot_unbound_univariate(
         "VRP", "20-day", "sym", C_VRP,
         sim, betas_vrp, bah_sim, yh_vrp, mu_20d,
@@ -1081,7 +909,7 @@ def main():
     # ── D: VRP asymmetric ────────────────────────────────────────────────────
     print("\n[D] VRP unbound asymmetric...")
     pos = run_ew_unbound_asym(panel, "VP", FWD, OOS_GAP, NW_LAGS)
-    sim_vrp_asym = _report(pos, daily_ret, "ub_asym_VRP")
+    sim_vrp_asym = _report(pos, daily_ret, "ub_asym_VRP", bah_sim)
     plot_unbound_univariate(
         "VRP", "20-day", "asym", C_VRP,
         sim_vrp_asym, betas_vrp, bah_sim, yh_vrp, mu_20d,
@@ -1091,7 +919,7 @@ def main():
     # ── E: VRP base_return_shift ─────────────────────────────────────────────
     print("\n[E] VRP unbound base_return_shift...")
     pos = run_ew_unbound_rolmu(panel, "VP", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_rolmu_VRP")
+    sim = _report(pos, daily_ret, "ub_rolmu_VRP", bah_sim)
     plot_unbound_univariate(
         "VRP", "20-day", "rolmu", C_VRP,
         sim, betas_vrp, bah_sim, yh_vrp, mu_20d,
@@ -1101,7 +929,7 @@ def main():
     # ── F: VRP+VVIX MA5 bivariate symmetric ──────────────────────────────────
     print("\n[F] VRP+VVIX MA5 unbound symmetric...")
     pos = run_ew_biv_unbound_sym(panel, "VP", "vvix_ma5", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_sym_biv")
+    sim = _report(pos, daily_ret, "ub_sym_biv", bah_sim)
     plot_unbound_bivariate(
         "VRP", "VVIX MA5", "20-day", "sym", C_BIV,
         sim, betas_biv, bah_sim, yh_biv, mu_20d,
@@ -1111,7 +939,7 @@ def main():
     # ── G: VRP+VVIX MA5 bivariate asymmetric ─────────────────────────────────
     print("\n[G] VRP+VVIX MA5 unbound asymmetric...")
     pos = run_ew_biv_unbound_asym(panel, "VP", "vvix_ma5", FWD, OOS_GAP, NW_LAGS)
-    sim_biv_asym = _report(pos, daily_ret, "ub_asym_biv")
+    sim_biv_asym = _report(pos, daily_ret, "ub_asym_biv", bah_sim)
     plot_unbound_bivariate(
         "VRP", "VVIX MA5", "20-day", "asym", C_BIV,
         sim_biv_asym, betas_biv, bah_sim, yh_biv, mu_20d,
@@ -1121,7 +949,7 @@ def main():
     # ── H: VRP+VVIX MA5 bivariate base_return_shift ───────────────────────────
     print("\n[H] VRP+VVIX MA5 unbound base_return_shift...")
     pos = run_ew_biv_unbound_rolmu(panel, "VP", "vvix_ma5", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_rolmu_biv")
+    sim = _report(pos, daily_ret, "ub_rolmu_biv", bah_sim)
     plot_unbound_bivariate(
         "VRP", "VVIX MA5", "20-day", "rolmu", C_BIV,
         sim, betas_biv, bah_sim, yh_biv, mu_20d,
@@ -1131,7 +959,7 @@ def main():
     # ── U: VRP+VVIX MA10 bivariate symmetric ─────────────────────────────────
     print("\n[U] VRP+VVIX MA10 unbound symmetric...")
     pos = run_ew_biv_unbound_sym(panel, "VP", "vvix_ma10", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_sym_biv10")
+    sim = _report(pos, daily_ret, "ub_sym_biv10", bah_sim)
     plot_unbound_bivariate(
         "VRP", "VVIX MA10", "20-day", "sym", C_BIV10,
         sim, betas_biv10, bah_sim, yh_biv10, mu_20d,
@@ -1141,7 +969,7 @@ def main():
     # ── V: VRP+VVIX MA10 bivariate asymmetric ────────────────────────────────
     print("\n[V] VRP+VVIX MA10 unbound asymmetric...")
     pos = run_ew_biv_unbound_asym(panel, "VP", "vvix_ma10", FWD, OOS_GAP, NW_LAGS)
-    sim_biv10_asym = _report(pos, daily_ret, "ub_asym_biv10")
+    sim_biv10_asym = _report(pos, daily_ret, "ub_asym_biv10", bah_sim)
     plot_unbound_bivariate(
         "VRP", "VVIX MA10", "20-day", "asym", C_BIV10,
         sim_biv10_asym, betas_biv10, bah_sim, yh_biv10, mu_20d,
@@ -1151,7 +979,7 @@ def main():
     # ── W: VRP+VVIX MA10 bivariate base_return_shift ─────────────────────────
     print("\n[W] VRP+VVIX MA10 unbound base_return_shift...")
     pos = run_ew_biv_unbound_rolmu(panel, "VP", "vvix_ma10", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_rolmu_biv10")
+    sim = _report(pos, daily_ret, "ub_rolmu_biv10", bah_sim)
     plot_unbound_bivariate(
         "VRP", "VVIX MA10", "20-day", "rolmu", C_BIV10,
         sim, betas_biv10, bah_sim, yh_biv10, mu_20d,
@@ -1161,7 +989,7 @@ def main():
     # ── I: VRP+Term Slope bivariate symmetric ────────────────────────────────
     print("\n[I] VRP+Term Slope unbound symmetric...")
     pos = run_ew_biv_unbound_sym(panel, "VP", "term_slope", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_sym_term")
+    sim = _report(pos, daily_ret, "ub_sym_term", bah_sim)
     plot_unbound_bivariate(
         "VRP", "Term Slope", "20-day", "sym", C_TERM,
         sim, betas_term, bah_sim, yh_term, mu_20d,
@@ -1171,7 +999,7 @@ def main():
     # ── J: VRP+Term Slope bivariate asymmetric ───────────────────────────────
     print("\n[J] VRP+Term Slope unbound asymmetric...")
     pos = run_ew_biv_unbound_asym(panel, "VP", "term_slope", FWD, OOS_GAP, NW_LAGS)
-    sim_term_asym = _report(pos, daily_ret, "ub_asym_term")
+    sim_term_asym = _report(pos, daily_ret, "ub_asym_term", bah_sim)
     plot_unbound_bivariate(
         "VRP", "Term Slope", "20-day", "asym", C_TERM,
         sim_term_asym, betas_term, bah_sim, yh_term, mu_20d,
@@ -1181,7 +1009,7 @@ def main():
     # ── K: VRP+Term Slope bivariate base_return_shift ────────────────────────
     print("\n[K] VRP+Term Slope unbound base_return_shift...")
     pos = run_ew_biv_unbound_rolmu(panel, "VP", "term_slope", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_rolmu_term")
+    sim = _report(pos, daily_ret, "ub_rolmu_term", bah_sim)
     plot_unbound_bivariate(
         "VRP", "Term Slope", "20-day", "rolmu", C_TERM,
         sim, betas_term, bah_sim, yh_term, mu_20d,
@@ -1191,7 +1019,7 @@ def main():
     # ── L: VRP+Open Interest bivariate symmetric ──────────────────────────────
     print("\n[L] VRP+Open Interest unbound symmetric...")
     pos = run_ew_biv_unbound_sym(panel, "VP", "open_interest", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_sym_oi")
+    sim = _report(pos, daily_ret, "ub_sym_oi", bah_sim)
     plot_unbound_bivariate(
         "VRP", "Open Interest", "20-day", "sym", C_OI,
         sim, betas_oi, bah_sim, yh_oi, mu_20d,
@@ -1201,7 +1029,7 @@ def main():
     # ── M: VRP+Open Interest bivariate asymmetric ─────────────────────────────
     print("\n[M] VRP+Open Interest unbound asymmetric...")
     pos = run_ew_biv_unbound_asym(panel, "VP", "open_interest", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_asym_oi")
+    sim = _report(pos, daily_ret, "ub_asym_oi", bah_sim)
     plot_unbound_bivariate(
         "VRP", "Open Interest", "20-day", "asym", C_OI,
         sim, betas_oi, bah_sim, yh_oi, mu_20d,
@@ -1211,7 +1039,7 @@ def main():
     # ── N: VRP+Open Interest bivariate base_return_shift ─────────────────────
     print("\n[N] VRP+Open Interest unbound base_return_shift...")
     pos = run_ew_biv_unbound_rolmu(panel, "VP", "open_interest", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_rolmu_oi")
+    sim = _report(pos, daily_ret, "ub_rolmu_oi", bah_sim)
     plot_unbound_bivariate(
         "VRP", "Open Interest", "20-day", "rolmu", C_OI,
         sim, betas_oi, bah_sim, yh_oi, mu_20d,
@@ -1229,7 +1057,7 @@ def main():
     print("\n[O] VRP+VVIX MA5+Term Slope unbound symmetric...")
     pos = run_ew_triv_unbound_sym(panel, "VP", "vvix_ma5", "term_slope",
                                   FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_sym_triv")
+    sim = _report(pos, daily_ret, "ub_sym_triv", bah_sim)
     plot_unbound_trivariate(
         "VRP", "VVIX MA5", "Term Slope", "20-day", "sym", C_TRIV,
         sim, betas_triv, bah_sim, yh_triv, mu_20d,
@@ -1240,7 +1068,7 @@ def main():
     print("\n[P] VRP+VVIX MA5+Term Slope unbound asymmetric...")
     pos = run_ew_triv_unbound_asym(panel, "VP", "vvix_ma5", "term_slope",
                                    FWD, OOS_GAP, NW_LAGS)
-    sim_triv_asym = _report(pos, daily_ret, "ub_asym_triv")
+    sim_triv_asym = _report(pos, daily_ret, "ub_asym_triv", bah_sim)
     plot_unbound_trivariate(
         "VRP", "VVIX MA5", "Term Slope", "20-day", "asym", C_TRIV,
         sim_triv_asym, betas_triv, bah_sim, yh_triv, mu_20d,
@@ -1251,7 +1079,7 @@ def main():
     print("\n[Q] VRP+VVIX MA5+Term Slope unbound base_return_shift...")
     pos = run_ew_triv_unbound_rolmu(panel, "VP", "vvix_ma5", "term_slope",
                                     FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_rolmu_triv")
+    sim = _report(pos, daily_ret, "ub_rolmu_triv", bah_sim)
     plot_unbound_trivariate(
         "VRP", "VVIX MA5", "Term Slope", "20-day", "rolmu", C_TRIV,
         sim, betas_triv, bah_sim, yh_triv, mu_20d,

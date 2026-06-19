@@ -5,8 +5,8 @@ Pure expanding-window OLS regression computation for every model.
 
 Responsibilities:
   - Build the data panel (`build_panel`)
-  - Compute OOS R² (univariate and bivariate)
-  - Compute beta time-series (univariate, bivariate, trivariate)
+  - Compute beta time-series (univariate, bivariate, trivariate); each frame
+    carries the NW t-stat columns (t_stat / t_stat_1 / …) used for the plots
   - Provide derived-series helpers: _yhat_univariate/bivariate/trivariate,
     _rolling_mu, _shade, oos_cumret
   - Export shared constants (OOS_START, MIN_WIN, T_THRESH, DELTAS, …)
@@ -38,11 +38,12 @@ from har_model import _nw_se
 
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent))
-from experiment2 import (
+from helpers import (
     load_vrp_series, load_es_front_month, load_vvix,
     compute_vvix_ma5, compute_vvix_ma10,
     load_vix_spot, load_vix_futures_term_structure,
-    load_es_open_interest,
+    load_es_open_interest, load_vix_basis, compute_trend_quotient,
+    compute_performance_stats,
 )
 from fh_replication.fh_replication import compute_vix_term_slope
 
@@ -75,98 +76,153 @@ def oos_cumret(sim, start=OOS_START):
     return (1 + s).cumprod()
 
 
+def _align_zero(ax_left, ax_right):
+    """Force both twin axes to share y=0 by making each range symmetric."""
+    lo1, hi1 = ax_left.get_ylim()
+    lo2, hi2 = ax_right.get_ylim()
+    half1 = max(abs(lo1), abs(hi1)) or 1.0
+    half2 = max(abs(lo2), abs(hi2)) or 1.0
+    ax_left.set_ylim(-half1, half1)
+    ax_right.set_ylim(-half2, half2)
+
+
+def draw_tstat_beta_panel(ax, betas_df, labels, tstat_colors, nw_lags):
+    """Canonical t-stat + beta twin-axis panel, shared by base_strategies.py and
+    leveraged_strategies.py so the panel is identical across every strategy.
+
+    Draws, for 1-3 predictors:
+      • NW t-stat per predictor on the left axis (one per `tstat_colors`), with
+        the |t| = T_THRESH gate band.
+      • Each predictor's expanding-window beta on a grey twin axis, NORMALISED by
+        its own peak |beta| so predictors on wildly different scales (e.g. VRP
+        ~1e-4 vs VVIX ~1e-3) are both legible and their SIGN is unambiguous.
+        `_align_zero` then pins y=0 of both axes together.
+
+    Normalising + zero-aligning is what keeps a small-but-positive beta (VRP in
+    the bivariate models) from visually sinking to the bottom of a raw beta axis
+    and reading as negative against the t-stat scale.
+
+    `labels` / `tstat_colors` are parallel lists of equal length (1, 2, or 3);
+    column names are taken from `betas_df` (`beta`/`t_stat` for one predictor,
+    `beta_i`/`t_stat_i` otherwise).
+    """
+    n = len(labels)
+    if n != len(tstat_colors):
+        raise ValueError("labels and tstat_colors must be the same length")
+    if not 1 <= n <= 3:
+        raise ValueError(f"draw_tstat_beta_panel supports 1-3 predictors, got {n}")
+
+    t_cols = ["t_stat"] if n == 1 else [f"t_stat_{i+1}" for i in range(n)]
+    b_cols = ["beta"]   if n == 1 else [f"beta_{i+1}"   for i in range(n)]
+    t_styles = ["-", "--", "-."]
+    b_styles = ["--"] if n == 1 else ["-", ":", "-."]
+
+    # ── t-stat lines (left axis) ──────────────────────────────────────────────
+    for i in range(n):
+        s = betas_df[t_cols[i]]
+        ax.plot(s.index, s.values, color=tstat_colors[i], lw=1.0, alpha=0.85,
+                ls=t_styles[i],
+                label=f"NW t-stat: {labels[i]} ({nw_lags}-lag HAC)")
+    ax.fill_between(betas_df.index, -T_THRESH, T_THRESH,
+                    color="firebrick", alpha=0.05, label="Below gate (flat zone)")
+    ax.axhline( T_THRESH, color="firebrick", lw=1.2, ls="--",
+               label=f"|t| = {T_THRESH:.2f} gate")
+    ax.axhline(-T_THRESH, color="firebrick", lw=1.2, ls="--")
+    ax.axhline(0, color="black", lw=0.5, ls=":")
+    ax.set_ylabel("NW t-stat" if n > 1 else f"NW t-stat ({labels[0]})", fontsize=9)
+    ax.grid(axis="y", alpha=0.2, lw=0.6)
+    ax.spines["top"].set_visible(False)
+
+    # ── beta lines (grey twin axis, normalised by own peak) ───────────────────
+    ax2 = ax.twinx()
+    for i in range(n):
+        b    = betas_df[b_cols[i]]
+        peak = b.abs().max() or 1.0
+        lbl  = (f"Beta ({labels[i]})" if n == 1
+                else f"Beta: {labels[i]} (peak={peak:.3g})")
+        ax2.plot(b.index, b.values / peak, color="dimgrey", lw=1.0,
+                 ls=b_styles[i], alpha=0.60, label=lbl)
+    ax2.axhline(0, color="dimgrey", lw=0.4, ls=":")
+    ax2.set_ylabel("Beta (normalised)" if n > 1 else f"Beta ({labels[0]})",
+                   fontsize=8, color="dimgrey")
+    ax2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
+    ax2.spines["top"].set_visible(False)
+    _align_zero(ax, ax2)
+
+    l1, lb1 = ax.get_legend_handles_labels()
+    l2, lb2 = ax2.get_legend_handles_labels()
+    ax.legend(l1 + l2, lb1 + lb2, fontsize=8, loc="upper left")
+    return ax2
+
+
+# ─── Shared performance-stat window ───────────────────────────────────────────
+# Plots rebase a strategy's cumulative curve to its first activation when that
+# happens after 2020 (e.g. a signal that only fires from the 2020 crash on), and
+# report SR/return/drawdown over that same window. stat_start() / window_stats()
+# expose that one rule so printed statistics and plot legends are always computed
+# over the identical window.
+
+def _first_activation(sim):
+    """First date with a nonzero position on/after OOS_START (None if never)."""
+    pos    = sim["position"][sim.index >= OOS_START]
+    active = pos[pos != 0]
+    return active.index.min() if len(active) else None
+
+
+def stat_start(sims, ref_index):
+    """Common start date for performance statistics.
+
+    `sims` is a single sim DataFrame or an iterable of them. Uses the EARLIEST
+    post-OOS_START activation among them; if that activation is after 2020-01-01
+    the window starts the trading day after it (located on `ref_index`) — so a
+    signal that only activates in 2020 is scored from 2020 onward, exactly as the
+    plots rebase the curve. Otherwise the window spans the full OOS period from
+    OOS_START.
+    """
+    if isinstance(sims, pd.DataFrame):
+        sims = [sims]
+    acts = [a for a in (_first_activation(s) for s in sims) if a is not None]
+    activation = min(acts) if acts else None
+    if activation is not None and activation > pd.Timestamp("2020-01-01"):
+        i = ref_index.searchsorted(activation)
+        return ref_index[min(i + 1, len(ref_index) - 1)]
+    return pd.Timestamp(OOS_START)
+
+
+def window_stats(sim, label, ref_index, start=None):
+    """compute_performance_stats over the shared stat window (see stat_start), so
+    printed numbers and plot legends are computed identically. Pass an explicit
+    `start` to reuse a window already computed for a group of sims."""
+    if start is None:
+        start = stat_start(sim, ref_index)
+    return compute_performance_stats(sim[sim.index >= start], label)
+
+
 # ─── Data ─────────────────────────────────────────────────────────────────────
 
-def build_panel(vrp, es, vvix_ma5, vix_spot, term_slope, oi):
+def build_panel(vrp, es, vvix_ma5, vvix_ma10, vix_spot, vix_basis,
+                term_slope, oi, trend_q):
     ret   = es["returns"]
+    r2    = ret ** 2
+    rv5   = np.sqrt(r2.rolling(5).mean()  * 252)
+    rv22  = np.sqrt(r2.rolling(22).mean() * 252)
     panel = pd.DataFrame({
         "VP":            vrp["VP"],
         "vvix_ma5":      vvix_ma5,
+        "vvix_ma10":     vvix_ma10,
         "vix":           vix_spot if vix_spot is not None else np.nan,
+        "vix_basis":     vix_basis,
         "term_slope":    term_slope,
         "open_interest": oi,
+        "trend_q":       trend_q,
+        "vol_trend":     np.log(rv5 / rv22),
         "daily_ret":     ret,
     })
-    panel["fwd_20d"] = (ret + 1).rolling(20).apply(np.prod, raw=True).shift(-20) - 1
-    r2   = ret ** 2
-    rv5  = np.sqrt(r2.rolling(5).mean()  * 252)
-    rv22 = np.sqrt(r2.rolling(22).mean() * 252)
-    panel["vol_trend"] = np.log(rv5 / rv22)
-    panel = panel.dropna(subset=["VP", "vvix_ma5", "term_slope"])
+    panel["fwd_20d"]     = (ret + 1).rolling(20).apply(np.prod, raw=True).shift(-20) - 1
+    panel["vrp_monthly"] = (panel["VP"].resample("ME").last()
+                            .reindex(panel.index).ffill())
     return panel[panel.index >= "2006-03-06"]
 
-
-# ─── OOS R² (Campbell-Thompson 2008) ──────────────────────────────────────────
-
-def compute_oos_r2(panel, predictor, fwd_col, oos_gap, nw_lags):
-    """OOS R² vs prevailing mean. No t-stat gate. Cached."""
-    tag   = f"r2oos_EW_{predictor}_{fwd_col}_oos{OOS_START}.txt"
-    cache = CACHE_DIR / tag
-    if cache.exists():
-        return float(cache.read_text().strip())
-
-    print(f"    Computing OOS R² for {predictor} -> {fwd_col}...", flush=True)
-    sub     = panel.dropna(subset=[predictor, fwd_col]).copy()
-    N       = len(sub)
-    fwd_arr = sub[fwd_col].values
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
-
-    y_hat_l, y_mean_l, y_act_l = [], [], []
-    for i in range(start_i, N):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[predictor]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        test  = sub.iloc[[i]][[predictor]].copy()
-        test.insert(0, "const", 1.0)
-        y_hat_l.append(float(res.predict(test).iloc[0]))
-        y_mean_l.append(float(np.mean(fwd_arr[0 : i - oos_gap])))
-        y_act_l.append(fwd_arr[i])
-
-    ya, yh, ym = np.array(y_act_l), np.array(y_hat_l), np.array(y_mean_l)
-    r2 = 1.0 - np.sum((ya - yh) ** 2) / np.sum((ya - ym) ** 2)
-    cache.write_text(str(r2))
-    return r2
-
-
-def compute_oos_r2_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags):
-    """OOS R² (bivariate) vs prevailing mean. No t-stat gate. Cached."""
-    tag   = f"r2oos_EWbiv_{pred1}_{pred2}_{fwd_col}_oos{OOS_START}.txt"
-    cache = CACHE_DIR / tag
-    if cache.exists():
-        return float(cache.read_text().strip())
-
-    print(f"    Computing OOS R² for {pred1}+{pred2} -> {fwd_col}...", flush=True)
-    sub     = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
-    N       = len(sub)
-    fwd_arr = sub[fwd_col].values
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
-
-    y_hat_l, y_mean_l, y_act_l = [], [], []
-    for i in range(start_i, N):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[pred1, pred2]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        test  = sub.iloc[[i]][[pred1, pred2]].copy()
-        test.insert(0, "const", 1.0)
-        y_hat_l.append(float(res.predict(test).iloc[0]))
-        y_mean_l.append(float(np.mean(fwd_arr[0 : i - oos_gap])))
-        y_act_l.append(fwd_arr[i])
-
-    ya, yh, ym = np.array(y_act_l), np.array(y_hat_l), np.array(y_mean_l)
-    r2 = 1.0 - np.sum((ya - yh) ** 2) / np.sum((ya - ym) ** 2)
-    cache.write_text(str(r2))
-    return r2
-
-
-# ─── Unbound (multi-level) helpers ────────────────────────────────────────────
-
-def _level(excess_abs):
-    for thresh, lv in zip(THRESHOLDS, LEVELS):
-        if excess_abs >= thresh:
-            return lv
-    return 0
 
 
 # ─── Beta time-series ─────────────────────────────────────────────────────────
@@ -298,8 +354,66 @@ def _yhat_trivariate(panel, pred1, pred2, pred3, fwd_col, betas_df):
             + betas_df.loc[idx, "beta_3"] * sub.loc[idx, pred3]).rename("y_hat")
 
 
+def _yhat(panel, predictors, fwd_col, betas_df):
+    """Dispatch to the uni/bi/trivariate y_hat helper based on # of predictors."""
+    cols = [predictors] if isinstance(predictors, str) else list(predictors)
+    if len(cols) == 1:
+        return _yhat_univariate(panel, cols[0], fwd_col, betas_df)
+    if len(cols) == 2:
+        return _yhat_bivariate(panel, cols[0], cols[1], fwd_col, betas_df)
+    if len(cols) == 3:
+        return _yhat_trivariate(panel, cols[0], cols[1], cols[2], fwd_col, betas_df)
+    raise ValueError(f"_yhat supports 1-3 predictors, got {len(cols)}")
+
+
+# ─── R² metrics ───────────────────────────────────────────────────────────────
+
+def in_sample_r2(panel, predictors, fwd_col):
+    """In-sample R² of a single OLS fit over the entire training timeframe.
+
+    ``predictors`` may be a single column name or a list of names.
+    """
+    cols = [predictors] if isinstance(predictors, str) else list(predictors)
+    sub  = panel.dropna(subset=[*cols, fwd_col]).copy()
+    X    = add_constant(sub[cols], has_constant="skip")
+    res  = OLS(sub[fwd_col], X).fit()
+    return float(res.rsquared)
+
+
+def oos_cumulative_r2(panel, predictors, fwd_col, betas_df, oos_gap=OOS_GAP):
+    """Cumulative out-of-sample R² (Campbell-Thompson).
+
+        R²_oos = 1 - Σ(y - ŷ_model)² / Σ(y - ŷ_mean)²
+
+    where ŷ_model are the expanding-window model predictions (from ``betas_df``)
+    and ŷ_mean is the prevailing training-sample mean of ``fwd_col`` (an
+    expanding mean lagged by ``oos_gap``, matching the regression's train/test
+    split). A positive value means the model beats the historical-mean benchmark.
+    """
+    cols = [predictors] if isinstance(predictors, str) else list(predictors)
+    sub  = panel.dropna(subset=[*cols, fwd_col]).copy()
+
+    yhat = _yhat(panel, predictors, fwd_col, betas_df)
+    idx  = yhat.index
+    y    = sub.loc[idx, fwd_col]
+    mu   = (sub[fwd_col].expanding(min_periods=1).mean()
+            .shift(oos_gap).loc[idx])
+
+    sse_model = float(((y - yhat) ** 2).sum())
+    sse_bench = float(((y - mu)   ** 2).sum())
+    return 1.0 - sse_model / sse_bench if sse_bench > 0 else float("nan")
+
+
 def _rolling_mu(panel, fwd_col, oos_gap, rolling_window=500, predictor="VP"):
-    sub = panel.dropna(subset=[predictor, fwd_col]).copy()
+    """Rolling mean of ``fwd_col`` over ``rolling_window`` rows, lagged ``oos_gap``.
+
+    ``predictor`` may be a single column name or a list of names. The dropna
+    subset must match the calling strategy's own ``sub`` so the rolling window
+    is built over the same row set (single predictor for univariate models,
+    both predictors for bivariate models).
+    """
+    cols = [predictor] if isinstance(predictor, str) else list(predictor)
+    sub  = panel.dropna(subset=[*cols, fwd_col]).copy()
     return (sub[fwd_col]
             .rolling(rolling_window, min_periods=1).mean()
             .shift(oos_gap).rename("rolling_mu"))
@@ -309,7 +423,7 @@ def _rolling_mu(panel, fwd_col, oos_gap, rolling_window=500, predictor="VP"):
 
 def main():
     print("=" * 72)
-    print("  regressions.py — pre-compute betas and OOS R² caches")
+    print("  regressions.py — pre-compute beta / t-stat caches")
     print("  Models: VRP · VVIX MA5 · VVIX MA10 · VRP+VVIX MA5 · VRP+VVIX MA10")
     print("          VRP+Term Slope · VRP+Open Interest · Trivariate")
     print("=" * 72)
@@ -321,21 +435,32 @@ def main():
     vvix_ma5   = compute_vvix_ma5(vvix_raw)
     vvix_ma10  = compute_vvix_ma10(vvix_raw)
     vix_spot   = load_vix_spot()
+    vix_basis  = load_vix_basis()
     term_slope = compute_vix_term_slope(load_vix_futures_term_structure())
     oi         = load_es_open_interest()
+    trend_q    = compute_trend_quotient(es)
 
-    panel = build_panel(vrp, es, vvix_ma5, vix_spot, term_slope, oi)
-    panel["vvix_ma10"] = vvix_ma10.reindex(panel.index)
+    panel = build_panel(vrp, es, vvix_ma5, vvix_ma10, vix_spot,
+                        vix_basis, term_slope, oi, trend_q)
     print(f"    {len(panel):,} obs  "
           f"[{panel.index.min().date()} - {panel.index.max().date()}]")
 
     FWD = "fwd_20d"
 
+    # Every panel column is a univariate predictor except the forward-return target.
+    NON_PREDICTORS = {FWD}
+    predictors = [c for c in panel.columns if c not in NON_PREDICTORS]
+
     print("\n[2] Univariate models...")
-    for predictor in ["VP", "vvix_ma5", "vvix_ma10"]:
+    for predictor in predictors:
         print(f"  {predictor}")
-        compute_betas(panel, predictor, FWD, OOS_GAP, NW_LAGS)
-        compute_oos_r2(panel, predictor, FWD, OOS_GAP, NW_LAGS)
+        df  = compute_betas(panel, predictor, FWD, OOS_GAP, NW_LAGS)
+        row = df.iloc[-1]
+        is_r2  = in_sample_r2(panel, predictor, FWD)
+        oos_r2 = oos_cumulative_r2(panel, predictor, FWD, df, OOS_GAP)
+        print(f"    full-period [{df.index[-1].date()}]: "
+              f"beta={row['beta']:+.6f}  t-stat={row['t_stat']:+.2f}")
+        print(f"    IS R²={is_r2:+.4f}  cumulative OOS R²={oos_r2:+.4f}")
 
     print("\n[3] Bivariate models...")
     bivar_pairs = [
@@ -346,11 +471,26 @@ def main():
     ]
     for pred1, pred2 in bivar_pairs:
         print(f"  {pred1} + {pred2}")
-        compute_betas_bivariate(panel, pred1, pred2, FWD, OOS_GAP, NW_LAGS)
-        compute_oos_r2_bivariate(panel, pred1, pred2, FWD, OOS_GAP, NW_LAGS)
+        df  = compute_betas_bivariate(panel, pred1, pred2, FWD, OOS_GAP, NW_LAGS)
+        row = df.iloc[-1]
+        is_r2  = in_sample_r2(panel, [pred1, pred2], FWD)
+        oos_r2 = oos_cumulative_r2(panel, [pred1, pred2], FWD, df, OOS_GAP)
+        print(f"    full-period [{df.index[-1].date()}]: "
+              f"{pred1}: beta={row['beta_1']:+.6f} t-stat={row['t_stat_1']:+.2f}  |  "
+              f"{pred2}: beta={row['beta_2']:+.6f} t-stat={row['t_stat_2']:+.2f}")
+        print(f"    IS R²={is_r2:+.4f}  cumulative OOS R²={oos_r2:+.4f}")
 
     print("\n[4] Trivariate model: VRP + VVIX MA5 + Term Slope...")
-    compute_betas_trivariate(panel, "VP", "vvix_ma5", "term_slope", FWD, OOS_GAP, NW_LAGS)
+    triv = ("VP", "vvix_ma5", "term_slope")
+    df   = compute_betas_trivariate(panel, *triv, FWD, OOS_GAP, NW_LAGS)
+    row  = df.iloc[-1]
+    is_r2  = in_sample_r2(panel, list(triv), FWD)
+    oos_r2 = oos_cumulative_r2(panel, list(triv), FWD, df, OOS_GAP)
+    print(f"    full-period [{df.index[-1].date()}]: "
+          f"{triv[0]}: beta={row['beta_1']:+.6f} t-stat={row['t_stat_1']:+.2f}  |  "
+          f"{triv[1]}: beta={row['beta_2']:+.6f} t-stat={row['t_stat_2']:+.2f}  |  "
+          f"{triv[2]}: beta={row['beta_3']:+.6f} t-stat={row['t_stat_3']:+.2f}")
+    print(f"    IS R²={is_r2:+.4f}  cumulative OOS R²={oos_r2:+.4f}")
 
     print("\n" + "=" * 72)
     print("  Done — all regression caches updated in output/regression_cache/")

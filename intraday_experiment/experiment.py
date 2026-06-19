@@ -74,7 +74,7 @@ def load_intraday_rv() -> pd.DataFrame:
         RV22  22-day rolling sum
     """
     print("  Loading intraday ES data…", flush=True)
-    df = pd.read_csv(DATA / "intraday_eq_vx_data.csv")
+    df = pd.read_csv(DATA / "es_intraday_sorted.csv")
     es = df[df["QCODE"] == "ES"].copy()
     es["date"] = pd.to_datetime(es["PUBLICATION_DATE"])
 

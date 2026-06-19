@@ -36,24 +36,20 @@ sys.path.insert(0, str(ROOT.parent / "bh_replication"))
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent))
 
-from statsmodels.api import OLS, add_constant
-from har_model import _nw_se
-
-from experiment2 import (
+from helpers import (
     load_vrp_series, load_es_front_month, load_vvix,
     compute_vvix_ma5, compute_vvix_ma10,
     load_vix_spot, load_vix_futures_term_structure,
-    load_es_open_interest,
+    load_es_open_interest, load_vix_basis, compute_trend_quotient,
     compute_buy_and_hold, simulate_strategy, compute_performance_stats,
 )
 from fh_replication.fh_replication import compute_vix_term_slope
 from regressions import (
     build_panel,
     compute_betas, compute_betas_bivariate,
-    compute_oos_r2, compute_oos_r2_bivariate,
     _yhat_univariate, _yhat_bivariate, _rolling_mu,
-    _shade, oos_cumret,
-    OOS_START, MIN_WIN, T_THRESH, DELTAS, DELTA_LBL, OOS_GAP, NW_LAGS,
+    _shade, oos_cumret, stat_start, window_stats, draw_tstat_beta_panel,
+    OOS_START, T_THRESH, DELTAS, DELTA_LBL, OOS_GAP, NW_LAGS,
 )
 
 BAH_COLOR = "#d62728"
@@ -71,31 +67,31 @@ def _align_zero(ax_left, ax_right):
 
 
 def _stat_window(sim_dict_or_sim, bah_sim):
-    """Find earliest activation; return (rebase_start, stat_start, stat_lbl)."""
-    if isinstance(sim_dict_or_sim, dict):
-        candidates = []
-        for _, sim in sim_dict_or_sim.values():
-            p = sim["position"][sim.index >= OOS_START]
-            a = p[p != 0]
-            if len(a):
-                candidates.append(a.index.min())
-        activation = min(candidates) if candidates else None
-    else:
-        sim = sim_dict_or_sim
-        p = sim["position"][sim.index >= OOS_START]
-        a = p[p != 0]
-        activation = a.index.min() if len(a) else None
+    """Plot legend window via the shared stat_start rule.
 
-    rebase_start = None
-    if activation is not None and activation > pd.Timestamp("2020-01-01"):
-        idx          = bah_sim.index
-        act_iloc     = idx.searchsorted(activation)
-        rebase_start = idx[min(act_iloc + 1, len(idx) - 1)]
+    Returns (rebase_start, stat_start, stat_lbl); rebase_start is None when the
+    window is the full OOS span (no post-2020 activation rebase)."""
+    sims = ([sim for _, sim in sim_dict_or_sim.values()]
+            if isinstance(sim_dict_or_sim, dict) else sim_dict_or_sim)
+    start        = stat_start(sims, bah_sim.index)
+    rebase_start = start if start > pd.Timestamp(OOS_START) else None
+    stat_lbl     = (f" · stats from {start.strftime('%Y-%m-%d')}"
+                    if rebase_start is not None else "")
+    return rebase_start, start, stat_lbl
 
-    stat_start = rebase_start if rebase_start is not None else pd.Timestamp(OOS_START)
-    stat_lbl   = (f" · stats from {stat_start.strftime('%Y-%m-%d')}"
-                  if rebase_start is not None else "")
-    return rebase_start, stat_start, stat_lbl
+
+def _print_delta_stats(sim_dict, bah_sim):
+    """Print per-delta SR/return/drawdown over the same window the plot legend uses
+    (shared stat_start across the delta grid)."""
+    sims  = [sim for _, sim in sim_dict.values()]
+    start = stat_start(sims, bah_sim.index)
+    if start > pd.Timestamp(OOS_START):
+        print(f"    stats from {start.strftime('%Y-%m-%d')} (first activation)")
+    for di in sorted(sim_dict):
+        _, sim = sim_dict[di]
+        st = window_stats(sim, f"d{di}", bah_sim.index, start=start)
+        print(f"    delta={DELTA_LBL[di]}  SR={st['sharpe']:+.2f}  "
+              f"ret={st['ann_ret']*100:+.1f}%  DD={st['max_dd']*100:.1f}%")
 
 
 # ─── plot_2panel: symmetric multi-delta (univariate) ─────────────────────────
@@ -185,35 +181,7 @@ def plot_2panel(pred_label, horizon_label, oos_gap, nw_lags,
     ax_t.set_xlim(*xlim)
     _shade(ax_t, oos_dt, e_dt)
 
-    t_series = betas_df["t_stat"]
-    b_series = betas_df["beta"]
-
-    ax_t.plot(t_series.index, t_series.values,
-              color=color_palette[0], lw=1.0, alpha=0.85,
-              label=f"NW t-stat of {pred_label} ({nw_lags}-lag HAC)")
-    ax_t.fill_between(t_series.index, -T_THRESH, T_THRESH,
-                      color="firebrick", alpha=0.05, label="Below gate (flat zone)")
-    ax_t.axhline( T_THRESH, color="firebrick", lw=1.2, ls="--",
-                 label=f"|t| = {T_THRESH:.2f} gate")
-    ax_t.axhline(-T_THRESH, color="firebrick", lw=1.2, ls="--")
-    ax_t.axhline(0, color="black", lw=0.5, ls=":")
-    ax_t.set_ylabel(f"NW t-stat ({pred_label})", fontsize=9)
-    ax_t.grid(axis="y", alpha=0.2, lw=0.6)
-    ax_t.spines["top"].set_visible(False)
-
-    ax_t2 = ax_t.twinx()
-    ax_t2.plot(b_series.index, b_series.values,
-               color="dimgrey", lw=1.0, ls="--", alpha=0.60,
-               label=f"Beta ({pred_label})")
-    ax_t2.axhline(0, color="dimgrey", lw=0.4, ls=":")
-    ax_t2.set_ylabel(f"Beta ({pred_label})", fontsize=8, color="dimgrey")
-    ax_t2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
-    ax_t2.spines["top"].set_visible(False)
-    _align_zero(ax_t, ax_t2)
-
-    lines1, labs1 = ax_t.get_legend_handles_labels()
-    lines2, labs2 = ax_t2.get_legend_handles_labels()
-    ax_t.legend(lines1 + lines2, labs1 + labs2, fontsize=8, loc="upper left")
+    draw_tstat_beta_panel(ax_t, betas_df, [pred_label], [color_palette[0]], nw_lags)
 
     for di, (delta, lbl, ax_p) in enumerate(zip(DELTAS, DELTA_LBL, ax_pos)):
         _, sim = sim_dict[di]
@@ -518,35 +486,7 @@ def plot_asym(pred_label, horizon_label, oos_gap, nw_lags,
     ax_t.set_xlim(*xlim)
     _shade(ax_t, oos_dt, e_dt)
 
-    t_series = betas_df["t_stat"]
-    b_series = betas_df["beta"]
-
-    ax_t.plot(t_series.index, t_series.values,
-              color=color_palette[0], lw=1.0, alpha=0.85,
-              label=f"NW t-stat of {pred_label} ({nw_lags}-lag HAC)")
-    ax_t.fill_between(t_series.index, -T_THRESH, T_THRESH,
-                      color="firebrick", alpha=0.05, label="Below gate (flat zone)")
-    ax_t.axhline( T_THRESH, color="firebrick", lw=1.2, ls="--",
-                 label=f"|t| = {T_THRESH:.2f} gate")
-    ax_t.axhline(-T_THRESH, color="firebrick", lw=1.2, ls="--")
-    ax_t.axhline(0, color="black", lw=0.5, ls=":")
-    ax_t.set_ylabel(f"NW t-stat ({pred_label})", fontsize=9)
-    ax_t.grid(axis="y", alpha=0.2, lw=0.6)
-    ax_t.spines["top"].set_visible(False)
-
-    ax_t2 = ax_t.twinx()
-    ax_t2.plot(b_series.index, b_series.values,
-               color="dimgrey", lw=1.0, ls="--", alpha=0.60,
-               label=f"Beta ({pred_label})")
-    ax_t2.axhline(0, color="dimgrey", lw=0.4, ls=":")
-    ax_t2.set_ylabel(f"Beta ({pred_label})", fontsize=8, color="dimgrey")
-    ax_t2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
-    ax_t2.spines["top"].set_visible(False)
-    _align_zero(ax_t, ax_t2)
-
-    lines1, labs1 = ax_t.get_legend_handles_labels()
-    lines2, labs2 = ax_t2.get_legend_handles_labels()
-    ax_t.legend(lines1 + lines2, labs1 + labs2, fontsize=8, loc="upper left")
+    draw_tstat_beta_panel(ax_t, betas_df, [pred_label], [color_palette[0]], nw_lags)
 
     for di, (delta, lbl, ax_p) in enumerate(zip(DELTAS, DELTA_LBL, ax_pos)):
         _, sim = sim_dict[di]
@@ -851,35 +791,7 @@ def plot_rolmu(pred_label, horizon_label, oos_gap, nw_lags,
     ax_t.set_xlim(*xlim)
     _shade(ax_t, oos_dt, e_dt)
 
-    t_series = betas_df["t_stat"]
-    b_series = betas_df["beta"]
-
-    ax_t.plot(t_series.index, t_series.values,
-              color=color_palette[0], lw=1.0, alpha=0.85,
-              label=f"NW t-stat of {pred_label} ({nw_lags}-lag HAC)")
-    ax_t.fill_between(t_series.index, -T_THRESH, T_THRESH,
-                      color="firebrick", alpha=0.05, label="Below gate (flat zone)")
-    ax_t.axhline( T_THRESH, color="firebrick", lw=1.2, ls="--",
-                 label=f"|t| = {T_THRESH:.2f} gate")
-    ax_t.axhline(-T_THRESH, color="firebrick", lw=1.2, ls="--")
-    ax_t.axhline(0, color="black", lw=0.5, ls=":")
-    ax_t.set_ylabel(f"NW t-stat ({pred_label})", fontsize=9)
-    ax_t.grid(axis="y", alpha=0.2, lw=0.6)
-    ax_t.spines["top"].set_visible(False)
-
-    ax_t2 = ax_t.twinx()
-    ax_t2.plot(b_series.index, b_series.values,
-               color="dimgrey", lw=1.0, ls="--", alpha=0.60,
-               label=f"Beta ({pred_label})")
-    ax_t2.axhline(0, color="dimgrey", lw=0.4, ls=":")
-    ax_t2.set_ylabel(f"Beta ({pred_label})", fontsize=8, color="dimgrey")
-    ax_t2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
-    ax_t2.spines["top"].set_visible(False)
-    _align_zero(ax_t, ax_t2)
-
-    lines1, labs1 = ax_t.get_legend_handles_labels()
-    lines2, labs2 = ax_t2.get_legend_handles_labels()
-    ax_t.legend(lines1 + lines2, labs1 + labs2, fontsize=8, loc="upper left")
+    draw_tstat_beta_panel(ax_t, betas_df, [pred_label], [color_palette[0]], nw_lags)
 
     for di, (delta, lbl, ax_p) in enumerate(zip(DELTAS, DELTA_LBL, ax_pos)):
         _, sim = sim_dict[di]
@@ -1108,23 +1020,15 @@ def run_ew(panel, predictor, fwd_col, oos_gap, nw_lags, delta):
     if cache.exists():
         return pd.read_parquet(cache).squeeze().rename(f"pos_{predictor}_{delta}")
 
-    sub = panel.dropna(subset=[predictor, fwd_col]).copy()
-    N   = len(sub)
-    pos = pd.Series(0.0, index=sub.index, name=f"pos_{predictor}_{delta}")
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
+    sub      = panel.dropna(subset=[predictor, fwd_col]).copy()
+    betas_df = compute_betas(panel, predictor, fwd_col, oos_gap, nw_lags)
+    y_hat    = _yhat_univariate(panel, predictor, fwd_col, betas_df)
+    fire     = betas_df["t_stat"].abs() > T_THRESH
 
-    for i in range(start_i, N):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[predictor]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        nw    = _nw_se(res, nlags=nw_lags)
-        if abs(float(res.params.iloc[1]) / float(nw[1])) <= T_THRESH:
-            continue
-        test  = sub.iloc[[i]][[predictor]].copy(); test.insert(0, "const", 1.0)
-        y_hat = float(res.predict(test).iloc[0])
-        if   y_hat >  delta: pos.iloc[i] =  1.0
-        elif y_hat < -delta: pos.iloc[i] = -1.0
+    pos   = pd.Series(0.0, index=sub.index, name=f"pos_{predictor}_{delta}")
+    gated = y_hat[fire.reindex(y_hat.index, fill_value=False)]
+    pos.loc[gated.index[gated >  delta]] =  1.0
+    pos.loc[gated.index[gated < -delta]] = -1.0
 
     pos.to_frame().to_parquet(cache)
     return pos
@@ -1138,25 +1042,16 @@ def run_ew_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, delta):
     if cache.exists():
         return pd.read_parquet(cache).squeeze().rename(f"pos_{pred1}_{pred2}_{delta}")
 
-    sub = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
-    N   = len(sub)
-    pos = pd.Series(0.0, index=sub.index, name=f"pos_{pred1}_{pred2}_{delta}")
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
+    sub      = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
+    betas_df = compute_betas_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags)
+    y_hat    = _yhat_bivariate(panel, pred1, pred2, fwd_col, betas_df)
+    fire     = ((betas_df["t_stat_1"].abs() > T_THRESH)
+                & (betas_df["t_stat_2"].abs() > T_THRESH))
 
-    for i in range(start_i, N):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[pred1, pred2]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        nw    = _nw_se(res, nlags=nw_lags)
-        t1    = float(res.params.iloc[1]) / float(nw[1])
-        t2    = float(res.params.iloc[2]) / float(nw[2])
-        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH:
-            continue
-        test  = sub.iloc[[i]][[pred1, pred2]].copy(); test.insert(0, "const", 1.0)
-        y_hat = float(res.predict(test).iloc[0])
-        if   y_hat >  delta: pos.iloc[i] =  1.0
-        elif y_hat < -delta: pos.iloc[i] = -1.0
+    pos   = pd.Series(0.0, index=sub.index, name=f"pos_{pred1}_{pred2}_{delta}")
+    gated = y_hat[fire.reindex(y_hat.index, fill_value=False)]
+    pos.loc[gated.index[gated >  delta]] =  1.0
+    pos.loc[gated.index[gated < -delta]] = -1.0
 
     pos.to_frame().to_parquet(cache)
     return pos
@@ -1173,24 +1068,20 @@ def run_ew_asym(panel, predictor, fwd_col, oos_gap, nw_lags, delta=0.0):
     if cache.exists():
         return pd.read_parquet(cache).squeeze().rename(f"pos_asym_{predictor}")
 
-    sub = panel.dropna(subset=[predictor, fwd_col]).copy()
-    N   = len(sub)
-    pos = pd.Series(0.0, index=sub.index, name=f"pos_asym_{predictor}")
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
+    sub      = panel.dropna(subset=[predictor, fwd_col]).copy()
+    betas_df = compute_betas(panel, predictor, fwd_col, oos_gap, nw_lags)
+    y_hat    = _yhat_univariate(panel, predictor, fwd_col, betas_df)
+    mu       = _rolling_mu(panel, fwd_col, oos_gap, predictor=predictor)
+    fire     = betas_df["t_stat"].abs() > T_THRESH
 
-    for i in range(start_i, N):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[predictor]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        nw    = _nw_se(res, nlags=nw_lags)
-        if abs(float(res.params.iloc[1]) / float(nw[1])) <= T_THRESH:
-            continue
-        test  = sub.iloc[[i]][[predictor]].copy(); test.insert(0, "const", 1.0)
-        y_hat = float(res.predict(test).iloc[0])
-        mu500 = float(sub[fwd_col].iloc[max(0, i - oos_gap - 500) : i - oos_gap].mean())
-        if   (y_hat - mu500) > delta: pos.iloc[i] =  1.0
-        elif       (-y_hat)  > delta: pos.iloc[i] = -1.0
+    pos   = pd.Series(0.0, index=sub.index, name=f"pos_asym_{predictor}")
+    idx   = y_hat.index[fire.reindex(y_hat.index, fill_value=False)]
+    yh    = y_hat.loc[idx]
+    mu_a  = mu.reindex(idx)
+    long_mask  = (yh - mu_a) > delta
+    short_mask = (-yh) > delta
+    pos.loc[idx[long_mask]]               =  1.0
+    pos.loc[idx[short_mask & ~long_mask]] = -1.0
 
     pos.to_frame().to_parquet(cache)
     return pos
@@ -1205,26 +1096,21 @@ def run_ew_asym_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, delta=
     if cache.exists():
         return pd.read_parquet(cache).squeeze().rename(f"pos_asym_{pred1}_{pred2}")
 
-    sub = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
-    N   = len(sub)
-    pos = pd.Series(0.0, index=sub.index, name=f"pos_asym_{pred1}_{pred2}")
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
+    sub      = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
+    betas_df = compute_betas_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags)
+    y_hat    = _yhat_bivariate(panel, pred1, pred2, fwd_col, betas_df)
+    mu       = _rolling_mu(panel, fwd_col, oos_gap, predictor=[pred1, pred2])
+    fire     = ((betas_df["t_stat_1"].abs() > T_THRESH)
+                & (betas_df["t_stat_2"].abs() > T_THRESH))
 
-    for i in range(start_i, N):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[pred1, pred2]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        nw    = _nw_se(res, nlags=nw_lags)
-        t1    = float(res.params.iloc[1]) / float(nw[1])
-        t2    = float(res.params.iloc[2]) / float(nw[2])
-        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH:
-            continue
-        test  = sub.iloc[[i]][[pred1, pred2]].copy(); test.insert(0, "const", 1.0)
-        y_hat = float(res.predict(test).iloc[0])
-        mu500 = float(sub[fwd_col].iloc[max(0, i - oos_gap - 500) : i - oos_gap].mean())
-        if   (y_hat - mu500) > delta: pos.iloc[i] =  1.0
-        elif       (-y_hat)  > delta: pos.iloc[i] = -1.0
+    pos   = pd.Series(0.0, index=sub.index, name=f"pos_asym_{pred1}_{pred2}")
+    idx   = y_hat.index[fire.reindex(y_hat.index, fill_value=False)]
+    yh    = y_hat.loc[idx]
+    mu_a  = mu.reindex(idx)
+    long_mask  = (yh - mu_a) > delta
+    short_mask = (-yh) > delta
+    pos.loc[idx[long_mask]]               =  1.0
+    pos.loc[idx[short_mask & ~long_mask]] = -1.0
 
     pos.to_frame().to_parquet(cache)
     return pos
@@ -1241,24 +1127,19 @@ def run_ew_rolmu(panel, predictor, fwd_col, oos_gap, nw_lags, delta=0.0):
     if cache.exists():
         return pd.read_parquet(cache).squeeze().rename(f"pos_rolmu_{predictor}")
 
-    sub = panel.dropna(subset=[predictor, fwd_col]).copy()
-    N   = len(sub)
-    pos = pd.Series(0.0, index=sub.index, name=f"pos_rolmu_{predictor}")
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
+    sub      = panel.dropna(subset=[predictor, fwd_col]).copy()
+    betas_df = compute_betas(panel, predictor, fwd_col, oos_gap, nw_lags)
+    y_hat    = _yhat_univariate(panel, predictor, fwd_col, betas_df)
+    mu       = _rolling_mu(panel, fwd_col, oos_gap, predictor=predictor)
+    fire     = betas_df["t_stat"].abs() > T_THRESH
 
-    for i in range(start_i, N):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[predictor]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        nw    = _nw_se(res, nlags=nw_lags)
-        if abs(float(res.params.iloc[1]) / float(nw[1])) <= T_THRESH:
-            continue
-        mu500 = float(sub[fwd_col].iloc[max(0, i - oos_gap - 500) : i - oos_gap].mean())
-        test  = sub.iloc[[i]][[predictor]].copy(); test.insert(0, "const", 1.0)
-        y_hat = float(res.predict(test).iloc[0])
-        if   (y_hat - mu500) >  delta: pos.iloc[i] =  1.0
-        elif (mu500 - y_hat) >  delta: pos.iloc[i] = -1.0
+    pos    = pd.Series(0.0, index=sub.index, name=f"pos_rolmu_{predictor}")
+    idx    = y_hat.index[fire.reindex(y_hat.index, fill_value=False)]
+    excess = y_hat.loc[idx] - mu.reindex(idx)
+    long_mask  =  excess > delta
+    short_mask = -excess > delta
+    pos.loc[idx[long_mask]]               =  1.0
+    pos.loc[idx[short_mask & ~long_mask]] = -1.0
 
     pos.to_frame().to_parquet(cache)
     return pos
@@ -1273,26 +1154,20 @@ def run_ew_rolmu_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, delta
     if cache.exists():
         return pd.read_parquet(cache).squeeze().rename(f"pos_rolmu_{pred1}_{pred2}")
 
-    sub = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
-    N   = len(sub)
-    pos = pd.Series(0.0, index=sub.index, name=f"pos_rolmu_{pred1}_{pred2}")
-    oos_idx = sub.index.searchsorted(pd.Timestamp(OOS_START))
-    start_i = max(MIN_WIN + oos_gap, oos_idx)
+    sub      = panel.dropna(subset=[pred1, pred2, fwd_col]).copy()
+    betas_df = compute_betas_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags)
+    y_hat    = _yhat_bivariate(panel, pred1, pred2, fwd_col, betas_df)
+    mu       = _rolling_mu(panel, fwd_col, oos_gap, predictor=[pred1, pred2])
+    fire     = ((betas_df["t_stat_1"].abs() > T_THRESH)
+                & (betas_df["t_stat_2"].abs() > T_THRESH))
 
-    for i in range(start_i, N):
-        train = sub.iloc[0 : i - oos_gap]
-        X_tr  = add_constant(train[[pred1, pred2]], has_constant="skip")
-        res   = OLS(train[fwd_col], X_tr).fit()
-        nw    = _nw_se(res, nlags=nw_lags)
-        t1    = float(res.params.iloc[1]) / float(nw[1])
-        t2    = float(res.params.iloc[2]) / float(nw[2])
-        if abs(t1) <= T_THRESH or abs(t2) <= T_THRESH:
-            continue
-        mu500 = float(sub[fwd_col].iloc[max(0, i - oos_gap - 500) : i - oos_gap].mean())
-        test  = sub.iloc[[i]][[pred1, pred2]].copy(); test.insert(0, "const", 1.0)
-        y_hat = float(res.predict(test).iloc[0])
-        if   (y_hat - mu500) >  delta: pos.iloc[i] =  1.0
-        elif (mu500 - y_hat) >  delta: pos.iloc[i] = -1.0
+    pos    = pd.Series(0.0, index=sub.index, name=f"pos_rolmu_{pred1}_{pred2}")
+    idx    = y_hat.index[fire.reindex(y_hat.index, fill_value=False)]
+    excess = y_hat.loc[idx] - mu.reindex(idx)
+    long_mask  =  excess > delta
+    short_mask = -excess > delta
+    pos.loc[idx[long_mask]]               =  1.0
+    pos.loc[idx[short_mask & ~long_mask]] = -1.0
 
     pos.to_frame().to_parquet(cache)
     return pos
@@ -1313,11 +1188,13 @@ def main():
     vvix_ma5   = compute_vvix_ma5(vvix_raw)
     vvix_ma10  = compute_vvix_ma10(vvix_raw)
     vix_spot   = load_vix_spot()
+    vix_basis  = load_vix_basis()
     term_slope = compute_vix_term_slope(load_vix_futures_term_structure())
     oi         = load_es_open_interest()
+    trend_q    = compute_trend_quotient(es)
 
-    panel = build_panel(vrp, es, vvix_ma5, vix_spot, term_slope, oi)
-    panel["vvix_ma10"] = vvix_ma10.reindex(panel.index)
+    panel = build_panel(vrp, es, vvix_ma5, vvix_ma10, vix_spot,
+                        vix_basis, term_slope, oi, trend_q)
     print(f"    {len(panel):,} obs  "
           f"[{panel.index.min().date()} - {panel.index.max().date()}]")
 
@@ -1346,8 +1223,8 @@ def main():
     pal_ts    = ["#00441b", "#006d2c", "#31a354", "#74c476"]
     pal_oi    = ["#54278f", "#756bb1", "#9e9ac8", "#cbc9e2"]
 
-    # ── Pre-compute betas and OOS R² ──
-    print("\n[2] Computing betas and OOS R²...")
+    # ── Pre-compute betas ──
+    print("\n[2] Computing betas...")
     vrp_betas   = compute_betas(panel, "VP",         FWD, OOS_GAP, NW_LAGS)
     vvix5_betas = compute_betas(panel, "vvix_ma5",   FWD, OOS_GAP, NW_LAGS)
     vvix10_betas= compute_betas(panel, "vvix_ma10",  FWD, OOS_GAP, NW_LAGS)
@@ -1355,14 +1232,6 @@ def main():
     biv10_betas = compute_betas_bivariate(panel, "VP", "vvix_ma10",     FWD, OOS_GAP, NW_LAGS)
     ts_betas    = compute_betas_bivariate(panel, "VP", "term_slope",    FWD, OOS_GAP, NW_LAGS)
     oi_betas    = compute_betas_bivariate(panel, "VP", "open_interest", FWD, OOS_GAP, NW_LAGS)
-
-    vrp_r2    = compute_oos_r2(panel, "VP",         FWD, OOS_GAP, NW_LAGS)
-    vvix5_r2  = compute_oos_r2(panel, "vvix_ma5",   FWD, OOS_GAP, NW_LAGS)
-    vvix10_r2 = compute_oos_r2(panel, "vvix_ma10",  FWD, OOS_GAP, NW_LAGS)
-    biv5_r2   = compute_oos_r2_bivariate(panel, "VP", "vvix_ma5",      FWD, OOS_GAP, NW_LAGS)
-    biv10_r2  = compute_oos_r2_bivariate(panel, "VP", "vvix_ma10",     FWD, OOS_GAP, NW_LAGS)
-    ts_r2     = compute_oos_r2_bivariate(panel, "VP", "term_slope",    FWD, OOS_GAP, NW_LAGS)
-    oi_r2     = compute_oos_r2_bivariate(panel, "VP", "open_interest", FWD, OOS_GAP, NW_LAGS)
 
     # ══════════════════════════════════════════════════════════════════════════
     # 1. VRP
@@ -1373,13 +1242,13 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew(panel, "VP", FWD, OOS_GAP, NW_LAGS, delta)
         sim_dict_vrp[di] = (delta, simulate_strategy(pos, daily_ret))
+    _print_delta_stats(sim_dict_vrp, bah_sim)
     plot_2panel(
         pred_label="VRP", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
         color_palette=pal_vrp,
         sim_dict=sim_dict_vrp, betas_df=vrp_betas, bah_sim=bah_sim,
         out_path=out_vrp / "symmetric_VRP.png",
-        r2_oos=vrp_r2,
     )
 
     print("\n[1.2] VRP asymmetric...")
@@ -1387,11 +1256,7 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_asym(panel, "VP", FWD, OOS_GAP, NW_LAGS, delta=delta)
         asym_sims_vrp[di] = (delta, simulate_strategy(pos, daily_ret))
-        st = compute_performance_stats(
-            asym_sims_vrp[di][1][asym_sims_vrp[di][1].index >= OOS_START],
-            f"asym_vrp_{di}")
-        print(f"    delta={DELTA_LBL[di]}  SR={st['sharpe']:+.2f}  "
-              f"ret={st['ann_ret']*100:+.1f}%  DD={st['max_dd']*100:.1f}%")
+    _print_delta_stats(asym_sims_vrp, bah_sim)
     plot_asym(
         pred_label="VRP", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
@@ -1405,11 +1270,7 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_rolmu(panel, "VP", FWD, OOS_GAP, NW_LAGS, delta=delta)
         rolmu_sims_vrp[di] = (delta, simulate_strategy(pos, daily_ret))
-        st = compute_performance_stats(
-            rolmu_sims_vrp[di][1][rolmu_sims_vrp[di][1].index >= OOS_START],
-            f"rolmu_vrp_{di}")
-        print(f"    delta={DELTA_LBL[di]}  SR={st['sharpe']:+.2f}  "
-              f"ret={st['ann_ret']*100:+.1f}%  DD={st['max_dd']*100:.1f}%")
+    _print_delta_stats(rolmu_sims_vrp, bah_sim)
     plot_rolmu(
         pred_label="VRP", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
@@ -1427,13 +1288,13 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew(panel, "vvix_ma5", FWD, OOS_GAP, NW_LAGS, delta)
         sim_dict_vvix5[di] = (delta, simulate_strategy(pos, daily_ret))
+    _print_delta_stats(sim_dict_vvix5, bah_sim)
     plot_2panel(
         pred_label="VVIX MA5", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
         color_palette=pal_vvix5,
         sim_dict=sim_dict_vvix5, betas_df=vvix5_betas, bah_sim=bah_sim,
         out_path=out_vvix5 / "symmetric_VVIX_MA5.png",
-        r2_oos=vvix5_r2,
     )
 
     print("\n[2.2] VVIX MA5 asymmetric...")
@@ -1441,11 +1302,7 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_asym(panel, "vvix_ma5", FWD, OOS_GAP, NW_LAGS, delta=delta)
         asym_sims_vvix5[di] = (delta, simulate_strategy(pos, daily_ret))
-        st = compute_performance_stats(
-            asym_sims_vvix5[di][1][asym_sims_vvix5[di][1].index >= OOS_START],
-            f"asym_vvix5_{di}")
-        print(f"    delta={DELTA_LBL[di]}  SR={st['sharpe']:+.2f}  "
-              f"ret={st['ann_ret']*100:+.1f}%  DD={st['max_dd']*100:.1f}%")
+    _print_delta_stats(asym_sims_vvix5, bah_sim)
     plot_asym(
         pred_label="VVIX MA5", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
@@ -1459,11 +1316,7 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_rolmu(panel, "vvix_ma5", FWD, OOS_GAP, NW_LAGS, delta=delta)
         rolmu_sims_vvix5[di] = (delta, simulate_strategy(pos, daily_ret))
-        st = compute_performance_stats(
-            rolmu_sims_vvix5[di][1][rolmu_sims_vvix5[di][1].index >= OOS_START],
-            f"rolmu_vvix5_{di}")
-        print(f"    delta={DELTA_LBL[di]}  SR={st['sharpe']:+.2f}  "
-              f"ret={st['ann_ret']*100:+.1f}%  DD={st['max_dd']*100:.1f}%")
+    _print_delta_stats(rolmu_sims_vvix5, bah_sim)
     plot_rolmu(
         pred_label="VVIX MA5", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
@@ -1481,13 +1334,13 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew(panel, "vvix_ma10", FWD, OOS_GAP, NW_LAGS, delta)
         sim_dict_vvix10[di] = (delta, simulate_strategy(pos, daily_ret))
+    _print_delta_stats(sim_dict_vvix10, bah_sim)
     plot_2panel(
         pred_label="VVIX MA10", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
         color_palette=pal_vvix10,
         sim_dict=sim_dict_vvix10, betas_df=vvix10_betas, bah_sim=bah_sim,
         out_path=out_vvix10 / "symmetric_VVIX_MA10.png",
-        r2_oos=vvix10_r2,
     )
 
     print("\n[3.2] VVIX MA10 asymmetric...")
@@ -1495,11 +1348,7 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_asym(panel, "vvix_ma10", FWD, OOS_GAP, NW_LAGS, delta=delta)
         asym_sims_vvix10[di] = (delta, simulate_strategy(pos, daily_ret))
-        st = compute_performance_stats(
-            asym_sims_vvix10[di][1][asym_sims_vvix10[di][1].index >= OOS_START],
-            f"asym_vvix10_{di}")
-        print(f"    delta={DELTA_LBL[di]}  SR={st['sharpe']:+.2f}  "
-              f"ret={st['ann_ret']*100:+.1f}%  DD={st['max_dd']*100:.1f}%")
+    _print_delta_stats(asym_sims_vvix10, bah_sim)
     plot_asym(
         pred_label="VVIX MA10", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
@@ -1513,11 +1362,7 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_rolmu(panel, "vvix_ma10", FWD, OOS_GAP, NW_LAGS, delta=delta)
         rolmu_sims_vvix10[di] = (delta, simulate_strategy(pos, daily_ret))
-        st = compute_performance_stats(
-            rolmu_sims_vvix10[di][1][rolmu_sims_vvix10[di][1].index >= OOS_START],
-            f"rolmu_vvix10_{di}")
-        print(f"    delta={DELTA_LBL[di]}  SR={st['sharpe']:+.2f}  "
-              f"ret={st['ann_ret']*100:+.1f}%  DD={st['max_dd']*100:.1f}%")
+    _print_delta_stats(rolmu_sims_vvix10, bah_sim)
     plot_rolmu(
         pred_label="VVIX MA10", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
@@ -1535,13 +1380,13 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_bivariate(panel, "VP", "vvix_ma5", FWD, OOS_GAP, NW_LAGS, delta)
         sim_dict_biv5[di] = (delta, simulate_strategy(pos, daily_ret))
+    _print_delta_stats(sim_dict_biv5, bah_sim)
     plot_2panel_bivariate(
         pred1_label="VRP", pred2_label="VVIX MA5", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
         color_palette=pal_biv5,
         sim_dict=sim_dict_biv5, betas_df=biv5_betas, bah_sim=bah_sim,
         out_path=out_biv5 / "symmetric_VRP_+_VVIX_MA5.png",
-        r2_oos=biv5_r2,
     )
 
     print("\n[4.2] VRP + VVIX MA5 asymmetric...")
@@ -1549,11 +1394,7 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_asym_bivariate(panel, "VP", "vvix_ma5", FWD, OOS_GAP, NW_LAGS, delta=delta)
         asym_sims_biv5[di] = (delta, simulate_strategy(pos, daily_ret))
-        st = compute_performance_stats(
-            asym_sims_biv5[di][1][asym_sims_biv5[di][1].index >= OOS_START],
-            f"asym_biv5_{di}")
-        print(f"    delta={DELTA_LBL[di]}  SR={st['sharpe']:+.2f}  "
-              f"ret={st['ann_ret']*100:+.1f}%  DD={st['max_dd']*100:.1f}%")
+    _print_delta_stats(asym_sims_biv5, bah_sim)
     plot_asym_bivariate(
         pred1_label="VRP", pred2_label="VVIX MA5", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
@@ -1567,11 +1408,7 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_rolmu_bivariate(panel, "VP", "vvix_ma5", FWD, OOS_GAP, NW_LAGS, delta=delta)
         rolmu_sims_biv5[di] = (delta, simulate_strategy(pos, daily_ret))
-        st = compute_performance_stats(
-            rolmu_sims_biv5[di][1][rolmu_sims_biv5[di][1].index >= OOS_START],
-            f"rolmu_biv5_{di}")
-        print(f"    delta={DELTA_LBL[di]}  SR={st['sharpe']:+.2f}  "
-              f"ret={st['ann_ret']*100:+.1f}%  DD={st['max_dd']*100:.1f}%")
+    _print_delta_stats(rolmu_sims_biv5, bah_sim)
     plot_rolmu_bivariate(
         pred1_label="VRP", pred2_label="VVIX MA5", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
@@ -1589,13 +1426,13 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_bivariate(panel, "VP", "vvix_ma10", FWD, OOS_GAP, NW_LAGS, delta)
         sim_dict_biv10[di] = (delta, simulate_strategy(pos, daily_ret))
+    _print_delta_stats(sim_dict_biv10, bah_sim)
     plot_2panel_bivariate(
         pred1_label="VRP", pred2_label="VVIX MA10", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
         color_palette=pal_biv10,
         sim_dict=sim_dict_biv10, betas_df=biv10_betas, bah_sim=bah_sim,
         out_path=out_biv10 / "symmetric_VRP_+_VVIX_MA10.png",
-        r2_oos=biv10_r2,
     )
 
     print("\n[5.2] VRP + VVIX MA10 asymmetric...")
@@ -1603,11 +1440,7 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_asym_bivariate(panel, "VP", "vvix_ma10", FWD, OOS_GAP, NW_LAGS, delta=delta)
         asym_sims_biv10[di] = (delta, simulate_strategy(pos, daily_ret))
-        st = compute_performance_stats(
-            asym_sims_biv10[di][1][asym_sims_biv10[di][1].index >= OOS_START],
-            f"asym_biv10_{di}")
-        print(f"    delta={DELTA_LBL[di]}  SR={st['sharpe']:+.2f}  "
-              f"ret={st['ann_ret']*100:+.1f}%  DD={st['max_dd']*100:.1f}%")
+    _print_delta_stats(asym_sims_biv10, bah_sim)
     plot_asym_bivariate(
         pred1_label="VRP", pred2_label="VVIX MA10", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
@@ -1621,11 +1454,7 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_rolmu_bivariate(panel, "VP", "vvix_ma10", FWD, OOS_GAP, NW_LAGS, delta=delta)
         rolmu_sims_biv10[di] = (delta, simulate_strategy(pos, daily_ret))
-        st = compute_performance_stats(
-            rolmu_sims_biv10[di][1][rolmu_sims_biv10[di][1].index >= OOS_START],
-            f"rolmu_biv10_{di}")
-        print(f"    delta={DELTA_LBL[di]}  SR={st['sharpe']:+.2f}  "
-              f"ret={st['ann_ret']*100:+.1f}%  DD={st['max_dd']*100:.1f}%")
+    _print_delta_stats(rolmu_sims_biv10, bah_sim)
     plot_rolmu_bivariate(
         pred1_label="VRP", pred2_label="VVIX MA10", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
@@ -1643,13 +1472,13 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_bivariate(panel, "VP", "term_slope", FWD, OOS_GAP, NW_LAGS, delta)
         sim_dict_ts[di] = (delta, simulate_strategy(pos, daily_ret))
+    _print_delta_stats(sim_dict_ts, bah_sim)
     plot_2panel_bivariate(
         pred1_label="VRP", pred2_label="Term Slope", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
         color_palette=pal_ts,
         sim_dict=sim_dict_ts, betas_df=ts_betas, bah_sim=bah_sim,
         out_path=out_ts / "symmetric_VRP_+_Term_Slope.png",
-        r2_oos=ts_r2,
     )
 
     print("\n[6.2] VRP + Term Slope asymmetric...")
@@ -1657,11 +1486,7 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_asym_bivariate(panel, "VP", "term_slope", FWD, OOS_GAP, NW_LAGS, delta=delta)
         asym_sims_ts[di] = (delta, simulate_strategy(pos, daily_ret))
-        st = compute_performance_stats(
-            asym_sims_ts[di][1][asym_sims_ts[di][1].index >= OOS_START],
-            f"asym_ts_{di}")
-        print(f"    delta={DELTA_LBL[di]}  SR={st['sharpe']:+.2f}  "
-              f"ret={st['ann_ret']*100:+.1f}%  DD={st['max_dd']*100:.1f}%")
+    _print_delta_stats(asym_sims_ts, bah_sim)
     plot_asym_bivariate(
         pred1_label="VRP", pred2_label="Term Slope", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
@@ -1675,11 +1500,7 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_rolmu_bivariate(panel, "VP", "term_slope", FWD, OOS_GAP, NW_LAGS, delta=delta)
         rolmu_sims_ts[di] = (delta, simulate_strategy(pos, daily_ret))
-        st = compute_performance_stats(
-            rolmu_sims_ts[di][1][rolmu_sims_ts[di][1].index >= OOS_START],
-            f"rolmu_ts_{di}")
-        print(f"    delta={DELTA_LBL[di]}  SR={st['sharpe']:+.2f}  "
-              f"ret={st['ann_ret']*100:+.1f}%  DD={st['max_dd']*100:.1f}%")
+    _print_delta_stats(rolmu_sims_ts, bah_sim)
     plot_rolmu_bivariate(
         pred1_label="VRP", pred2_label="Term Slope", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
@@ -1697,13 +1518,13 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_bivariate(panel, "VP", "open_interest", FWD, OOS_GAP, NW_LAGS, delta)
         sim_dict_oi[di] = (delta, simulate_strategy(pos, daily_ret))
+    _print_delta_stats(sim_dict_oi, bah_sim)
     plot_2panel_bivariate(
         pred1_label="VRP", pred2_label="Open Interest", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
         color_palette=pal_oi,
         sim_dict=sim_dict_oi, betas_df=oi_betas, bah_sim=bah_sim,
         out_path=out_oi / "symmetric_VRP_+_Open_Interest.png",
-        r2_oos=oi_r2,
     )
 
     print("\n[7.2] VRP + Open Interest asymmetric...")
@@ -1711,11 +1532,7 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_asym_bivariate(panel, "VP", "open_interest", FWD, OOS_GAP, NW_LAGS, delta=delta)
         asym_sims_oi[di] = (delta, simulate_strategy(pos, daily_ret))
-        st = compute_performance_stats(
-            asym_sims_oi[di][1][asym_sims_oi[di][1].index >= OOS_START],
-            f"asym_oi_{di}")
-        print(f"    delta={DELTA_LBL[di]}  SR={st['sharpe']:+.2f}  "
-              f"ret={st['ann_ret']*100:+.1f}%  DD={st['max_dd']*100:.1f}%")
+    _print_delta_stats(asym_sims_oi, bah_sim)
     plot_asym_bivariate(
         pred1_label="VRP", pred2_label="Open Interest", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,
@@ -1729,11 +1546,7 @@ def main():
     for di, delta in enumerate(DELTAS):
         pos = run_ew_rolmu_bivariate(panel, "VP", "open_interest", FWD, OOS_GAP, NW_LAGS, delta=delta)
         rolmu_sims_oi[di] = (delta, simulate_strategy(pos, daily_ret))
-        st = compute_performance_stats(
-            rolmu_sims_oi[di][1][rolmu_sims_oi[di][1].index >= OOS_START],
-            f"rolmu_oi_{di}")
-        print(f"    delta={DELTA_LBL[di]}  SR={st['sharpe']:+.2f}  "
-              f"ret={st['ann_ret']*100:+.1f}%  DD={st['max_dd']*100:.1f}%")
+    _print_delta_stats(rolmu_sims_oi, bah_sim)
     plot_rolmu_bivariate(
         pred1_label="VRP", pred2_label="Open Interest", horizon_label="20-day",
         oos_gap=OOS_GAP, nw_lags=NW_LAGS,

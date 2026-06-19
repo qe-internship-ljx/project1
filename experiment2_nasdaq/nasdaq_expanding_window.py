@@ -62,7 +62,7 @@ sys.path.insert(0, str(ROOT.parent))
 sys.path.insert(0, str(EXP2_DIR))
 
 from har_model import _nw_se
-from experiment2 import (
+from helpers import (
     load_vrp_series,
     load_vix_futures_term_structure,
     load_vvix,

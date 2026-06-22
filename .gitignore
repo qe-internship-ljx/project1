@@ -1,9 +1,10 @@
 # Raw data
 data/
 
+report/
+
 .claude/
 
-report
 
 # Python bytecode
 __pycache__/

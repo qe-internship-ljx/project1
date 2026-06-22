@@ -3,7 +3,7 @@ intraday_experiment/experiment.py
 ==================================
 VRP Experiment — Intraday-Based Realized Variance
 
-Key differences from vrp_experiment/experiment.py:
+Key differences from "experiment1 - VRP Computation"/experiment.py:
   - RV is computed from intraday 5-minute E-mini S&P 500 (ES) futures returns
     (sum of squared 5-min log returns per day) instead of squared daily returns
   - Intraday data is only available from 2016-01-04 onwards

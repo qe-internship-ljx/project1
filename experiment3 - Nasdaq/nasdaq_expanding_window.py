@@ -79,4 +79,4 @@ if __name__ == "__main__":
         cache_dir=ROOT / "output" / "regression_cache",
         vv_label="VVIX MA5",
     )
-    print("\nDone — nasdaq outputs in", ROOT / "output" / "expanding_window")
+    print("\nDone — nasdaq outputs in", ROOT / "output" / "plots")

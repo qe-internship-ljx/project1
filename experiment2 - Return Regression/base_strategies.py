@@ -557,13 +557,13 @@ def main(t_threshold=None):
     FWD       = "fwd_20d"
 
     # ── Output directories ──
-    out_vrp   = OUTPUT / "expanding_window" / "VRP"
-    out_vvix5 = OUTPUT / "expanding_window" / "VVIX MA5"
-    out_vvix10= OUTPUT / "expanding_window" / "VVIX MA10"
-    out_biv5  = OUTPUT / "expanding_window" / "VRP + VVIX MA5"
-    out_biv10 = OUTPUT / "expanding_window" / "VRP + VVIX MA10"
-    out_ts    = OUTPUT / "expanding_window" / "VRP + Term Slope"
-    out_oi    = OUTPUT / "expanding_window" / "VRP + Open Interest"
+    out_vrp   = OUTPUT / "plots" / "VRP"
+    out_vvix5 = OUTPUT / "plots" / "VVIX MA5"
+    out_vvix10= OUTPUT / "plots" / "VVIX MA10"
+    out_biv5  = OUTPUT / "plots" / "VRP + VVIX MA5"
+    out_biv10 = OUTPUT / "plots" / "VRP + VVIX MA10"
+    out_ts    = OUTPUT / "plots" / "VRP + Term Slope"
+    out_oi    = OUTPUT / "plots" / "VRP + Open Interest"
     for d in [out_vrp, out_vvix5, out_vvix10, out_biv5, out_biv10, out_ts, out_oi]:
         d.mkdir(parents=True, exist_ok=True)
 

@@ -141,7 +141,7 @@ def run_all(panel, out_root: Path, cache_dir: Path, vv_label: str):
     _redirect(out_root, cache_dir)
     daily_ret = panel["daily_ret"].dropna()
     bah_sim   = simulate_strategy(compute_buy_and_hold(daily_ret), daily_ret)
-    ew        = out_root / "expanding_window"
+    ew        = out_root / "plots"
 
     print("\n[VRP]"); run_univariate(panel, daily_ret, bah_sim, "VP", "VRP",
                                      ew / "VRP", lev.C_VRP)

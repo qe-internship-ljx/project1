@@ -18,13 +18,13 @@ Excess definitions:
   base_return_shift:   excess = y_hat - mu           (symmetric around rolling mu)
 
 Models:
-  VVIX MA5  -> 20-day (univariate)            -> output/expanding_window/VVIX MA5/
-  VVIX MA10 -> 20-day (univariate)            -> output/expanding_window/VVIX MA10/
-  VRP       -> 20-day (univariate)            -> output/expanding_window/VRP/
-  VRP + VVIX MA5 -> 20-day (bivariate)       -> output/expanding_window/VRP + VVIX MA5/
-  VRP + VVIX MA10 -> 20-day (bivariate)      -> output/expanding_window/VRP + VVIX MA10/
-  VRP + Term Slope -> 20-day (bivariate)     -> output/expanding_window/VRP + Term Slope/
-  VRP + Open Interest -> 20-day (bivariate)  -> output/expanding_window/VRP + Open Interest/
+  VVIX MA5  -> 20-day (univariate)            -> output/plots/VVIX MA5/
+  VVIX MA10 -> 20-day (univariate)            -> output/plots/VVIX MA10/
+  VRP       -> 20-day (univariate)            -> output/plots/VRP/
+  VRP + VVIX MA5 -> 20-day (bivariate)       -> output/plots/VRP + VVIX MA5/
+  VRP + VVIX MA10 -> 20-day (bivariate)      -> output/plots/VRP + VVIX MA10/
+  VRP + Term Slope -> 20-day (bivariate)     -> output/plots/VRP + Term Slope/
+  VRP + Open Interest -> 20-day (bivariate)  -> output/plots/VRP + Open Interest/
 
 Position functions are defined in this file; betas, y_hat helpers and constants
 are imported from regressions.py.
@@ -691,13 +691,13 @@ def main(t_threshold=None):
     yh_oi    = _yhat_bivariate(panel, "VP", "open_interest", FWD, betas_oi)
     mu_20d   = _rolling_mu(panel, FWD, OOS_GAP, RW)
 
-    out_vvix  = OUTPUT / "expanding_window" / "VVIX MA5"
-    out_ma10  = OUTPUT / "expanding_window" / "VVIX MA10"
-    out_vrp   = OUTPUT / "expanding_window" / "VRP"
-    out_biv   = OUTPUT / "expanding_window" / "VRP + VVIX MA5"
-    out_biv10 = OUTPUT / "expanding_window" / "VRP + VVIX MA10"
-    out_term  = OUTPUT / "expanding_window" / "VRP + Term Slope"
-    out_oi    = OUTPUT / "expanding_window" / "VRP + Open Interest"
+    out_vvix  = OUTPUT / "plots" / "VVIX MA5"
+    out_ma10  = OUTPUT / "plots" / "VVIX MA10"
+    out_vrp   = OUTPUT / "plots" / "VRP"
+    out_biv   = OUTPUT / "plots" / "VRP + VVIX MA5"
+    out_biv10 = OUTPUT / "plots" / "VRP + VVIX MA10"
+    out_term  = OUTPUT / "plots" / "VRP + Term Slope"
+    out_oi    = OUTPUT / "plots" / "VRP + Open Interest"
     for d in (out_vvix, out_ma10, out_vrp, out_biv, out_biv10, out_term, out_oi):
         d.mkdir(parents=True, exist_ok=True)
 
@@ -762,7 +762,7 @@ def main(t_threshold=None):
 
     # ── Comparison: leveraged-asymmetric VVIX MA5/MA10 vs VRP+VVIX MA5/MA10 ────
     print("\nLeveraged asymmetric VVIX MA5/MA10 vs VRP+VVIX MA5/MA10...")
-    out_cmp = OUTPUT / "expanding_window" / "comparisons"
+    out_cmp = OUTPUT / "plots" / "comparisons"
     plot_leveraged_asymmetric_comparison(
         sims[("VVIX MA5", "asym")], sims[("VRP + VVIX MA5", "asym")],
         sims[("VRP + Term Slope", "asym")], bah_sim,

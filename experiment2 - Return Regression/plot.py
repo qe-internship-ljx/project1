@@ -1,7 +1,7 @@
 """
 plot.py
 =======
-Regenerates all non-poor-correlation plots under output/expanding_window/ in one shot.
+Regenerates all non-poor-correlation plots under output/plots/ in one shot.
 
 Poor-correlation baselines (Vol Trend, VIX, Term Slope univariate, Expanding VRP)
 are intentionally excluded.  Run horizon_regression.py directly to regenerate those.
@@ -9,41 +9,41 @@ are intentionally excluded.  Run horizon_regression.py directly to regenerate th
 Generated outputs
 -----------------
   === Non-leveraged (unit-position) strategies ===
-  output/expanding_window/VRP/symmetric_VRP.png
-  output/expanding_window/VRP/asymmetric_VRP.png
-  output/expanding_window/VRP/base_return_shift_VRP.png
-  output/expanding_window/VVIX MA5/symmetric_VVIX_MA5.png
-  output/expanding_window/VVIX MA5/asymmetric_VVIX_MA5.png
-  output/expanding_window/VVIX MA5/base_return_shift_VVIX_MA5.png
-  output/expanding_window/VVIX MA10/symmetric_VVIX_MA10.png
-  output/expanding_window/VVIX MA10/asymmetric_VVIX_MA10.png
-  output/expanding_window/VVIX MA10/base_return_shift_VVIX_MA10.png
-  output/expanding_window/VRP + VVIX MA5/symmetric_VRP_+_VVIX_MA5.png
-  output/expanding_window/VRP + VVIX MA5/asymmetric_VRP_+_VVIX_MA5.png
-  output/expanding_window/VRP + VVIX MA5/base_return_shift_VRP_+_VVIX_MA5.png
-  output/expanding_window/VRP + VVIX MA10/symmetric_VRP_+_VVIX_MA10.png
-  output/expanding_window/VRP + VVIX MA10/asymmetric_VRP_+_VVIX_MA10.png
-  output/expanding_window/VRP + VVIX MA10/base_return_shift_VRP_+_VVIX_MA10.png
-  output/expanding_window/VRP + Term Slope/symmetric_VRP_+_Term_Slope.png
-  output/expanding_window/VRP + Term Slope/asymmetric_VRP_+_Term_Slope.png
-  output/expanding_window/VRP + Term Slope/base_return_shift_VRP_+_Term_Slope.png
-  output/expanding_window/VRP + Open Interest/symmetric_VRP_+_Open_Interest.png
-  output/expanding_window/VRP + Open Interest/asymmetric_VRP_+_Open_Interest.png
-  output/expanding_window/VRP + Open Interest/base_return_shift_VRP_+_Open_Interest.png
+  output/plots/VRP/symmetric_VRP.png
+  output/plots/VRP/asymmetric_VRP.png
+  output/plots/VRP/base_return_shift_VRP.png
+  output/plots/VVIX MA5/symmetric_VVIX_MA5.png
+  output/plots/VVIX MA5/asymmetric_VVIX_MA5.png
+  output/plots/VVIX MA5/base_return_shift_VVIX_MA5.png
+  output/plots/VVIX MA10/symmetric_VVIX_MA10.png
+  output/plots/VVIX MA10/asymmetric_VVIX_MA10.png
+  output/plots/VVIX MA10/base_return_shift_VVIX_MA10.png
+  output/plots/VRP + VVIX MA5/symmetric_VRP_+_VVIX_MA5.png
+  output/plots/VRP + VVIX MA5/asymmetric_VRP_+_VVIX_MA5.png
+  output/plots/VRP + VVIX MA5/base_return_shift_VRP_+_VVIX_MA5.png
+  output/plots/VRP + VVIX MA10/symmetric_VRP_+_VVIX_MA10.png
+  output/plots/VRP + VVIX MA10/asymmetric_VRP_+_VVIX_MA10.png
+  output/plots/VRP + VVIX MA10/base_return_shift_VRP_+_VVIX_MA10.png
+  output/plots/VRP + Term Slope/symmetric_VRP_+_Term_Slope.png
+  output/plots/VRP + Term Slope/asymmetric_VRP_+_Term_Slope.png
+  output/plots/VRP + Term Slope/base_return_shift_VRP_+_Term_Slope.png
+  output/plots/VRP + Open Interest/symmetric_VRP_+_Open_Interest.png
+  output/plots/VRP + Open Interest/asymmetric_VRP_+_Open_Interest.png
+  output/plots/VRP + Open Interest/base_return_shift_VRP_+_Open_Interest.png
 
   === Leveraged (leveraged) strategies ===
-  output/expanding_window/VVIX MA5/leveraged_{symmetric,asymmetric,base_return_shift}_VVIX_MA5.png
-  output/expanding_window/VVIX MA10/leveraged_{symmetric,asymmetric,base_return_shift}_VVIX_MA10.png
-  output/expanding_window/VRP/leveraged_{symmetric,asymmetric,base_return_shift}_VRP.png
-  output/expanding_window/VRP + VVIX MA5/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_VVIX_MA5.png
-  output/expanding_window/VRP + VVIX MA10/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_VVIX_MA10.png
-  output/expanding_window/VRP + Term Slope/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_Term_Slope.png
-  output/expanding_window/VRP + Open Interest/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_Open_Interest.png
-  output/expanding_window/trivariate/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_VVIX_MA5_+_Term_Slope.png
-  output/expanding_window/comparisons/leveraged_asymmetric_vvix_vs_vrp_vvix.png
+  output/plots/VVIX MA5/leveraged_{symmetric,asymmetric,base_return_shift}_VVIX_MA5.png
+  output/plots/VVIX MA10/leveraged_{symmetric,asymmetric,base_return_shift}_VVIX_MA10.png
+  output/plots/VRP/leveraged_{symmetric,asymmetric,base_return_shift}_VRP.png
+  output/plots/VRP + VVIX MA5/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_VVIX_MA5.png
+  output/plots/VRP + VVIX MA10/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_VVIX_MA10.png
+  output/plots/VRP + Term Slope/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_Term_Slope.png
+  output/plots/VRP + Open Interest/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_Open_Interest.png
+  output/plots/trivariate/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_VVIX_MA5_+_Term_Slope.png
+  output/plots/comparisons/leveraged_asymmetric_vvix_vs_vrp_vvix.png
 
   === Summary table ===
-  output/expanding_window/sharpe_table_extended.png   (7 models x 6 strategies)
+  output/plots/sharpe_table_extended.png   (7 models x 6 strategies)
 
 All regression positions and betas are cached in output/regression_cache/, so
 re-runs only redo the plot rendering.
@@ -75,7 +75,7 @@ def make_vrp_vvix_ma5_scatter():
     VRP is the 'VP' column from Experiment 1's production-loop output; VVIX MA5
     is the 5-day moving average of (monthly-unit) VVIX.  Annotated with the
     Pearson correlation and saved to
-    output/expanding_window/scatter_vrp_vs_vvix_ma5.png.
+    output/plots/scatter_vrp_vs_vvix_ma5.png.
     """
     from helpers import load_vrp_series, load_vvix, compute_vvix_ma5
 
@@ -95,7 +95,7 @@ def make_vrp_vvix_ma5_scatter():
                  fontsize=13, fontweight="bold")
     ax.grid(True, alpha=0.3)
 
-    out_path = ROOT / "output" / "expanding_window" / "scatter_vrp_vs_vvix_ma5.png"
+    out_path = ROOT / "output" / "plots" / "scatter_vrp_vs_vvix_ma5.png"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -108,7 +108,7 @@ def make_sharpe_table():
     Stat-window logic mirrors the plot logic exactly (stats measured from signal
     activation when activation is post-2020), base strategies use d=0.2%, and
     Sharpe ratios are annualised against a 3% risk-free rate.  Saved to
-    output/expanding_window/sharpe_table_extended.png.
+    output/plots/sharpe_table_extended.png.
     """
     from helpers import (
         load_vrp_series, load_es_front_month, load_vvix, compute_vvix_ma5, compute_vvix_ma10,
@@ -341,7 +341,7 @@ def make_sharpe_table():
         fontsize=11, fontweight="bold", pad=18,
     )
 
-    out_path = ROOT / "output" / "expanding_window" / "sharpe_table_extended.png"
+    out_path = ROOT / "output" / "plots" / "sharpe_table_extended.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"\nSaved: {out_path}")

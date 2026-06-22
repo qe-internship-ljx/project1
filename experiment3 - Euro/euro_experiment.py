@@ -8,7 +8,7 @@ European data by swapping in Euro inputs and delegating everything else to
 
 Euro inputs (the only market-specific code here):
   • Euro Stoxx 50 front-month (FX futures)        -> dependent return
-  • Euro VRP via 500-day rolling HAR on V2X²/12    -> "VP"
+  • Euro VRP via 1000-day rolling HAR on V2X²/12    -> "VP"
   • VSTOXX (DI) futures term-structure slope       -> "term_slope"
   • VV2TX (VSTOXX-of-VSTOXX) 5-day MA               -> "vvix_ma5" column
 
@@ -33,7 +33,7 @@ sys.path.insert(0, str(ROOT.parent / "experiment2 - Return Regression"))
 from helpers import compute_trend_quotient, build_master_panel
 import cross_market
 
-ROLL_VRP_WIN = 500
+ROLL_VRP_WIN = 1000
 
 
 # ── Euro data loaders ─────────────────────────────────────────────────────────
@@ -99,7 +99,7 @@ def load_vv2tx() -> pd.Series:
 
 def compute_euro_vrp(returns: pd.Series, v2x: pd.Series,
                      window: int = ROLL_VRP_WIN) -> pd.DataFrame:
-    """500-day rolling HAR production loop for Euro VRP (mirrors
+    """1000-day rolling HAR production loop for Euro VRP (mirrors
     vrp_experiment production_loop):  IVar = V2X²/12;  CV = HAR forecast of
     forward 22-day RV from rolling OLS;  VP = IVar − CV."""
     ivar = (v2x ** 2 / 12.0).rename("IVar")
@@ -176,4 +176,4 @@ if __name__ == "__main__":
         cache_dir=ROOT / "output" / "regression_cache",
         vv_label="VV2TX MA5",
     )
-    print("\nDone — euro outputs in", ROOT / "output" / "expanding_window")
+    print("\nDone — euro outputs in", ROOT / "output" / "plots")

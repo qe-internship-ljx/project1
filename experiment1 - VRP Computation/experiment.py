@@ -10,7 +10,7 @@ Steps
 2.  Physical Realized Variance: rolling 22-day sum of squared daily returns
 3.  HAR panel fitting (Model 8) — strictly out-of-sample coefficients
 4.  VRP = ImpliedVariance − CV (fitted conditional variance)
-5.  500-day rolling-window OLS production loop (day-by-day, no look-ahead)
+5.  1000-day rolling-window OLS production loop (day-by-day, no look-ahead)
 6.  RMSE, MAE, MAPE evaluation
 7.  Comparison vs. martingale (BTZ Model 30) and univariate VRP return regression
 
@@ -54,7 +54,7 @@ DATA   = ROOT.parent / "data"
 PAPER_START      = "1990-01-02"
 PAPER_END        = "2010-10-01"
 PAPER_SPLIT      = "2005-07-15"   # 75% train split (matching B&H)
-ROLL_WIN         = 500            # production-loop rolling window (trading days)
+ROLL_WIN         = 1000            # production-loop rolling window (trading days)
 EXP_TRAIN_START  = "1990-01-02"  # expanding-window anchor (full history from paper start)
 EXP_OOS_START    = "2006-01-01"  # first OOS prediction (after 1990-2005 initial training)
 
@@ -136,7 +136,7 @@ def extract_vrp(panel: pd.DataFrame, cv_series: pd.Series) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 5 — Production Loop (500-day rolling OLS)
+# STEP 5 — Production Loop (1000-day rolling OLS)
 # ══════════════════════════════════════════════════════════════════════════════
 def production_loop(panel: pd.DataFrame, window: int = ROLL_WIN,
                     return_stats: bool = False):
@@ -601,15 +601,14 @@ def _trailing_oos_mz_r2(prod_df: pd.DataFrame, window: int = 252) -> pd.Series:
 
 def plot_combined_vrp_summary(prod_df: pd.DataFrame, stats_df: pd.DataFrame,
                                tag: str = "rolling",
-                               window_label: str = "500-day rolling OLS") -> Path:
+                               window_label: str = "1000-day rolling OLS") -> Path:
     """
     Single combined image (4 panels):
       Row 1: Predicted VRP with long-run mean ± 1σ labelled
       Row 2: IS Adj-R² and trailing-252d OOS MZ-R²
       Row 3: HAR betas over time
       Row 4: NW t-statistics for all variables
-    window_label is embedded in titles (e.g. "500-day rolling OLS" or
-    "expanding window OLS (initial train 2006-2012)").
+    window_label is embedded in titles.
     """
     vrp_mean = float(prod_df["VP"].mean())
     vrp_std  = float(prod_df["VP"].std())
@@ -773,7 +772,7 @@ def main():
     print(f"    VP mean (full):  {panel_full['VP'].mean():.3f}")
 
     # ── STEP 5: Production loop ───────────────────────────────────────────────
-    print("\n[5] Production loop (500-day rolling OLS)…")
+    print("\n[5] Production loop (1000-day rolling OLS)…")
     print("  Paper sample:")
     prod_paper = production_loop(panel_paper, ROLL_WIN)
     print("  Full sample (with IS stats for summary plot):")
@@ -809,7 +808,7 @@ def main():
     # ── Plots ─────────────────────────────────────────────────────────────────
     print("\n[9] Generating combined VRP summary plot (VIX only)…")
     plot_combined_vrp_summary(prod_rolling, stats_rolling, tag="rolling",
-                              window_label="500-day Rolling OLS")
+                              window_label="1000-day Rolling OLS")
     prod_rolling.to_csv(OUTPUT / "production_loop_rolling.csv")
 
     # ── Expanding-window production loop (initial train 2006-2012) ──────────

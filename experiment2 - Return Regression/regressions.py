@@ -9,7 +9,7 @@ Responsibilities:
     carries the NW t-stat columns (t_stat / t_stat_1 / …) used for the plots
   - Provide derived-series helpers: _yhat_univariate/bivariate/trivariate,
     _rolling_mu, _shade, oos_cumret
-  - Export shared constants (OOS_START, MIN_WIN, T_THRESH, DELTAS, …)
+  - Export shared constants (OOS_START, MIN_WIN, DELTAS, …)
 
 Position / backtest logic lives in base_strategies.py (unit-position) and
 leveraged_strategies.py (multi-level unbound).
@@ -50,7 +50,6 @@ from fh_replication.fh_replication import compute_vix_term_slope
 # ─── Shared constants ─────────────────────────────────────────────────────────
 OOS_START  = "2012-01-01"
 MIN_WIN    = 500
-T_THRESH   = 1.28
 DELTAS     = [0.002, 0.005, 0.0075, 0.010]
 DELTA_LBL  = ["d=0.2%", "d=0.5%", "d=0.75%", "d=1.0%"]
 OOS_GAP    = 20
@@ -74,85 +73,6 @@ def oos_cumret(sim, start=OOS_START):
     net = sim["net_pnl"]
     s   = net[net.index >= start]
     return (1 + s).cumprod()
-
-
-def _align_zero(ax_left, ax_right):
-    """Force both twin axes to share y=0 by making each range symmetric."""
-    lo1, hi1 = ax_left.get_ylim()
-    lo2, hi2 = ax_right.get_ylim()
-    half1 = max(abs(lo1), abs(hi1)) or 1.0
-    half2 = max(abs(lo2), abs(hi2)) or 1.0
-    ax_left.set_ylim(-half1, half1)
-    ax_right.set_ylim(-half2, half2)
-
-
-def draw_tstat_beta_panel(ax, betas_df, labels, tstat_colors, nw_lags):
-    """Canonical t-stat + beta twin-axis panel, shared by base_strategies.py and
-    leveraged_strategies.py so the panel is identical across every strategy.
-
-    Draws, for 1-3 predictors:
-      • NW t-stat per predictor on the left axis (one per `tstat_colors`), with
-        the |t| = T_THRESH gate band.
-      • Each predictor's expanding-window beta on a grey twin axis, NORMALISED by
-        its own peak |beta| so predictors on wildly different scales (e.g. VRP
-        ~1e-4 vs VVIX ~1e-3) are both legible and their SIGN is unambiguous.
-        `_align_zero` then pins y=0 of both axes together.
-
-    Normalising + zero-aligning is what keeps a small-but-positive beta (VRP in
-    the bivariate models) from visually sinking to the bottom of a raw beta axis
-    and reading as negative against the t-stat scale.
-
-    `labels` / `tstat_colors` are parallel lists of equal length (1, 2, or 3);
-    column names are taken from `betas_df` (`beta`/`t_stat` for one predictor,
-    `beta_i`/`t_stat_i` otherwise).
-    """
-    n = len(labels)
-    if n != len(tstat_colors):
-        raise ValueError("labels and tstat_colors must be the same length")
-    if not 1 <= n <= 3:
-        raise ValueError(f"draw_tstat_beta_panel supports 1-3 predictors, got {n}")
-
-    t_cols = ["t_stat"] if n == 1 else [f"t_stat_{i+1}" for i in range(n)]
-    b_cols = ["beta"]   if n == 1 else [f"beta_{i+1}"   for i in range(n)]
-    t_styles = ["-", "--", "-."]
-    b_styles = ["--"] if n == 1 else ["-", ":", "-."]
-
-    # ── t-stat lines (left axis) ──────────────────────────────────────────────
-    for i in range(n):
-        s = betas_df[t_cols[i]]
-        ax.plot(s.index, s.values, color=tstat_colors[i], lw=1.0, alpha=0.85,
-                ls=t_styles[i],
-                label=f"NW t-stat: {labels[i]} ({nw_lags}-lag HAC)")
-    ax.fill_between(betas_df.index, -T_THRESH, T_THRESH,
-                    color="firebrick", alpha=0.05, label="Below gate (flat zone)")
-    ax.axhline( T_THRESH, color="firebrick", lw=1.2, ls="--",
-               label=f"|t| = {T_THRESH:.2f} gate")
-    ax.axhline(-T_THRESH, color="firebrick", lw=1.2, ls="--")
-    ax.axhline(0, color="black", lw=0.5, ls=":")
-    ax.set_ylabel("NW t-stat" if n > 1 else f"NW t-stat ({labels[0]})", fontsize=9)
-    ax.grid(axis="y", alpha=0.2, lw=0.6)
-    ax.spines["top"].set_visible(False)
-
-    # ── beta lines (grey twin axis, normalised by own peak) ───────────────────
-    ax2 = ax.twinx()
-    for i in range(n):
-        b    = betas_df[b_cols[i]]
-        peak = b.abs().max() or 1.0
-        lbl  = (f"Beta ({labels[i]})" if n == 1
-                else f"Beta: {labels[i]} (peak={peak:.3g})")
-        ax2.plot(b.index, b.values / peak, color="dimgrey", lw=1.0,
-                 ls=b_styles[i], alpha=0.60, label=lbl)
-    ax2.axhline(0, color="dimgrey", lw=0.4, ls=":")
-    ax2.set_ylabel("Beta (normalised)" if n > 1 else f"Beta ({labels[0]})",
-                   fontsize=8, color="dimgrey")
-    ax2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
-    ax2.spines["top"].set_visible(False)
-    _align_zero(ax, ax2)
-
-    l1, lb1 = ax.get_legend_handles_labels()
-    l2, lb2 = ax2.get_legend_handles_labels()
-    ax.legend(l1 + l2, lb1 + lb2, fontsize=8, loc="upper left")
-    return ax2
 
 
 # ─── Shared performance-stat window ───────────────────────────────────────────

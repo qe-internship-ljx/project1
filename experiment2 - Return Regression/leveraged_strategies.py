@@ -63,9 +63,17 @@ from fh_replication.fh_replication import compute_vix_term_slope
 from regressions import (
     compute_betas, compute_betas_bivariate,
     _yhat_univariate, _yhat_bivariate, _rolling_mu,
-    _shade, oos_cumret, stat_start, window_stats, draw_tstat_beta_panel,
-    OOS_START, T_THRESH, VVIX_ACT, OOS_GAP, NW_LAGS, RW, THRESHOLDS, LEVELS,
+    _shade, oos_cumret, stat_start, window_stats,
+    OOS_START, VVIX_ACT, OOS_GAP, NW_LAGS, RW, THRESHOLDS, LEVELS,
 )
+# Shared Buy-and-Hold / finalisation / t-stat panel drawing live in
+# base_strategies.py (the canonical plotting module).
+from base_strategies import _draw_bah, _finalize, draw_tstat_beta_panel
+
+# |t|-stat gate threshold. Lives here (and in base_strategies.py) — not in
+# regressions.py — so the --t-threshold flag can rebind it and have every plot
+# title and the t-stat gate band reflect the chosen value.
+T_THRESH = 1.65
 
 # ─── Color constants ──────────────────────────────────────────────────────────
 BAH_COLOR = "#d62728"
@@ -85,36 +93,6 @@ C_BIV102 = "#f768a1"   # second t-stat colour for VRP+VVIX MA10 bivariate
 # ═══════════════════════════════════════════════════════════════════════════
 # Shared panel-drawing helpers
 # ═══════════════════════════════════════════════════════════════════════════
-
-def _draw_bah(ax, bah_sim, stat_start_dt, stat_lbl, rebase_start, oos_start=OOS_START):
-    """Panel-1 Buy-and-Hold curve(s), shared by base_strategies.py and
-    leveraged_strategies.py.
-
-    Draws the full-OOS line (stats over the window from `stat_start_dt`), plus a
-    second line rebased to `rebase_start` when a strategy only activated post-2020
-    (`rebase_start` is None otherwise). `stat_lbl` is the caller's legend suffix.
-    """
-    bah_st  = compute_performance_stats(bah_sim[bah_sim.index >= stat_start_dt], "BaH")
-    bah_oos = oos_cumret(bah_sim, start=oos_start)
-    ax.plot(bah_oos.index, bah_oos.values,
-            color=BAH_COLOR, lw=1.5, ls="-.", alpha=0.6,
-            label=(f"Buy-and-Hold{stat_lbl}  "
-                   f"[SR={bah_st['sharpe']:+.2f}  "
-                   f"ret={bah_st['ann_ret']*100:+.1f}%  "
-                   f"DD={bah_st['max_dd']*100:.1f}%]"))
-
-    if rebase_start is not None:
-        bah_from   = bah_sim["net_pnl"][bah_sim.index >= rebase_start]
-        bah_act    = (1 + bah_from).cumprod()
-        bah_act_st = compute_performance_stats(
-            bah_sim[bah_sim.index >= rebase_start], "BaH_act")
-        ax.plot(bah_act.index, bah_act.values,
-                color=BAH_COLOR, lw=1.2, ls=":", alpha=0.85,
-                label=(f"Buy-and-Hold from {rebase_start.strftime('%Y-%m-%d')}  "
-                       f"[SR={bah_act_st['sharpe']:+.2f}  "
-                       f"ret={bah_act_st['ann_ret']*100:+.1f}%  "
-                       f"DD={bah_act_st['max_dd']*100:.1f}%]"))
-
 
 def _draw_cumret(ax, sim, bah_sim, main_color, label):
     """Panel 1. Returns (_stat_start, pL, pS, avg_pos)."""
@@ -151,13 +129,14 @@ def _draw_cumret(ax, sim, bah_sim, main_color, label):
 
 def _draw_tstat_univ(ax, betas_df, main_color, pred_label, nw_lags):
     """Panel 2 — univariate. Delegates to the shared canonical panel."""
-    return draw_tstat_beta_panel(ax, betas_df, [pred_label], [main_color], nw_lags)
+    return draw_tstat_beta_panel(ax, betas_df, [pred_label], [main_color], nw_lags,
+                                 t_thresh=T_THRESH)
 
 
 def _draw_tstat_biv(ax, betas_df, c1, c2, pred1_label, pred2_label, nw_lags):
     """Panel 2 — bivariate. Delegates to the shared canonical panel."""
     return draw_tstat_beta_panel(ax, betas_df, [pred1_label, pred2_label],
-                                 [c1, c2], nw_lags)
+                                 [c1, c2], nw_lags, t_thresh=T_THRESH)
 
 
 def _draw_position(ax, sim, main_color, pL, pS, avg_pos):
@@ -245,16 +224,6 @@ def _draw_predicted(ax, y_hat_ser, mu_ser, main_color, threshold_type):
     ax.legend(h + [bp], lb + [bp.get_label()], fontsize=8, loc="upper left")
 
 
-def _finalize(fig, axes, out_path):
-    for ax in axes:
-        ax.xaxis.set_major_locator(mdates.YearLocator(2))
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-        ax.tick_params(axis="x", which="major", labelbottom=True, labelsize=7, pad=2)
-    fig.savefig(out_path, dpi=155, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {out_path.name}")
-
-
 # ─── Leveraged: position-sizing helpers ─────────────────────────────────────────
 
 def _level(excess_abs):
@@ -282,8 +251,10 @@ def _asym_levels(y_hat, mu):
 
 # ─── Leveraged: univariate ──────────────────────────────────────────────────────
 
-def run_ew_leveraged_sym(panel, predictor, fwd_col, oos_gap, nw_lags, t_thresh=T_THRESH):
+def run_ew_leveraged_sym(panel, predictor, fwd_col, oos_gap, nw_lags, t_thresh=None):
     """Level based on |ŷ|."""
+    if t_thresh is None:
+        t_thresh = T_THRESH
     tag = (f"pos_EW_leveraged_sym_{predictor}_{fwd_col}"
            f"_t{int(t_thresh*100)}_oos{OOS_START}.parquet")
     cache = CACHE_DIR / tag
@@ -304,8 +275,10 @@ def run_ew_leveraged_sym(panel, predictor, fwd_col, oos_gap, nw_lags, t_thresh=T
 
 
 def run_ew_leveraged_asym(panel, predictor, fwd_col, oos_gap, nw_lags,
-                        rolling_window=500, t_thresh=T_THRESH):
+                        rolling_window=500, t_thresh=None):
     """Long: level by (ŷ-µ); short: level by |ŷ| when ŷ<0."""
+    if t_thresh is None:
+        t_thresh = T_THRESH
     tag = (f"pos_EW_leveraged_asym_{predictor}_{fwd_col}"
            f"_t{int(t_thresh*100)}_rw{rolling_window}_oos{OOS_START}.parquet")
     cache = CACHE_DIR / tag
@@ -328,8 +301,10 @@ def run_ew_leveraged_asym(panel, predictor, fwd_col, oos_gap, nw_lags,
 
 
 def run_ew_leveraged_rolmu(panel, predictor, fwd_col, oos_gap, nw_lags,
-                         rolling_window=500, t_thresh=T_THRESH):
+                         rolling_window=500, t_thresh=None):
     """Level based on |ŷ - µ|."""
+    if t_thresh is None:
+        t_thresh = T_THRESH
     tag = (f"pos_EW_rolmu_leveraged_{predictor}_{fwd_col}"
            f"_t{int(t_thresh*100)}_rw{rolling_window}_oos{OOS_START}.parquet")
     cache = CACHE_DIR / tag
@@ -353,7 +328,9 @@ def run_ew_leveraged_rolmu(panel, predictor, fwd_col, oos_gap, nw_lags,
 
 # ─── Leveraged: bivariate ───────────────────────────────────────────────────────
 
-def run_ew_biv_leveraged_sym(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, t_thresh=T_THRESH):
+def run_ew_biv_leveraged_sym(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, t_thresh=None):
+    if t_thresh is None:
+        t_thresh = T_THRESH
     tag = (f"pos_EW_leveraged_sym_{pred1}_{pred2}_{fwd_col}"
            f"_t{int(t_thresh*100)}_oos{OOS_START}.parquet")
     cache = CACHE_DIR / tag
@@ -375,7 +352,9 @@ def run_ew_biv_leveraged_sym(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, t_t
 
 
 def run_ew_biv_leveraged_asym(panel, pred1, pred2, fwd_col, oos_gap, nw_lags,
-                             rolling_window=500, t_thresh=T_THRESH):
+                             rolling_window=500, t_thresh=None):
+    if t_thresh is None:
+        t_thresh = T_THRESH
     tag = (f"pos_EW_leveraged_asym_{pred1}_{pred2}_{fwd_col}"
            f"_t{int(t_thresh*100)}_rw{rolling_window}_oos{OOS_START}.parquet")
     cache = CACHE_DIR / tag
@@ -399,7 +378,9 @@ def run_ew_biv_leveraged_asym(panel, pred1, pred2, fwd_col, oos_gap, nw_lags,
 
 
 def run_ew_biv_leveraged_rolmu(panel, pred1, pred2, fwd_col, oos_gap, nw_lags,
-                              rolling_window=500, t_thresh=T_THRESH):
+                              rolling_window=500, t_thresh=None):
+    if t_thresh is None:
+        t_thresh = T_THRESH
     tag = (f"pos_EW_rolmu_leveraged_{pred1}_{pred2}_{fwd_col}"
            f"_t{int(t_thresh*100)}_rw{rolling_window}_oos{OOS_START}.parquet")
     cache = CACHE_DIR / tag
@@ -648,11 +629,23 @@ def _report(pos, daily_ret, label, bah_sim):
     return sim
 
 
-def main():
+def main(t_threshold=None):
+    """Run all leveraged-strategy simulations/plots.
+
+    `t_threshold` overrides the |t|-stat gate used by every simulation (default
+    T_THRESH = 1.65). It rebinds the module-level T_THRESH so plot titles and the
+    per-strategy cache keys reflect the chosen value; cache files encode the
+    threshold, so different thresholds never collide.
+    """
+    if t_threshold is not None:
+        global T_THRESH
+        T_THRESH = t_threshold
+
     print("=" * 72)
     print("  Leveraged (Leveraged) Strategies")
     print("  VVIX MA5 / VVIX MA10 / VRP / VRP+VVIX MA5 / VRP+VVIX MA10 /")
     print("  VRP+Term Slope / VRP+Open Interest  x  sym / asym / rolmu")
+    print(f"  |t| gate threshold = {T_THRESH:.2f}")
     print("=" * 72)
 
     print("\n[1] Loading data...")
@@ -708,236 +701,74 @@ def main():
     for d in (out_vvix, out_ma10, out_vrp, out_biv, out_biv10, out_term, out_oi):
         d.mkdir(parents=True, exist_ok=True)
 
-    # ── A: VVIX MA5 symmetric ────────────────────────────────────────────────
-    print("\nVVIX MA5 leveraged symmetric...")
-    pos = run_ew_leveraged_sym(panel, "vvix_ma5", FWD, OOS_GAP, NW_LAGS)
-    pos = pos.copy(); pos[pos.index < VVIX_ACT] = 0.0
-    sim = _report(pos, daily_ret, "ub_sym_VVIX", bah_sim)
-    plot_leveraged_univariate(
-        "VVIX MA5", "20-day", "sym", C_VVIX,
-        sim, betas_vvix, bah_sim, yh_vvix, mu_20d,
-        out_vvix / "leveraged_symmetric_VVIX_MA5.png",
-        extra_title="\nFlat before VVIX activation (2006-03-06)",
-    )
+    # ── Strategy specs: (threshold_type, filename prefix, run_fn) ──
+    # All three thresholds share one skeleton: run → (VVIX flat-mask) → report → plot.
+    uni_strats = [
+        ("sym",   "symmetric",         run_ew_leveraged_sym),
+        ("asym",  "asymmetric",        run_ew_leveraged_asym),
+        ("rolmu", "base_return_shift", run_ew_leveraged_rolmu),
+    ]
+    biv_strats = [
+        ("sym",   "symmetric",         run_ew_biv_leveraged_sym),
+        ("asym",  "asymmetric",        run_ew_biv_leveraged_asym),
+        ("rolmu", "base_return_shift", run_ew_biv_leveraged_rolmu),
+    ]
 
-    # ── B: VVIX MA5 asymmetric ───────────────────────────────────────────────
-    print("\nVVIX MA5 leveraged asymmetric...")
-    pos = run_ew_leveraged_asym(panel, "vvix_ma5", FWD, OOS_GAP, NW_LAGS)
-    pos = pos.copy(); pos[pos.index < VVIX_ACT] = 0.0
-    sim_vvix_asym = _report(pos, daily_ret, "ub_asym_VVIX", bah_sim)
-    plot_leveraged_univariate(
-        "VVIX MA5", "20-day", "asym", C_VVIX,
-        sim_vvix_asym, betas_vvix, bah_sim, yh_vvix, mu_20d,
-        out_vvix / "leveraged_asymmetric_VVIX_MA5.png",
-        extra_title="\nFlat before VVIX activation (2006-03-06)",
-    )
+    sims = {}   # (model label, threshold_type) → simulated DataFrame
 
-    # ── MA5-rolmu: VVIX MA5 base_return_shift ────────────────────────────────
-    print("\nVVIX MA5 leveraged base_return_shift...")
-    pos = run_ew_leveraged_rolmu(panel, "vvix_ma5", FWD, OOS_GAP, NW_LAGS)
-    pos = pos.copy(); pos[pos.index < VVIX_ACT] = 0.0
-    sim = _report(pos, daily_ret, "ub_rolmu_VVIX_MA5", bah_sim)
-    plot_leveraged_univariate(
-        "VVIX MA5", "20-day", "rolmu", C_VVIX,
-        sim, betas_vvix, bah_sim, yh_vvix, mu_20d,
-        out_vvix / "leveraged_base_return_shift_VVIX_MA5.png",
-        extra_title="\nFlat before VVIX activation (2006-03-06)",
-    )
+    # ── Univariate models: (label, column, betas, y_hat, color, out_dir, flat) ──
+    # `flat` masks positions before VVIX activation (2006-03-06).
+    uni_models = [
+        ("VVIX MA5",  "vvix_ma5",  betas_vvix, yh_vvix, C_VVIX, out_vvix, True),
+        ("VVIX MA10", "vvix_ma10", betas_ma10, yh_ma10, C_MA10, out_ma10, True),
+        ("VRP",       "VP",        betas_vrp,  yh_vrp,  C_VRP,  out_vrp,  False),
+    ]
+    for label, col, betas, yhat, color, out_dir, flat in uni_models:
+        for thr, prefix, run_fn in uni_strats:
+            print(f"\n{label} leveraged {prefix}...")
+            pos   = run_fn(panel, col, FWD, OOS_GAP, NW_LAGS)
+            extra = ""
+            if flat:
+                pos = pos.copy(); pos[pos.index < VVIX_ACT] = 0.0
+                extra = "\nFlat before VVIX activation (2006-03-06)"
+            sim = _report(pos, daily_ret, f"ub_{thr}_{label.replace(' ', '_')}", bah_sim)
+            sims[(label, thr)] = sim
+            plot_leveraged_univariate(
+                label, "20-day", thr, color,
+                sim, betas, bah_sim, yhat, mu_20d,
+                out_dir / f"leveraged_{prefix}_{label.replace(' ', '_')}.png",
+                extra_title=extra,
+            )
 
-    # ── R: VVIX MA10 symmetric ───────────────────────────────────────────────
-    print("\nVVIX MA10 leveraged symmetric...")
-    pos = run_ew_leveraged_sym(panel, "vvix_ma10", FWD, OOS_GAP, NW_LAGS)
-    pos = pos.copy(); pos[pos.index < VVIX_ACT] = 0.0
-    sim = _report(pos, daily_ret, "ub_sym_VVIX_MA10", bah_sim)
-    plot_leveraged_univariate(
-        "VVIX MA10", "20-day", "sym", C_MA10,
-        sim, betas_ma10, bah_sim, yh_ma10, mu_20d,
-        out_ma10 / "leveraged_symmetric_VVIX_MA10.png",
-        extra_title="\nFlat before VVIX activation (2006-03-06)",
-    )
-
-    # ── S: VVIX MA10 asymmetric ──────────────────────────────────────────────
-    print("\nVVIX MA10 leveraged asymmetric...")
-    pos = run_ew_leveraged_asym(panel, "vvix_ma10", FWD, OOS_GAP, NW_LAGS)
-    pos = pos.copy(); pos[pos.index < VVIX_ACT] = 0.0
-    sim_ma10_asym = _report(pos, daily_ret, "ub_asym_VVIX_MA10", bah_sim)
-    plot_leveraged_univariate(
-        "VVIX MA10", "20-day", "asym", C_MA10,
-        sim_ma10_asym, betas_ma10, bah_sim, yh_ma10, mu_20d,
-        out_ma10 / "leveraged_asymmetric_VVIX_MA10.png",
-        extra_title="\nFlat before VVIX activation (2006-03-06)",
-    )
-
-    # ── T: VVIX MA10 base_return_shift ───────────────────────────────────────
-    print("\nVVIX MA10 leveraged base_return_shift...")
-    pos = run_ew_leveraged_rolmu(panel, "vvix_ma10", FWD, OOS_GAP, NW_LAGS)
-    pos = pos.copy(); pos[pos.index < VVIX_ACT] = 0.0
-    sim = _report(pos, daily_ret, "ub_rolmu_VVIX_MA10", bah_sim)
-    plot_leveraged_univariate(
-        "VVIX MA10", "20-day", "rolmu", C_MA10,
-        sim, betas_ma10, bah_sim, yh_ma10, mu_20d,
-        out_ma10 / "leveraged_base_return_shift_VVIX_MA10.png",
-        extra_title="\nFlat before VVIX activation (2006-03-06)",
-    )
-
-    # ── C: VRP symmetric ─────────────────────────────────────────────────────
-    print("\nVRP leveraged symmetric...")
-    pos = run_ew_leveraged_sym(panel, "VP", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_sym_VRP", bah_sim)
-    plot_leveraged_univariate(
-        "VRP", "20-day", "sym", C_VRP,
-        sim, betas_vrp, bah_sim, yh_vrp, mu_20d,
-        out_vrp / "leveraged_symmetric_VRP.png",
-    )
-
-    # ── D: VRP asymmetric ────────────────────────────────────────────────────
-    print("\nVRP leveraged asymmetric...")
-    pos = run_ew_leveraged_asym(panel, "VP", FWD, OOS_GAP, NW_LAGS)
-    sim_vrp_asym = _report(pos, daily_ret, "ub_asym_VRP", bah_sim)
-    plot_leveraged_univariate(
-        "VRP", "20-day", "asym", C_VRP,
-        sim_vrp_asym, betas_vrp, bah_sim, yh_vrp, mu_20d,
-        out_vrp / "leveraged_asymmetric_VRP.png",
-    )
-
-    # ── E: VRP base_return_shift ─────────────────────────────────────────────
-    print("\nVRP leveraged base_return_shift...")
-    pos = run_ew_leveraged_rolmu(panel, "VP", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_rolmu_VRP", bah_sim)
-    plot_leveraged_univariate(
-        "VRP", "20-day", "rolmu", C_VRP,
-        sim, betas_vrp, bah_sim, yh_vrp, mu_20d,
-        out_vrp / "leveraged_base_return_shift_VRP.png",
-    )
-
-    # ── F: VRP+VVIX MA5 bivariate symmetric ──────────────────────────────────
-    print("\nVRP+VVIX MA5 leveraged symmetric...")
-    pos = run_ew_biv_leveraged_sym(panel, "VP", "vvix_ma5", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_sym_biv", bah_sim)
-    plot_leveraged_bivariate(
-        "VRP", "VVIX MA5", "20-day", "sym", C_BIV,
-        sim, betas_biv, bah_sim, yh_biv, mu_20d,
-        out_biv / "leveraged_symmetric_VRP_+_VVIX_MA5.png",
-    )
-
-    # ── G: VRP+VVIX MA5 bivariate asymmetric ─────────────────────────────────
-    print("\nVRP+VVIX MA5 leveraged asymmetric...")
-    pos = run_ew_biv_leveraged_asym(panel, "VP", "vvix_ma5", FWD, OOS_GAP, NW_LAGS)
-    sim_biv_asym = _report(pos, daily_ret, "ub_asym_biv", bah_sim)
-    plot_leveraged_bivariate(
-        "VRP", "VVIX MA5", "20-day", "asym", C_BIV,
-        sim_biv_asym, betas_biv, bah_sim, yh_biv, mu_20d,
-        out_biv / "leveraged_asymmetric_VRP_+_VVIX_MA5.png",
-    )
-
-    # ── H: VRP+VVIX MA5 bivariate base_return_shift ───────────────────────────
-    print("\nVRP+VVIX MA5 leveraged base_return_shift...")
-    pos = run_ew_biv_leveraged_rolmu(panel, "VP", "vvix_ma5", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_rolmu_biv", bah_sim)
-    plot_leveraged_bivariate(
-        "VRP", "VVIX MA5", "20-day", "rolmu", C_BIV,
-        sim, betas_biv, bah_sim, yh_biv, mu_20d,
-        out_biv / "leveraged_base_return_shift_VRP_+_VVIX_MA5.png",
-    )
-
-    # ── U: VRP+VVIX MA10 bivariate symmetric ─────────────────────────────────
-    print("\nVRP+VVIX MA10 leveraged symmetric...")
-    pos = run_ew_biv_leveraged_sym(panel, "VP", "vvix_ma10", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_sym_biv10", bah_sim)
-    plot_leveraged_bivariate(
-        "VRP", "VVIX MA10", "20-day", "sym", C_BIV10,
-        sim, betas_biv10, bah_sim, yh_biv10, mu_20d,
-        out_biv10 / "leveraged_symmetric_VRP_+_VVIX_MA10.png",
-    )
-
-    # ── V: VRP+VVIX MA10 bivariate asymmetric ────────────────────────────────
-    print("\nVRP+VVIX MA10 leveraged asymmetric...")
-    pos = run_ew_biv_leveraged_asym(panel, "VP", "vvix_ma10", FWD, OOS_GAP, NW_LAGS)
-    sim_biv10_asym = _report(pos, daily_ret, "ub_asym_biv10", bah_sim)
-    plot_leveraged_bivariate(
-        "VRP", "VVIX MA10", "20-day", "asym", C_BIV10,
-        sim_biv10_asym, betas_biv10, bah_sim, yh_biv10, mu_20d,
-        out_biv10 / "leveraged_asymmetric_VRP_+_VVIX_MA10.png",
-    )
-
-    # ── W: VRP+VVIX MA10 bivariate base_return_shift ─────────────────────────
-    print("\nVRP+VVIX MA10 leveraged base_return_shift...")
-    pos = run_ew_biv_leveraged_rolmu(panel, "VP", "vvix_ma10", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_rolmu_biv10", bah_sim)
-    plot_leveraged_bivariate(
-        "VRP", "VVIX MA10", "20-day", "rolmu", C_BIV10,
-        sim, betas_biv10, bah_sim, yh_biv10, mu_20d,
-        out_biv10 / "leveraged_base_return_shift_VRP_+_VVIX_MA10.png",
-    )
-
-    # ── I: VRP+Term Slope bivariate symmetric ────────────────────────────────
-    print("\nVRP+Term Slope leveraged symmetric...")
-    pos = run_ew_biv_leveraged_sym(panel, "VP", "term_slope", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_sym_term", bah_sim)
-    plot_leveraged_bivariate(
-        "VRP", "Term Slope", "20-day", "sym", C_TERM,
-        sim, betas_term, bah_sim, yh_term, mu_20d,
-        out_term / "leveraged_symmetric_VRP_+_Term_Slope.png",
-    )
-
-    # ── J: VRP+Term Slope bivariate asymmetric ───────────────────────────────
-    print("\nVRP+Term Slope leveraged asymmetric...")
-    pos = run_ew_biv_leveraged_asym(panel, "VP", "term_slope", FWD, OOS_GAP, NW_LAGS)
-    sim_term_asym = _report(pos, daily_ret, "ub_asym_term", bah_sim)
-    plot_leveraged_bivariate(
-        "VRP", "Term Slope", "20-day", "asym", C_TERM,
-        sim_term_asym, betas_term, bah_sim, yh_term, mu_20d,
-        out_term / "leveraged_asymmetric_VRP_+_Term_Slope.png",
-    )
-
-    # ── K: VRP+Term Slope bivariate base_return_shift ────────────────────────
-    print("\nVRP+Term Slope leveraged base_return_shift...")
-    pos = run_ew_biv_leveraged_rolmu(panel, "VP", "term_slope", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_rolmu_term", bah_sim)
-    plot_leveraged_bivariate(
-        "VRP", "Term Slope", "20-day", "rolmu", C_TERM,
-        sim, betas_term, bah_sim, yh_term, mu_20d,
-        out_term / "leveraged_base_return_shift_VRP_+_Term_Slope.png",
-    )
-
-    # ── L: VRP+Open Interest bivariate symmetric ──────────────────────────────
-    print("\nVRP+Open Interest leveraged symmetric...")
-    pos = run_ew_biv_leveraged_sym(panel, "VP", "open_interest", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_sym_oi", bah_sim)
-    plot_leveraged_bivariate(
-        "VRP", "Open Interest", "20-day", "sym", C_OI,
-        sim, betas_oi, bah_sim, yh_oi, mu_20d,
-        out_oi / "leveraged_symmetric_VRP_+_Open_Interest.png",
-    )
-
-    # ── M: VRP+Open Interest bivariate asymmetric ─────────────────────────────
-    print("\nVRP+Open Interest leveraged asymmetric...")
-    pos = run_ew_biv_leveraged_asym(panel, "VP", "open_interest", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_asym_oi", bah_sim)
-    plot_leveraged_bivariate(
-        "VRP", "Open Interest", "20-day", "asym", C_OI,
-        sim, betas_oi, bah_sim, yh_oi, mu_20d,
-        out_oi / "leveraged_asymmetric_VRP_+_Open_Interest.png",
-    )
-
-    # ── N: VRP+Open Interest bivariate base_return_shift ─────────────────────
-    print("\nVRP+Open Interest leveraged base_return_shift...")
-    pos = run_ew_biv_leveraged_rolmu(panel, "VP", "open_interest", FWD, OOS_GAP, NW_LAGS)
-    sim = _report(pos, daily_ret, "ub_rolmu_oi", bah_sim)
-    plot_leveraged_bivariate(
-        "VRP", "Open Interest", "20-day", "rolmu", C_OI,
-        sim, betas_oi, bah_sim, yh_oi, mu_20d,
-        out_oi / "leveraged_base_return_shift_VRP_+_Open_Interest.png",
-    )
+    # ── Bivariate models: (label2, column2, betas, y_hat, color, out_dir) ──
+    biv_models = [
+        ("VVIX MA5",      "vvix_ma5",      betas_biv,   yh_biv,   C_BIV,   out_biv),
+        ("VVIX MA10",     "vvix_ma10",     betas_biv10, yh_biv10, C_BIV10, out_biv10),
+        ("Term Slope",    "term_slope",    betas_term,  yh_term,  C_TERM,  out_term),
+        ("Open Interest", "open_interest", betas_oi,    yh_oi,    C_OI,    out_oi),
+    ]
+    for label2, col2, betas, yhat, color, out_dir in biv_models:
+        for thr, prefix, run_fn in biv_strats:
+            print(f"\nVRP+{label2} leveraged {prefix}...")
+            pos = run_fn(panel, "VP", col2, FWD, OOS_GAP, NW_LAGS)
+            sim = _report(pos, daily_ret, f"ub_{thr}_VRP_{col2}", bah_sim)
+            sims[(f"VRP + {label2}", thr)] = sim
+            fname = f"leveraged_{prefix}_VRP_+_{label2.replace(' ', '_')}.png"
+            plot_leveraged_bivariate(
+                "VRP", label2, "20-day", thr, color,
+                sim, betas, bah_sim, yhat, mu_20d,
+                out_dir / fname,
+            )
 
     # ── Comparison: leveraged-asymmetric VVIX MA5/MA10 vs VRP+VVIX MA5/MA10 ────
     print("\nLeveraged asymmetric VVIX MA5/MA10 vs VRP+VVIX MA5/MA10...")
     out_cmp = OUTPUT / "expanding_window" / "comparisons"
     plot_leveraged_asymmetric_comparison(
-        sim_vvix_asym, sim_biv_asym, sim_term_asym, bah_sim,
+        sims[("VVIX MA5", "asym")], sims[("VRP + VVIX MA5", "asym")],
+        sims[("VRP + Term Slope", "asym")], bah_sim,
         out_cmp / "leveraged_asymmetric_vvix_vs_vrp_vvix.png",
-        sim_ma10=sim_ma10_asym,
-        sim_biv10=sim_biv10_asym,
+        sim_ma10=sims[("VVIX MA10", "asym")],
+        sim_biv10=sims[("VRP + VVIX MA10", "asym")],
     )
 
     print("\nDone.")
@@ -945,4 +776,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Leveraged multi-level position-sizing strategy evaluation.")
+    parser.add_argument(
+        "--t", type=float, default=None, metavar="T",
+        help=f"|t|-stat gate threshold applied to every simulation "
+             f"(default: {T_THRESH:.2f}).")
+    args = parser.parse_args()
+    main(t_threshold=args.t)

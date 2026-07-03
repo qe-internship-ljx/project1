@@ -5,6 +5,21 @@ Port of the `experiment2 - Return Regression` timing pipeline to the
 the dependent return series is the **Euro Stoxx 50 future** (curve group
 `FX`). Signal mapping vs the US pipeline:
 
+## Purpose
+
+An out-of-sample **robustness test across markets**. Experiment2's US results
+could in principle reflect S&P-specific structure or data-mining over one
+market's history; if the underlying economic mechanism is real — a variance
+risk premium that compensates investors for bearing volatility risk and
+therefore forecasts returns — it should also appear in an independently
+priced market. This experiment rebuilds the *entire* signal set from European
+instruments (V2X, VSTOXX futures, VV2TX, Euro Stoxx 50), including
+recomputing the VRP from scratch with the same HAR production loop, and runs
+the identical regression/backtest engine. Agreement with the US results
+supports the economic interpretation; divergence localises which signals are
+market-specific. It also exists as the home of `cross_market.py`, the
+market-agnostic driver that makes such ports one-adapter-file cheap.
+
 | US (experiment2) | Euro equivalent |
 |---|---|
 | ES front-month return | Euro Stoxx 50 front-month return |
@@ -24,7 +39,7 @@ by `experiment3 - Nasdaq`.
 
 | File | Role |
 |---|---|
-| `cross_market.py` | **Shared driver (used by Euro and Nasdaq).** `load_front_month(curve_group)` builds the continuous front-month equity-future series (nearest-expiry contract per date, price level rebuilt from cumulated returns rebased to 1000) for any curve group ("FX" Euro Stoxx, "NN" NQ). `_redirect(out_root, cache_dir)` repoints the experiment2 modules' `OUTPUT`/`CACHE_DIR` globals at the calling market's folders (so US caches are never touched — cache tags are keyed by predictor name only and would collide across markets). `run_univariate` / `run_bivariate` run one model through all 3 base variants × 4 deltas + all 3 leveraged variants and plot. `run_all(panel, out_root, cache_dir, vv_label)` is the pipeline entry: buy-and-hold benchmark, then VRP, vol-of-vol, VRP+Term Slope, VRP+vol-of-vol, and the leveraged-asymmetric comparison figure |
+| `cross_market.py` | **Shared driver (used by Euro and Nasdaq).** `load_front_month(curve_group)` builds the continuous front-month equity-future series (nearest-expiry contract per date, price level rebuilt from cumulated returns rebased to 1000) for any curve group ("FX" Euro Stoxx, "NN" NQ). `_redirect(out_root, cache_dir)` repoints the experiment2 modules' `OUTPUT`/`CACHE_DIR` globals at the calling market's folders (so US caches are never touched — cache tags are keyed by predictor name only and would collide across markets). `run_univariate` / `run_bivariate` run one model through all 3 base variants × 4 deltas + all 3 leveraged variants and plot. `run_all(panel, out_root, cache_dir, vv_label)` is the pipeline entry: buy-and-hold benchmark, then VRP, vol-of-vol, VRP+Term Slope, VRP+vol-of-vol |
 | `euro_experiment.py` | **Euro adapter + entry point.** Loaders: `load_v2x_spot()`, `load_vstoxx_futures()` (with `ttm_years`), `load_vv2tx()`. Euro VRP: `run_euro_vrp_summary()` reuses `experiment1`'s `production_loop` + `plot_combined_vrp_summary` on a Euro panel (`build_euro_vrp_panel`) to produce the experiment1-style CSV/summary plot, and **returns the loop output, whose `VP/CV/IVar` columns feed the trading panel directly** — one code path for both. `compute_vstoxx_term_slope()` mirrors the FH daily cross-sectional slope on VSTOXX futures. `__main__` assembles the panel via experiment2's `build_master_panel` and calls `cross_market.run_all` |
 | `output/` | Euro artifacts (see below) |
 
@@ -48,10 +63,9 @@ output/
 ├── vrp_experiment_summary_rolling.png     experiment1-style 4-panel VRP summary
 ├── regression_cache/                      betas/positions parquet cache (git-ignored)
 └── plots/
-    ├── VRP/ · VV2TX MA5/ · VRP + Term Slope/ · VRP + VV2TX MA5/
-    │     6 PNGs per model: {symmetric,asymmetric,base_return_shift}_<model>.png
-    │     + leveraged_{...}_<model>.png
-    └── comparisons/leveraged_asymmetric_comparison.png
+    └── VRP/ · VV2TX MA5/ · VRP + Term Slope/ · VRP + VV2TX MA5/
+          6 PNGs per model: {symmetric,asymmetric,base_return_shift}_<model>.png
+          + leveraged_{...}_<model>.png
 ```
 
 ## How to run

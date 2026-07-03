@@ -13,6 +13,25 @@ signals extracted from volatility markets. Two coupled stages:
    "leveraged" — each under three threshold modes. Every strategy is
    simulated net of transaction costs and compared with buy-and-hold.
 
+## Purpose
+
+This is the **central experiment of the project** — it tests the core
+hypothesis that signals from the options-implied volatility complex (above
+all the VRP from experiment1) carry *economically exploitable* information
+about future equity index returns. The literature (e.g. Bekaert & Hoerova)
+establishes that the VRP predicts returns *statistically*, in full-sample
+regressions; this experiment asks the harder practical questions: would an
+investor who only knew what was knowable at each point in time (expanding
+regressions, strict 20-day gap, out-of-sample from 2012) have detected the
+predictability, and would trading on it have beaten buy-and-hold **after
+transaction costs**? The t-gate operationalises the first question — the
+strategy only takes risk once the coefficient is significant *in real time*
+— and the strategy grid (signal combinations × threshold modes × position
+sizing) maps out where the predictability is robust versus fragile. The
+comparison across signals (VRP vs VVIX vs term slope vs open interest, alone
+and combined) also identifies *which* part of the vol complex does the
+predicting.
+
 ## Signals
 
 | Panel column | Signal | Source |
@@ -53,7 +72,7 @@ trade count.
 | `helpers.py` | **Shared library (no main).** Data loaders (`load_vrp_series`, `load_vrp_series_expanding`, `load_es_front_month`, `load_es_open_interest`, `load_vvix`, `load_vix_spot`, `load_vix_basis`, `load_vix_futures_term_structure`), signal builders (`compute_vvix_ma5/ma10`, `compute_trend_quotient`), `build_master_panel`, `simulate_strategy`, `compute_performance_stats`, `compute_buy_and_hold`. Also imported by both `experiment3` ports |
 | `regressions.py` | Panel builder `build_panel` (all predictors) + expanding-window engines `compute_betas` / `compute_betas_bivariate` / `compute_betas_trivariate`, ŷ helpers, `in_sample_r2`, `oos_cumulative_r2`, rolling-µ helper, shared constants (`OOS_START`, `OOS_GAP`, `NW_LAGS`, `MIN_WIN`, `RW`). Its `main()` pre-computes every beta cache and prints an R² summary |
 | `base_strategies.py` | Unit-position strategies (`run_ew*`, `run_ew_asym*`, `run_ew_rolmu*`) and the canonical multi-panel plot helpers; `main()` renders all base plots. `--t` flag overrides the t-gate |
-| `leveraged_strategies.py` | Multi-level position strategies (`run_ew_leveraged_*`, `run_ew_biv_leveraged_*`) and their 4-panel figures; `main()` renders all leveraged plots + the comparison figure. `--t` supported |
+| `leveraged_strategies.py` | Multi-level position strategies (`run_ew_leveraged_*`, `run_ew_biv_leveraged_*`) and their 4-panel figures; `main()` renders all leveraged plots. `--t` supported |
 | `plot.py` | One-shot orchestrator: `base_strategies.main()` + `leveraged_strategies.main()` + the Sharpe summary table + the VRP-vs-VVIX scatter |
 
 Import order: `helpers → regressions → base_strategies →
@@ -70,7 +89,6 @@ output/
     │   · VRP + Term Slope/ · VRP + Open Interest/
     │       6 PNGs per model: {symmetric,asymmetric,base_return_shift}_<model>.png
     │       + leveraged_{symmetric,asymmetric,base_return_shift}_<model>.png
-    ├── comparisons/leveraged_asymmetric_vvix_vs_vrp_vvix.png
     ├── sharpe_table_extended.png       (7 models × 6 strategy variants)
     └── scatter_vrp_vs_vvix_ma5.png
 ```
@@ -92,7 +110,7 @@ the rolling-µ window).
 cd "experiment2 - Return Regression"
 python regressions.py           # 1. pre-warm the beta caches (slow, expanding OLS)
 python base_strategies.py       # 2. base strategy plots        [--t 1.28 to change gate]
-python leveraged_strategies.py  # 3. leveraged plots + comparison
+python leveraged_strategies.py  # 3. leveraged plots
 python plot.py                  # or: 2+3+Sharpe table+scatter in one shot
 ```
 

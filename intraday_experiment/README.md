@@ -9,6 +9,22 @@ HAR-RV machinery, so the results quantify the R² penalty of the daily proxy.
 Intraday data availability starts **2016-01-04** (vs the 1990s for the daily
 baselines), so samples are shorter.
 
+## Purpose
+
+A **measurement-robustness check** on the whole project's foundation. The
+VRP is defined as implied variance minus a *forecast of realized variance*,
+so everything downstream depends on how well realized variance is measured —
+and the daily squared-return proxy used by the baselines (forced on the long
+1990s samples, where no intraday data exist) is known to be a very noisy
+estimator. Bekaert & Hoerova's original results use 5-minute RV; the
+replications substitute the daily proxy. This experiment asks what that
+substitution costs: with genuine 5-minute RV (available from 2016), how much
+does HAR forecast accuracy improve, and does the resulting VRP tell the same
+story as the daily-proxy VRP over the overlapping period? If the two agree,
+the long-history daily-proxy VRP that experiments 1–3 rely on is a defensible
+stand-in; the measured R² gap also quantifies the noise ceiling the daily
+pipelines operate under.
+
 RV construction (`load_intraday_rv`): per date, keep only the front-month
 (nearest-expiry) ES contract's 5-minute bins with a CLOSE price; compute
 within-day log returns (`×100`); daily RV = Σ(log_ret²). The first bin of

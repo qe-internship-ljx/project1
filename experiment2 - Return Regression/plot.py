@@ -38,7 +38,6 @@ Generated outputs
   output/plots/VRP + VVIX MA10/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_VVIX_MA10.png
   output/plots/VRP + Term Slope/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_Term_Slope.png
   output/plots/VRP + Open Interest/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_Open_Interest.png
-  output/plots/comparisons/leveraged_asymmetric_vvix_vs_vrp_vvix.png
 
   === Summary table ===
   output/plots/sharpe_table_extended.png   (7 models x 6 strategies)

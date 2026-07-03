@@ -304,79 +304,6 @@ def run_ew_biv_leveraged_rolmu(panel, pred1, pred2, fwd_col, oos_gap, nw_lags,
                           rolling_window=rolling_window)
 
 
-def plot_leveraged_asymmetric_comparison(sim_vvix, sim_biv, sim_term, bah_sim, out_path,
-                                        sim_ma10=None, sim_biv10=None):
-    """One-panel comparison: leveraged-asymmetric VVIX MA5/MA10 vs VRP+VVIX MA5/MA10 vs VRP+Term Slope."""
-    oos_dt = pd.Timestamp(OOS_START)
-
-    def _first_active(sim):
-        pos = sim["position"][sim.index >= oos_dt]
-        active = pos[pos != 0]
-        return active.index.min() if len(active) else None
-
-    # (sim, colour, linestyle, legend name) in draw/legend order.
-    series = [
-        (sim_vvix, C_VVIX, "-",  "VVIX MA5 (Leveraged Asym)"),
-        (sim_biv,  C_BIV,  "--", "VRP + VVIX MA5 (Leveraged Asym)"),
-        (sim_term, C_TERM, "-.", "VRP + Term Slope (Leveraged Asym)"),
-    ]
-    if sim_ma10 is not None:
-        series.append((sim_ma10, C_MA10, ":", "VVIX MA10 (Leveraged Asym)"))
-    if sim_biv10 is not None:
-        series.append((sim_biv10, C_BIV10, (0, (5, 1)), "VRP + VVIX MA10 (Leveraged Asym)"))
-
-    strategy_sims = [sim for sim, *_ in series]
-    candidates = [d for d in (_first_active(s) for s in strategy_sims)
-                  if d is not None]
-    start = max(candidates) if candidates else oos_dt
-    start_str = start.strftime("%Y-%m-%d")
-    e_dt = max(s.index[-1] for s in strategy_sims)
-
-    fig, ax = plt.subplots(figsize=(14, 7))
-    fig.suptitle(
-        f"Leveraged Asymmetric: VVIX MA5 / MA10  vs  VRP + VVIX MA5 / MA10  vs  VRP + Term Slope  ·  Expanding Window\n"
-        f"Rebased to 1.0 at {start_str} (latest first activation)  ·  |t| > {T_THRESH:.2f} gate  ·  "
-        f"Levels ±1..4 at |excess| ≥ 0.2/0.5/0.75/1.0%  ·  0.05% slippage",
-        fontsize=10,
-    )
-
-    bah_cum = (1 + bah_sim["net_pnl"][bah_sim.index >= start]).cumprod()
-    bah_st  = compute_performance_stats(bah_sim[bah_sim.index >= start], "BaH")
-    ax.plot(bah_cum.index, bah_cum.values,
-            color=BAH_COLOR, lw=1.8, ls="-.", alpha=0.65,
-            label=f"Buy-and-Hold  {perf_label(bah_st)}")
-
-    for sim, color, ls, name in series:
-        cum = (1 + sim["net_pnl"][sim.index >= start]).cumprod()
-        st  = compute_performance_stats(sim[sim.index >= start], name)
-        p   = sim["position"][sim.index >= start]
-        pL, pS = float((p > 0).mean() * 100), float((p < 0).mean() * 100)
-        avg    = float(p.mean())
-        ax.plot(cum.index, cum.values, color=color, lw=2.2, ls=ls, alpha=0.92,
-                label=(f"{name}  "
-                       f"{perf_label(st, f'L{pL:.0f}%/S{pS:.0f}%  AvgPos={avg:+.2f}')}"))
-
-    for a_dt, b_dt in [("2020-02-01", "2020-06-01"), ("2022-01-01", "2022-12-31")]:
-        ax.axvspan(pd.Timestamp(a_dt), pd.Timestamp(b_dt), alpha=0.07, color="grey", lw=0)
-
-    ax.axhline(1, color="black", lw=0.5, ls=":")
-    ax.set_yscale("log")
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}x"))
-    ax.set_ylabel("Cumulative Net Return (log, rebased to 1.0)", fontsize=10)
-    ax.set_xlim(start, e_dt)
-    ax.legend(fontsize=8.5, loc="upper left", framealpha=0.92, edgecolor="#cccccc")
-    ax.xaxis.set_major_locator(mdates.YearLocator(1))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    plt.setp(ax.get_xticklabels(), visible=True, fontsize=9)
-    ax.grid(axis="y", alpha=0.2, lw=0.6)
-    ax.spines[["top", "right"]].set_visible(False)
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=155, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {out_path.name}")
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Full-figure plot functions
 # ═══════════════════════════════════════════════════════════════════════════
@@ -558,17 +485,6 @@ def main(t_threshold=None):
                 sim, betas, bah_sim, yhat, mu_20d,
                 out_dir / fname,
             )
-
-    # ── Comparison: leveraged-asymmetric VVIX MA5/MA10 vs VRP+VVIX MA5/MA10 ────
-    print("\nLeveraged asymmetric VVIX MA5/MA10 vs VRP+VVIX MA5/MA10...")
-    out_cmp = OUTPUT / "plots" / "comparisons"
-    plot_leveraged_asymmetric_comparison(
-        sims[("VVIX MA5", "asym")], sims[("VRP + VVIX MA5", "asym")],
-        sims[("VRP + Term Slope", "asym")], bah_sim,
-        out_cmp / "leveraged_asymmetric_vvix_vs_vrp_vvix.png",
-        sim_ma10=sims[("VVIX MA10", "asym")],
-        sim_biv10=sims[("VRP + VVIX MA10", "asym")],
-    )
 
     print("\nDone.")
     print("=" * 72)

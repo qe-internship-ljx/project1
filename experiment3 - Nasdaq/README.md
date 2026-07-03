@@ -4,6 +4,20 @@ Port of the `experiment2 - Return Regression` timing pipeline to the
 **NASDAQ-100 E-mini (NQ) future** (curve group `NN`). Unlike the Euro port,
 all signals stay **US-based** — only the dependent return series changes:
 
+## Purpose
+
+A robustness test that isolates the **traded index** while holding the
+signals fixed. The VIX complex is defined on S&P 500 options, so
+experiment2's result could be an SPX-specific effect; if instead the VRP and
+its companions proxy for a *broad* equity risk premium, they should also time
+a closely related but distinct index. Swapping only the dependent return
+series to the NASDAQ-100 (higher beta, tech-concentrated, but strongly
+correlated with the S&P) tests exactly that: predictability that survives the
+swap points to a market-wide risk-compensation mechanism rather than an
+artifact of regressing SPX-derived signals on SPX returns. Together with the
+Euro port (which changes *both* signals and index), this brackets how far the
+experiment2 result generalises.
+
 | Input | Source |
 |---|---|
 | Dependent return `fwd_20d` / `daily_ret` | NQ front-month (loaded here) |
@@ -30,10 +44,9 @@ directory).
 output/
 ├── regression_cache/                 betas/positions parquet cache (git-ignored)
 └── plots/
-    ├── VRP/ · VVIX MA5/ · VRP + Term Slope/ · VRP + VVIX MA5/
-    │     6 PNGs per model: {symmetric,asymmetric,base_return_shift}_<model>.png
-    │     + leveraged_{symmetric,asymmetric,base_return_shift}_<model>.png
-    └── comparisons/leveraged_asymmetric_comparison.png
+    └── VRP/ · VVIX MA5/ · VRP + Term Slope/ · VRP + VVIX MA5/
+          6 PNGs per model: {symmetric,asymmetric,base_return_shift}_<model>.png
+          + leveraged_{symmetric,asymmetric,base_return_shift}_<model>.png
 ```
 
 Models, threshold variants (δ ∈ {0.2%, 0.5%, 0.75%, 1.0%}), the |t| > 1.65

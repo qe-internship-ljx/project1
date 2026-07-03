@@ -5,6 +5,25 @@ the `bh_replication` Bekaert & Hoerova (2014) baseline with day-by-day
 re-estimated HAR forecasts. This experiment produces the VRP time series that
 `experiment2 - Return Regression` (and `experiment3 - Nasdaq`) consume.
 
+## Purpose
+
+The BH replication estimates the HAR model **once on the full sample**, so
+its fitted VRP uses information that was not available in real time — fine
+for validating the paper, unusable as a trading signal. This experiment's
+purpose is to turn the academic VRP into a **point-in-time signal**: on every
+trading day the HAR forecast is re-estimated using only data available up to
+that day (with a 22-day gap so the last training label is fully realized),
+exactly as a live system would have computed it. Along the way it answers
+three questions that determine whether the signal is trustworthy downstream:
+(1) does HAR forecast accuracy survive genuine out-of-sample, day-by-day
+re-estimation (vs a naive martingale baseline)? (2) how sensitive is the VRP
+to the estimation scheme (1000-day rolling vs expanding window) and to the
+implied-variance source (VIX² vs SPX variance swaps)? (3) are the HAR
+coefficients stable enough over time for the signal to mean the same thing
+across regimes? The resulting daily `VP` series is the organising signal of
+the whole project — every timing backtest in experiments 2 and 3 trades on
+the output of this loop.
+
 Definitions (all in monthly %² units):
 
 - **Implied variance** `IVar = VIX²/12` (full history from 1990), with a

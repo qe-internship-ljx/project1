@@ -9,8 +9,8 @@ experiment2, so the only market-specific code here is the NQ price series; the
 rest is delegated to ``cross_market`` (in "experiment3 - Euro").
 
 Models (VRP · VVIX MA5 · VRP+Term Slope · VRP+VVIX MA5), every base and
-leveraged threshold variant, and the leveraged comparison are produced by the
-shared runner.  Outputs/caches land in "experiment3 - Nasdaq"/output.
+leveraged threshold variant, are produced by the shared runner.
+Outputs/caches land in "experiment3 - Nasdaq"/output.
 """
 
 import warnings

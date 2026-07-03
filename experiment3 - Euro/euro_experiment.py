@@ -13,8 +13,8 @@ Euro inputs (the only market-specific code here):
   • VV2TX (VSTOXX-of-VSTOXX) 5-day MA               -> "vvix_ma5" column
 
 Models (VRP · VV2TX MA5 · VRP+Term Slope · VRP+VV2TX MA5), every base and
-leveraged threshold variant, and the leveraged comparison are produced by the
-shared runner.  Outputs/caches land in "experiment3 - Euro"/output.
+leveraged threshold variant, are produced by the shared runner.
+Outputs/caches land in "experiment3 - Euro"/output.
 """
 
 import warnings

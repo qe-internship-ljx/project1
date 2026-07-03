@@ -105,8 +105,7 @@ def _fname(stem, label):
 
 
 def run_univariate(panel, daily_ret, bah_sim, pred, label, out_dir, color):
-    """All base + leveraged univariate plots for one predictor. Returns the
-    leveraged-asymmetric sim (used by the cross-model comparison)."""
+    """All base + leveraged univariate plots for one predictor."""
     out_dir.mkdir(parents=True, exist_ok=True)
     pal   = PAL.get(pred, PAL["VP"])
     betas = reg.compute_betas(panel, pred, FWD, reg.OOS_GAP, reg.NW_LAGS)
@@ -122,14 +121,10 @@ def run_univariate(panel, daily_ret, bah_sim, pred, label, out_dir, color):
 
     yh = reg._yhat_univariate(panel, pred, FWD, betas)
     mu = reg._rolling_mu(panel, FWD, reg.OOS_GAP, reg.RW, predictor=pred)
-    asym_sim = None
     for t, (uni_fn, _, stem) in _LEV.items():
         sim = simulate_strategy(uni_fn(panel, pred, FWD, reg.OOS_GAP, reg.NW_LAGS), daily_ret)
         lev.plot_leveraged_univariate(label, "20-day", t, color, sim, betas, bah_sim,
                                     yh, mu, out_dir / _fname("leveraged_" + stem, label))
-        if t == "asym":
-            asym_sim = sim
-    return asym_sim
 
 
 def run_bivariate(panel, daily_ret, bah_sim, p1, p2, l1, l2, out_dir, color):
@@ -149,19 +144,15 @@ def run_bivariate(panel, daily_ret, bah_sim, p1, p2, l1, l2, out_dir, color):
 
     yh = reg._yhat_bivariate(panel, p1, p2, FWD, betas)
     mu = reg._rolling_mu(panel, FWD, reg.OOS_GAP, reg.RW, predictor=[p1, p2])
-    asym_sim = None
     for t, (_, biv_fn, stem) in _LEV.items():
         sim = simulate_strategy(biv_fn(panel, p1, p2, FWD, reg.OOS_GAP, reg.NW_LAGS), daily_ret)
         lev.plot_leveraged_bivariate(l1, l2, "20-day", t, color, sim, betas, bah_sim,
                                    yh, mu, out_dir / _fname("leveraged_" + stem, label))
-        if t == "asym":
-            asym_sim = sim
-    return asym_sim
 
 
 def run_all(panel, out_root: Path, cache_dir: Path, vv_label: str):
     """Run VRP, vol-of-vol (``vv_label``), VRP+Term Slope and VRP+vol-of-vol
-    base + leveraged strategies, plus the leveraged-asymmetric comparison.
+    base + leveraged strategies.
 
     ``vv_label`` is the display/folder name for the vol-of-vol signal carried in
     the panel's ``vvix_ma5`` column ("VVIX MA5" for NASDAQ, "VV2TX MA5" for euro).
@@ -173,17 +164,11 @@ def run_all(panel, out_root: Path, cache_dir: Path, vv_label: str):
 
     print("\n[VRP]"); run_univariate(panel, daily_ret, bah_sim, "VP", "VRP",
                                      ew / "VRP", lev.C_VRP)
-    print(f"\n[{vv_label}]"); vv_asym = run_univariate(
+    print(f"\n[{vv_label}]"); run_univariate(
         panel, daily_ret, bah_sim, "vvix_ma5", vv_label, ew / vv_label, lev.C_VVIX)
-    print("\n[VRP + Term Slope]"); term_asym = run_bivariate(
+    print("\n[VRP + Term Slope]"); run_bivariate(
         panel, daily_ret, bah_sim, "VP", "term_slope", "VRP", "Term Slope",
         ew / "VRP + Term Slope", lev.C_TERM)
-    print(f"\n[VRP + {vv_label}]"); biv_asym = run_bivariate(
+    print(f"\n[VRP + {vv_label}]"); run_bivariate(
         panel, daily_ret, bah_sim, "VP", "vvix_ma5", "VRP", vv_label,
         ew / f"VRP + {vv_label}", lev.C_BIV)
-
-    print("\n[Comparison] leveraged asymmetric")
-    cmp_dir = ew / "comparisons"; cmp_dir.mkdir(parents=True, exist_ok=True)
-    lev.plot_leveraged_asymmetric_comparison(
-        vv_asym, biv_asym, term_asym, bah_sim,
-        cmp_dir / "leveraged_asymmetric_comparison.png")

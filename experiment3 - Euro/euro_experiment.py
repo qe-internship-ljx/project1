@@ -27,41 +27,20 @@ import pandas as pd
 
 ROOT = Path(__file__).parent
 DATA = ROOT.parent / "data"
+EXP1_DIR = ROOT.parent / "experiment1 - VRP Computation"
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent / "experiment2 - Return Regression"))
+sys.path.insert(0, str(EXP1_DIR))
 
 from helpers import compute_trend_quotient, build_master_panel
 import cross_market
+import experiment as exp1          # experiment1 production loop + summary plotter
+from data_prep import compute_rv_components
 
 ROLL_VRP_WIN = 1000
 
 
 # ── Euro data loaders ─────────────────────────────────────────────────────────
-
-def load_stoxx_front_month() -> pd.DataFrame:
-    """Continuous Euro Stoxx 50 (FX futures) front-month series with a
-    returns-reconstructed price_level rebased to 1000."""
-    sec_meta = pd.read_parquet(DATA / "EquityFuture_security_meta.parquet")
-    hist     = pd.read_parquet(DATA / "EquityFuture_historical.parquet")
-
-    fx_tickers = sec_meta[sec_meta["curve_group"] == "FX"]["security"].tolist()
-    fx = hist[hist["security"].isin(fx_tickers)].copy()
-    fx["date"] = pd.to_datetime(fx["date"])
-
-    meta_fx = sec_meta[sec_meta["curve_group"] == "FX"][
-        ["security", "expiry_yearmonth"]].copy()
-    meta_fx["expiry_date"] = pd.to_datetime(meta_fx["expiry_yearmonth"], format="%Y-%m")
-    fx = fx.merge(meta_fx[["security", "expiry_date"]], on="security")
-
-    fx = fx.sort_values(["date", "expiry_date"])
-    front = (fx.groupby("date").first().reset_index()
-               [["date", "price", "returns"]].dropna(subset=["returns"]))
-    front = front.sort_values("date").set_index("date")
-
-    ret = front["returns"].dropna()
-    front = front.join(((1 + ret).cumprod() * 1000).rename("price_level"), how="left")
-    return front[["price", "price_level", "returns"]].dropna()
-
 
 def load_v2x_spot() -> pd.Series:
     df = pd.read_csv(DATA / "VolatilityIndexData.csv", parse_dates=["DATE"])
@@ -97,42 +76,51 @@ def load_vv2tx() -> pd.Series:
     return s
 
 
-def compute_euro_vrp(returns: pd.Series, v2x: pd.Series,
-                     window: int = ROLL_VRP_WIN) -> pd.DataFrame:
-    """1000-day rolling HAR production loop for Euro VRP (mirrors
-    vrp_experiment production_loop):  IVar = V2X²/12;  CV = HAR forecast of
-    forward 22-day RV from rolling OLS;  VP = IVar − CV."""
-    ivar = (v2x ** 2 / 12.0).rename("IVar")
-    r100 = (returns * 100) ** 2
-    df = pd.DataFrame({
-        "IVar":     ivar,
-        "IVar_lag": ivar.shift(1),
-        "rv22":     r100.rolling(22).sum(),
-        "rv22_lag": r100.rolling(22).sum().shift(1),
-        "rv5_lag":  r100.rolling(5).sum().shift(1),
-        "rv1_lag":  r100.shift(1),
-    }).dropna()
-    df["rv22_fwd"] = df["rv22"].shift(-22)
+def build_euro_vrp_panel(returns: pd.Series, v2x: pd.Series) -> pd.DataFrame:
+    """Assemble a panel in experiment1's exact format (V2X substituted for VIX),
+    so experiment1's production_loop / plot_combined_vrp_summary can be reused
+    verbatim.  Mirrors experiment1._build_panel_from_ivar, except that rows with
+    a missing forward target (the last 22 days) are kept: the production loop
+    never trains on them but still emits a VP forecast there, so the trading
+    panel gets VRP coverage right up to the end of the sample."""
+    ivar  = (v2x ** 2 / 12.0).rename("IVar")
+    rv    = compute_rv_components(returns)
+    panel = rv.join(ivar, how="inner").dropna()
+    panel["RV22_fwd"] = panel["RV22"].shift(-22)
+    panel["VIX2_lag"] = panel["IVar"].shift(1)   # named VIX2_lag for har_model compat
+    panel["RV22_lag"] = panel["RV22"].shift(1)
+    panel["RV5_lag"]  = panel["RV5"].shift(1)
+    panel["RV1_lag"]  = panel["RV1"].shift(1)
+    return panel.dropna(subset=["VIX2_lag", "RV22_lag", "RV5_lag", "RV1_lag"])
 
-    feats  = ["IVar_lag", "rv22_lag", "rv5_lag", "rv1_lag"]
-    N      = len(df)
-    vp_arr = np.full(N, np.nan)
-    cv_arr = np.full(N, np.nan)
-    for i in range(window + 22, N - 22):
-        train = df.iloc[i - window - 22 : i - 22].dropna(subset=["rv22_fwd"])
-        if len(train) < 100:
-            continue
-        X_tr = np.column_stack([np.ones(len(train))] + [train[f].values for f in feats])
-        try:
-            beta = np.linalg.lstsq(X_tr, train["rv22_fwd"].values, rcond=None)[0]
-        except Exception:
-            continue
-        x_i = np.array([1.0] + [float(df[f].iat[i]) for f in feats])
-        cv_arr[i] = float(x_i @ beta)
-        vp_arr[i] = float(df["IVar"].iat[i]) - cv_arr[i]
 
-    return pd.DataFrame({"VP": vp_arr, "CV": cv_arr, "IVar": df["IVar"].values},
-                        index=df.index).dropna(subset=["VP"])
+def run_euro_vrp_summary(returns: pd.Series, v2x: pd.Series,
+                         window: int = ROLL_VRP_WIN) -> pd.DataFrame:
+    """Run experiment1's rolling-window production loop on Euro inputs, save the
+    production-loop CSV, and render experiment1's combined VRP summary plot.
+    Returns the production-loop DataFrame (columns include VP/CV/IVar) so the
+    trading panel reuses the same VRP series — one code path, guaranteed
+    consistency between the summary CSV/plot and the strategy inputs."""
+    out_dir = ROOT / "output"
+    out_dir.mkdir(exist_ok=True)
+
+    panel = build_euro_vrp_panel(returns, v2x)
+    print(f"  VRP panel: {panel.index.min().date()} – {panel.index.max().date()} "
+          f"({len(panel):,} obs)")
+
+    prod_df, stats_df = exp1.production_loop(panel, window=window, return_stats=True)
+    prod_df.to_csv(out_dir / "production_loop_rolling.csv")
+    print(f"  Saved production loop -> {out_dir / 'production_loop_rolling.csv'} "
+          f"({len(prod_df):,} steps, VRP mean={prod_df['VP'].mean():.3f})")
+
+    # Point experiment1's plotter at the Euro output dir, then call it verbatim.
+    exp1.OUTPUT   = out_dir
+    exp1.ROLL_WIN = window
+    exp1.plot_combined_vrp_summary(
+        prod_df, stats_df, tag="rolling",
+        window_label=f"{window}-day Rolling OLS (Euro: V2X / Euro Stoxx 50)",
+    )
+    return prod_df
 
 
 def compute_vstoxx_term_slope(vstoxx_df: pd.DataFrame) -> pd.Series:
@@ -160,8 +148,15 @@ if __name__ == "__main__":
     print("  Experiment 2 — Euro edition (Euro Stoxx 50 / V2X / VSTOXX / VV2TX)")
     print("=" * 72)
 
-    stoxx      = load_stoxx_front_month()
-    vrp        = compute_euro_vrp(stoxx["returns"], load_v2x_spot())
+    stoxx      = cross_market.load_front_month("FX")   # Euro Stoxx 50
+    v2x        = load_v2x_spot()
+
+    # VRP production loop + experiment1-style summary plot (reuses experiment1
+    # code); the same loop output feeds the trading panel below.
+    print("\n[VRP] Rolling-window production loop + summary plot…")
+    prod_df    = run_euro_vrp_summary(stoxx["returns"], v2x)
+
+    vrp        = prod_df[["VP", "CV", "IVar"]]
     term_slope = compute_vstoxx_term_slope(load_vstoxx_futures())
     vv2tx_ma5  = load_vv2tx().rolling(5).mean().rename("vvix_ma5")
     trend_q    = compute_trend_quotient(stoxx)

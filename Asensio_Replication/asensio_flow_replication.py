@@ -24,7 +24,7 @@ Specifications:
   Spec 1  - Level:    vix_basis     ~ rolling_oi        (user specification)
   Spec 2  - FD Arb:  Dr_arb        ~ Dtotal_oi         (Asensio Table 7 exact)
   Spec 3  - FD Basis: Dvix_basis   ~ Dtotal_oi         (first-difference basis)
-  Spec 4  - FD Arb (scaled): same as Spec 2, OI / 1000 for coefficient matching
+  Spec 4  - FD Arb (smoothed flow): Dr_arb ~ Drolling_oi (252d rolling-mean OI)
   Spec 5  - PRIMARY:  ts_slope     ~ total_oi           (*** best match ***)
   Spec 6  - ts_spread ~ total_oi                        (absolute slope in vol pts)
 
@@ -47,13 +47,14 @@ Data:
 
 Outputs:
   output/asensio_flow_panel.csv        - weekly panel with all signals
-  output/asensio_flow_replication.png  - scatter + regression lines (Specs 5, 6, 2)
+  output/asensio_flow_replication.png  - scatter + regression lines (Spec 5, Spec 5 scaled, Spec 2)
   output/asensio_oi_timeseries.png     - OI, term slope, VIX basis time series
 """
 
 import warnings
 warnings.filterwarnings("ignore")
 
+import sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -64,9 +65,11 @@ import matplotlib.dates as mdates
 
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tools import add_constant
-from statsmodels.stats.sandwich_covariance import cov_hac
 
 ROOT   = Path(__file__).parent
+sys.path.insert(0, str(ROOT.parent / "bh_replication"))
+from har_model import _nw_se   # shared Newey-West HAC SE helper
+
 DATA   = ROOT.parent / "data"
 OUTPUT = ROOT / "output"
 OUTPUT.mkdir(exist_ok=True)
@@ -246,8 +249,7 @@ def ols_nw(y: pd.Series, x: pd.Series, nlags: int = NW_LAGS) -> dict:
     X = add_constant(df["x"].values)
 
     res = OLS(Y, X).fit()
-    nw_cov = cov_hac(res, nlags=nlags)
-    nw_se  = np.sqrt(np.diag(nw_cov))
+    nw_se  = _nw_se(res, nlags=nlags)
     t_stat = res.params / nw_se
 
     return {

@@ -35,13 +35,15 @@ def _nw_se(res, nlags: int = NW_LAGS) -> np.ndarray:
     return np.sqrt(np.diag(cov))
 
 
-def estimate_har(panel: pd.DataFrame, label: str = "full sample") -> dict:
+def estimate_har(panel: pd.DataFrame, label: str = "full sample",
+                 xcol: str = "VIX2_lag") -> dict:
     """
     Run Model 8 OLS on the supplied panel slice.
+    ``xcol`` selects the implied-variance predictor column (e.g. "VS2_lag").
     Returns a dict with coefficients, NW SEs, t-stats, adj-R², and RMSE.
     """
     y = panel["RV22_fwd"]
-    X = add_constant(panel[["VIX2_lag", "RV22_lag", "RV5_lag", "RV1_lag"]])
+    X = add_constant(panel[[xcol, "RV22_lag", "RV5_lag", "RV1_lag"]])
 
     res = OLS(y, X).fit()
     nw_ses = _nw_se(res)
@@ -66,20 +68,22 @@ def estimate_har(panel: pd.DataFrame, label: str = "full sample") -> dict:
 
 def out_of_sample_forecast(panel: pd.DataFrame,
                             train_end: str,
-                            label: str = "OOS") -> dict:
+                            label: str = "OOS",
+                            xcol: str = "VIX2_lag") -> dict:
     """
     Train on rows up to train_end, forecast the remainder.
+    ``xcol`` selects the implied-variance predictor column (e.g. "VS2_lag").
     Returns Mincer-Zarnowitz R², RMSE, MAE, MAPE for the OOS window.
     """
     train = panel[panel.index <= train_end]
     test  = panel[panel.index >  train_end]
 
+    feats = [xcol, "RV22_lag", "RV5_lag", "RV1_lag"]
     y_tr = train["RV22_fwd"]
-    X_tr = add_constant(train[["VIX2_lag", "RV22_lag", "RV5_lag", "RV1_lag"]])
+    X_tr = add_constant(train[feats])
     res  = OLS(y_tr, X_tr).fit()
 
-    X_te = add_constant(test[["VIX2_lag", "RV22_lag", "RV5_lag", "RV1_lag"]],
-                        has_constant="add")
+    X_te = add_constant(test[feats], has_constant="add")
     y_te   = test["RV22_fwd"]
     y_hat  = res.predict(X_te)
 
@@ -89,10 +93,12 @@ def out_of_sample_forecast(panel: pd.DataFrame,
     err   = y_te - y_hat
     rmse  = float(np.sqrt((err**2).mean()))
     mae   = float(err.abs().mean())
-    mape  = float((err.abs() / y_te).mean())
+    # Denominator clipped at 0.01 to guard near-zero RV days
+    # (same convention as experiment1's compute_metrics)
+    mape  = float((err.abs() / y_te.clip(lower=0.01)).mean())
 
     # IS stats
-    is_res = estimate_har(train, label=f"{label} in-sample")
+    is_res = estimate_har(train, label=f"{label} in-sample", xcol=xcol)
 
     return {
         "label":      label,
@@ -111,32 +117,6 @@ def out_of_sample_forecast(panel: pd.DataFrame,
         "y_hat":      y_hat,
         "test_panel": test,
     }
-
-
-def rolling_r2(panel: pd.DataFrame,
-               window: int = 252,
-               step: int = 22) -> pd.DataFrame:
-    """
-    Compute rolling in-sample Adj-R² and RMSE of Model 8.
-    window: trading days; step: stride in days.
-    """
-    rows = []
-    idx  = panel.index
-    dates = idx[::step]
-
-    for end_date in dates:
-        start_date = end_date - pd.DateOffset(days=int(window * 365 / 252))
-        sub = panel[(panel.index >= start_date) & (panel.index <= end_date)]
-        if len(sub) < window // 2:
-            continue
-        r = estimate_har(sub)
-        rows.append({
-            "date":     end_date,
-            "adj_r2":   r["adj_r2"],
-            "rmse":     r["rmse_is"],
-            "n":        r["n"],
-        })
-    return pd.DataFrame(rows).set_index("date")
 
 
 if __name__ == "__main__":

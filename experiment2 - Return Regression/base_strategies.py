@@ -36,19 +36,15 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent))
 
 from helpers import (
-    load_vrp_series, load_es_front_month, load_vvix,
-    compute_vvix_ma5, compute_vvix_ma10,
-    load_vix_spot, load_vix_futures_term_structure,
-    load_es_open_interest, load_vix_basis, compute_trend_quotient,
     compute_buy_and_hold, simulate_strategy, compute_performance_stats,
 )
-from fh_replication.fh_replication import compute_vix_term_slope
 from regressions import (
-    build_panel,
+    load_standard_panel,
     compute_betas, compute_betas_bivariate,
     _yhat_univariate, _yhat_bivariate, _rolling_mu,
     _shade, oos_cumret, stat_start, window_stats,
     OOS_START, DELTAS, DELTA_LBL, OOS_GAP, NW_LAGS,
+    UNI_MODELS, BIV_MODELS,
 )
 
 # |t|-stat gate threshold. Lives here (and in leveraged_strategies.py) — not in
@@ -59,7 +55,64 @@ T_THRESH = 1.65
 BAH_COLOR = "#d62728"
 
 
+def _resolve_t(t_thresh):
+    """Default to the module-level T_THRESH at call time (rebound by --t)."""
+    return T_THRESH if t_thresh is None else t_thresh
+
+
+def run_cli(main_fn, description, default_t):
+    """Shared --t argparse entry point for this module and leveraged_strategies."""
+    import argparse
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument(
+        "--t", type=float, default=None, metavar="T",
+        help=f"|t|-stat gate threshold applied to every simulation "
+             f"(default: {default_t:.2f}).")
+    main_fn(t_threshold=parser.parse_args().t)
+
+
 # ─── Shared plotting helpers (also imported by leveraged_strategies.py) ───────
+
+def perf_label(st, extra=""):
+    """Legend suffix `[SR=…  ret=…  DD=…  <extra>]` from compute_performance_stats
+    output, so every curve across both strategy modules is labelled identically."""
+    core = (f"SR={st['sharpe']:+.2f}  "
+            f"ret={st['ann_ret']*100:+.1f}%  "
+            f"DD={st['max_dd']*100:.1f}%")
+    return f"[{core}  {extra}]" if extra else f"[{core}]"
+
+
+def _style_cumret_axis(ax):
+    """Log-scale cumulative-return panel styling shared by every strategy figure."""
+    ax.axhline(1, color="black", lw=0.4, ls=":")
+    ax.set_yscale("log")
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}x"))
+    ax.set_ylabel("Cumulative Net Return (log)", fontsize=9)
+    ax.legend(fontsize=8, loc="upper left", framealpha=0.92)
+    ax.grid(axis="y", alpha=0.2, lw=0.6)
+    ax.spines[["top", "right"]].set_visible(False)
+
+
+def _annotate_position_panel(ax, sim, color, pL, pS, pF, avg_pos, oos_start=OOS_START):
+    """Long/Short/Flat mix + directional-accuracy text on a position panel.
+    Accuracy is the share of profitable days per prior-day position side over
+    the OOS window; the mix percentages are the caller's (their window and
+    position convention differ between the unit and leveraged panels)."""
+    sim_oos    = sim[sim.index >= oos_start]
+    prev_pos   = sim_oos["position"].shift(1)
+    long_mask  = prev_pos > 0
+    short_mask = prev_pos < 0
+    long_acc   = float((sim_oos.loc[long_mask,  "gross_pnl"] > 0).mean()) if long_mask.any()  else float("nan")
+    short_acc  = float((sim_oos.loc[short_mask, "gross_pnl"] > 0).mean()) if short_mask.any() else float("nan")
+    long_acc_str  = f"{long_acc  * 100:.1f}%" if not np.isnan(long_acc)  else "N/A"
+    short_acc_str = f"{short_acc * 100:.1f}%" if not np.isnan(short_acc) else "N/A"
+    ax.text(0.01, 0.97,
+            f"Long {pL:.1f}%  Short {pS:.1f}%  Flat {pF:.1f}%  AvgPos={avg_pos:+.3f}",
+            transform=ax.transAxes, fontsize=7.5, va="top", color=color)
+    ax.text(0.01, 0.83,
+            f"Long accuracy={long_acc_str}  Short accuracy={short_acc_str}",
+            transform=ax.transAxes, fontsize=7.5, va="top", color=color)
+
 
 def _draw_bah(ax, bah_sim, stat_start_dt, stat_lbl, rebase_start, oos_start=OOS_START):
     """Panel-1 Buy-and-Hold curve(s), shared by base_strategies.py and
@@ -73,10 +126,7 @@ def _draw_bah(ax, bah_sim, stat_start_dt, stat_lbl, rebase_start, oos_start=OOS_
     bah_oos = oos_cumret(bah_sim, start=oos_start)
     ax.plot(bah_oos.index, bah_oos.values,
             color=BAH_COLOR, lw=1.5, ls="-.", alpha=0.6,
-            label=(f"Buy-and-Hold{stat_lbl}  "
-                   f"[SR={bah_st['sharpe']:+.2f}  "
-                   f"ret={bah_st['ann_ret']*100:+.1f}%  "
-                   f"DD={bah_st['max_dd']*100:.1f}%]"))
+            label=f"Buy-and-Hold{stat_lbl}  {perf_label(bah_st)}")
 
     if rebase_start is not None:
         bah_from   = bah_sim["net_pnl"][bah_sim.index >= rebase_start]
@@ -86,9 +136,7 @@ def _draw_bah(ax, bah_sim, stat_start_dt, stat_lbl, rebase_start, oos_start=OOS_
         ax.plot(bah_act.index, bah_act.values,
                 color=BAH_COLOR, lw=1.2, ls=":", alpha=0.85,
                 label=(f"Buy-and-Hold from {rebase_start.strftime('%Y-%m-%d')}  "
-                       f"[SR={bah_act_st['sharpe']:+.2f}  "
-                       f"ret={bah_act_st['ann_ret']*100:+.1f}%  "
-                       f"DD={bah_act_st['max_dd']*100:.1f}%]"))
+                       f"{perf_label(bah_act_st)}"))
 
 
 def _align_zero(ax_left, ax_right):
@@ -289,19 +337,9 @@ def _plot_delta_grid(labels, mode, horizon_label, oos_gap, nw_lags,
         pS = float((pos_stat == -1).mean() * 100)
         ax_ret.plot(cum.index, cum.values,
                     color=color_palette[di], lw=1.8, alpha=0.9,
-                    label=(f"{lbl}  "
-                           f"[SR={st_plot['sharpe']:+.2f}  "
-                           f"ret={st_plot['ann_ret']*100:+.1f}%  "
-                           f"DD={st_plot['max_dd']*100:.1f}%  "
-                           f"L{pL:.0f}%/S{pS:.0f}%]"))
+                    label=f"{lbl}  {perf_label(st_plot, f'L{pL:.0f}%/S{pS:.0f}%')}")
 
-    ax_ret.axhline(1, color="black", lw=0.4, ls=":")
-    ax_ret.set_yscale("log")
-    ax_ret.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}x"))
-    ax_ret.set_ylabel("Cumulative Net Return (log)", fontsize=9)
-    ax_ret.legend(fontsize=8, loc="upper left", framealpha=0.92)
-    ax_ret.grid(axis="y", alpha=0.2, lw=0.6)
-    ax_ret.spines[["top", "right"]].set_visible(False)
+    _style_cumret_axis(ax_ret)
 
     ax_t.set_xlim(*xlim)
     _shade(ax_t, oos_dt, e_dt)
@@ -327,23 +365,8 @@ def _plot_delta_grid(labels, mode, horizon_label, oos_gap, nw_lags,
         pL = float((pos == 1).mean() * 100)
         pS = float((pos == -1).mean() * 100)
         pF = float((pos == 0).mean() * 100)
-        ax_p.text(0.01, 0.97,
-                  f"Long {pL:.1f}%  Short {pS:.1f}%  Flat {pF:.1f}%  "
-                  f"AvgPos={float(pos.mean()):+.3f}",
-                  transform=ax_p.transAxes, fontsize=7.5, va="top",
-                  color=color_palette[di])
-        sim_oos   = sim[sim.index >= _oos_start]
-        prev_pos  = sim_oos["position"].shift(1)
-        long_mask  = prev_pos > 0
-        short_mask = prev_pos < 0
-        long_acc   = float((sim_oos.loc[long_mask,  "gross_pnl"] > 0).mean()) if long_mask.any()  else float("nan")
-        short_acc  = float((sim_oos.loc[short_mask, "gross_pnl"] > 0).mean()) if short_mask.any() else float("nan")
-        long_acc_str  = f"{long_acc  * 100:.1f}%" if not np.isnan(long_acc)  else "N/A"
-        short_acc_str = f"{short_acc * 100:.1f}%" if not np.isnan(short_acc) else "N/A"
-        ax_p.text(0.01, 0.83,
-                  f"Long accuracy={long_acc_str}  Short accuracy={short_acc_str}",
-                  transform=ax_p.transAxes, fontsize=7.5, va="top",
-                  color=color_palette[di])
+        _annotate_position_panel(ax_p, sim, color_palette[di], pL, pS, pF,
+                                 float(pos.mean()), oos_start=_oos_start)
         ax_p.spines[["top", "right"]].set_visible(False)
 
     _finalize(fig, [ax_ret, ax_t] + list(ax_pos), out_path)
@@ -400,22 +423,23 @@ def plot_rolmu_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_la
                      r2_oos=r2_oos, oos_start=oos_start, extra_title=extra_title)
 
 
-# ─── Unit-position builders ───────────────────────────────────────────────────
-# All six strategies share one skeleton: load-from-cache → expanding-window betas
-# + ŷ + |t|-gate → mode-specific long/short assignment → cache. The wrappers below
-# differ only in the cache key, the stored series name, and the threshold rule
-# (sym / asym / rolmu); they delegate the skeleton to _run_unit. Cache keys are
-# kept byte-identical to the originals so existing regression_cache/ files hit.
+# ─── Position builders ────────────────────────────────────────────────────────
+# Every position strategy — the six unit-position builders below AND the six
+# leveraged builders in leveraged_strategies.py — shares one skeleton:
+# load-from-cache → expanding-window betas + ŷ + |t|-gate → strategy-specific
+# position assignment → cache. The wrappers differ only in the cache key, the
+# stored series name, and the assignment rule. Cache keys are kept byte-identical
+# to the originals so existing regression_cache/ files hit.
 
-def _run_unit(panel, preds, fwd_col, oos_gap, nw_lags, mode, delta, t_thresh,
-              cache_tag, pos_name):
-    """Shared unit-position backtest. `preds` is the 1-2 predictor columns; `mode`
-    selects the assignment rule:
-        sym   — long ŷ > delta, short ŷ < -delta
-        asym  — long (ŷ-µ) > delta, short (-ŷ) > delta   (long wins ties)
-        rolmu — long (ŷ-µ) > delta, short (µ-ŷ) > delta   (long wins ties)
+def _run_gated(panel, preds, fwd_col, oos_gap, nw_lags, t_thresh,
+               cache, pos_name, assign, use_mu, rolling_window=None):
+    """Shared cached backtest skeleton. `preds` is the 1-2 predictor columns;
+    `assign(pos, idx, yh, mu)` mutates the zero-initialised `pos` series in place
+    for the gate-passing dates `idx` (`mu` is the oos-gap-lagged rolling mean
+    reindexed to `idx`, None unless `use_mu`). `cache` is the full parquet path —
+    callers build it from their own module's CACHE_DIR so the cross-market cache
+    redirect (see experiment3/cross_market.py) keeps working per module.
     """
-    cache = CACHE_DIR / cache_tag
     if cache.exists():
         return pd.read_parquet(cache).squeeze().rename(pos_name)
 
@@ -434,26 +458,44 @@ def _run_unit(panel, preds, fwd_col, oos_gap, nw_lags, mode, delta, t_thresh,
     idx = y_hat.index[fire.reindex(y_hat.index, fill_value=False)]
     yh  = y_hat.loc[idx]
 
-    if mode == "sym":
-        pos.loc[idx[yh >  delta]] =  1.0
-        pos.loc[idx[yh < -delta]] = -1.0
-    else:
-        mu         = _rolling_mu(panel, fwd_col, oos_gap,
-                                 predictor=(preds[0] if len(preds) == 1 else list(preds)))
-        excess     = yh - mu.reindex(idx)
-        long_mask  = excess > delta
-        short_mask = (-yh > delta) if mode == "asym" else (-excess > delta)
-        pos.loc[idx[long_mask]]               =  1.0
-        pos.loc[idx[short_mask & ~long_mask]] = -1.0
+    mu = None
+    if use_mu:
+        mu_kw = {} if rolling_window is None else {"rolling_window": rolling_window}
+        mu = _rolling_mu(panel, fwd_col, oos_gap,
+                         predictor=(preds[0] if len(preds) == 1 else list(preds)),
+                         **mu_kw).reindex(idx)
 
+    assign(pos, idx, yh, mu)
     pos.to_frame().to_parquet(cache)
     return pos
 
 
+def _run_unit(panel, preds, fwd_col, oos_gap, nw_lags, mode, delta, t_thresh,
+              cache_tag, pos_name):
+    """Unit-position (±1) assignment on the shared skeleton. `mode` selects:
+        sym   — long ŷ > delta, short ŷ < -delta
+        asym  — long (ŷ-µ) > delta, short (-ŷ) > delta   (long wins ties)
+        rolmu — long (ŷ-µ) > delta, short (µ-ŷ) > delta   (long wins ties)
+    """
+    def assign(pos, idx, yh, mu):
+        if mode == "sym":
+            pos.loc[idx[yh >  delta]] =  1.0
+            pos.loc[idx[yh < -delta]] = -1.0
+        else:
+            excess     = yh - mu
+            long_mask  = excess > delta
+            short_mask = (-yh > delta) if mode == "asym" else (-excess > delta)
+            pos.loc[idx[long_mask]]               =  1.0
+            pos.loc[idx[short_mask & ~long_mask]] = -1.0
+
+    return _run_gated(panel, preds, fwd_col, oos_gap, nw_lags, t_thresh,
+                      CACHE_DIR / cache_tag, pos_name, assign,
+                      use_mu=(mode != "sym"))
+
+
 def run_ew(panel, predictor, fwd_col, oos_gap, nw_lags, delta, t_thresh=None):
     """±1 when |ŷ| > delta and t-stat gate passes."""
-    if t_thresh is None:
-        t_thresh = T_THRESH
+    t_thresh = _resolve_t(t_thresh)
     tag = (f"pos_EW_{predictor}_{fwd_col}_d{int(delta*10000)}bps"
            f"_t{int(t_thresh*100)}_oos{OOS_START}.parquet")
     return _run_unit(panel, [predictor], fwd_col, oos_gap, nw_lags, "sym",
@@ -462,8 +504,7 @@ def run_ew(panel, predictor, fwd_col, oos_gap, nw_lags, delta, t_thresh=None):
 
 def run_ew_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, delta, t_thresh=None):
     """Both betas must pass the |t| > t_thresh gate."""
-    if t_thresh is None:
-        t_thresh = T_THRESH
+    t_thresh = _resolve_t(t_thresh)
     tag = (f"pos_EWbiv_{pred1}_{pred2}_{fwd_col}_d{int(delta*10000)}bps"
            f"_t{int(t_thresh*100)}_oos{OOS_START}.parquet")
     return _run_unit(panel, [pred1, pred2], fwd_col, oos_gap, nw_lags, "sym",
@@ -472,8 +513,7 @@ def run_ew_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, delta, t_th
 
 def run_ew_asym(panel, predictor, fwd_col, oos_gap, nw_lags, delta=0.0, t_thresh=None):
     """Long if (ŷ-µ₅₀₀) > delta, short if -ŷ > delta."""
-    if t_thresh is None:
-        t_thresh = T_THRESH
+    t_thresh = _resolve_t(t_thresh)
     d_sfx = f"_d{int(round(delta * 10000))}" if delta > 0 else ""
     tag = (f"pos_EWasym_{predictor}_{fwd_col}"
            f"_t{int(t_thresh*100)}{d_sfx}_oos{OOS_START}.parquet")
@@ -483,8 +523,7 @@ def run_ew_asym(panel, predictor, fwd_col, oos_gap, nw_lags, delta=0.0, t_thresh
 
 def run_ew_asym_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, delta=0.0, t_thresh=None):
     """Both betas must pass gate. Long if (ŷ-µ₅₀₀) > delta, short if -ŷ > delta."""
-    if t_thresh is None:
-        t_thresh = T_THRESH
+    t_thresh = _resolve_t(t_thresh)
     d_sfx = f"_d{int(round(delta * 10000))}" if delta > 0 else ""
     tag = (f"pos_EWasym_{pred1}_{pred2}_{fwd_col}"
            f"_t{int(t_thresh*100)}{d_sfx}_oos{OOS_START}.parquet")
@@ -494,8 +533,7 @@ def run_ew_asym_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, delta=
 
 def run_ew_rolmu(panel, predictor, fwd_col, oos_gap, nw_lags, delta=0.0, t_thresh=None):
     """Long if (ŷ-µ₅₀₀) > delta, short if (µ₅₀₀-ŷ) > delta."""
-    if t_thresh is None:
-        t_thresh = T_THRESH
+    t_thresh = _resolve_t(t_thresh)
     d_sfx = f"_d{int(round(delta * 10000))}" if delta > 0 else ""
     tag = (f"pos_EWrolmu_{predictor}_{fwd_col}"
            f"_t{int(t_thresh*100)}{d_sfx}_oos{OOS_START}.parquet")
@@ -505,8 +543,7 @@ def run_ew_rolmu(panel, predictor, fwd_col, oos_gap, nw_lags, delta=0.0, t_thres
 
 def run_ew_rolmu_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, delta=0.0, t_thresh=None):
     """Both betas must pass gate. Long if (ŷ-µ₅₀₀) > delta, short if (µ₅₀₀-ŷ) > delta."""
-    if t_thresh is None:
-        t_thresh = T_THRESH
+    t_thresh = _resolve_t(t_thresh)
     d_sfx = f"_d{int(round(delta * 10000))}" if delta > 0 else ""
     tag = (f"pos_EWrolmu_{pred1}_{pred2}_{fwd_col}"
            f"_t{int(t_thresh*100)}{d_sfx}_oos{OOS_START}.parquet")
@@ -535,56 +572,26 @@ def main(t_threshold=None):
     print("=" * 72)
 
     print("\n[1] Loading data...")
-    vrp        = load_vrp_series()
-    es         = load_es_front_month()
-    vvix_raw   = load_vvix()
-    vvix_ma5   = compute_vvix_ma5(vvix_raw)
-    vvix_ma10  = compute_vvix_ma10(vvix_raw)
-    vix_spot   = load_vix_spot()
-    vix_basis  = load_vix_basis()
-    term_slope = compute_vix_term_slope(load_vix_futures_term_structure())
-    oi         = load_es_open_interest()
-    trend_q    = compute_trend_quotient(es)
-
-    panel = build_panel(vrp, es, vvix_ma5, vvix_ma10, vix_spot,
-                        vix_basis, term_slope, oi, trend_q)
+    panel = load_standard_panel()
     print(f"    {len(panel):,} obs  "
           f"[{panel.index.min().date()} - {panel.index.max().date()}]")
 
     daily_ret = panel["daily_ret"].dropna()
-    bah_pos   = compute_buy_and_hold(daily_ret)
-    bah_sim   = simulate_strategy(bah_pos, daily_ret)
+    bah_sim   = simulate_strategy(compute_buy_and_hold(daily_ret), daily_ret)
     FWD       = "fwd_20d"
 
-    # ── Output directories ──
-    out_vrp   = OUTPUT / "plots" / "VRP"
-    out_vvix5 = OUTPUT / "plots" / "VVIX MA5"
-    out_vvix10= OUTPUT / "plots" / "VVIX MA10"
-    out_biv5  = OUTPUT / "plots" / "VRP + VVIX MA5"
-    out_biv10 = OUTPUT / "plots" / "VRP + VVIX MA10"
-    out_ts    = OUTPUT / "plots" / "VRP + Term Slope"
-    out_oi    = OUTPUT / "plots" / "VRP + Open Interest"
-    for d in [out_vrp, out_vvix5, out_vvix10, out_biv5, out_biv10, out_ts, out_oi]:
-        d.mkdir(parents=True, exist_ok=True)
-
-    # ── Shared palettes ──
-    pal_vrp   = ["#08306b", "#2171b5", "#4292c6", "#6baed6"]
-    pal_vvix5 = ["#3f007d", "#6a51a3", "#807dba", "#9e9ac8"]
-    pal_vvix10= ["#7a0177", "#c51b8a", "#f768a1", "#fbb4b9"]
-    pal_biv5  = ["#3f007d", "#6a51a3", "#9e9ac8", "#dadaeb"]
-    pal_biv10 = ["#ae017e", "#dd3497", "#f768a1", "#fbb4b9"]
-    pal_ts    = ["#00441b", "#006d2c", "#31a354", "#74c476"]
-    pal_oi    = ["#54278f", "#756bb1", "#9e9ac8", "#cbc9e2"]
-
-    # ── Pre-compute betas ──
-    print("\n[2] Computing betas...")
-    vrp_betas   = compute_betas(panel, "VP",         FWD, OOS_GAP, NW_LAGS)
-    vvix5_betas = compute_betas(panel, "vvix_ma5",   FWD, OOS_GAP, NW_LAGS)
-    vvix10_betas= compute_betas(panel, "vvix_ma10",  FWD, OOS_GAP, NW_LAGS)
-    biv5_betas  = compute_betas_bivariate(panel, "VP", "vvix_ma5",      FWD, OOS_GAP, NW_LAGS)
-    biv10_betas = compute_betas_bivariate(panel, "VP", "vvix_ma10",     FWD, OOS_GAP, NW_LAGS)
-    ts_betas    = compute_betas_bivariate(panel, "VP", "term_slope",    FWD, OOS_GAP, NW_LAGS)
-    oi_betas    = compute_betas_bivariate(panel, "VP", "open_interest", FWD, OOS_GAP, NW_LAGS)
+    # ── 4-delta palettes per model (uni keyed by predictor, biv by 2nd predictor) ──
+    uni_pal = {
+        "VP":        ["#08306b", "#2171b5", "#4292c6", "#6baed6"],
+        "vvix_ma5":  ["#3f007d", "#6a51a3", "#807dba", "#9e9ac8"],
+        "vvix_ma10": ["#7a0177", "#c51b8a", "#f768a1", "#fbb4b9"],
+    }
+    biv_pal = {
+        "vvix_ma5":      ["#3f007d", "#6a51a3", "#9e9ac8", "#dadaeb"],
+        "vvix_ma10":     ["#ae017e", "#dd3497", "#f768a1", "#fbb4b9"],
+        "term_slope":    ["#00441b", "#006d2c", "#31a354", "#74c476"],
+        "open_interest": ["#54278f", "#756bb1", "#9e9ac8", "#cbc9e2"],
+    }
 
     # ── Strategy specs: (run_fn, plot_fn, filename prefix) ──
     # run_fn(panel, *preds, FWD, OOS_GAP, NW_LAGS, delta) → position series.
@@ -601,13 +608,10 @@ def main(t_threshold=None):
         (run_ew_rolmu_bivariate, plot_rolmu_bivariate,  "base_return_shift"),
     ]
 
-    # ── Univariate models: (column, label, palette, betas) ──
-    uni_models = [
-        ("VP",        "VRP",       pal_vrp,    vrp_betas,    out_vrp),
-        ("vvix_ma5",  "VVIX MA5",  pal_vvix5,  vvix5_betas,  out_vvix5),
-        ("vvix_ma10", "VVIX MA10", pal_vvix10, vvix10_betas, out_vvix10),
-    ]
-    for mi, (col, label, pal, betas, out_dir) in enumerate(uni_models, 1):
+    for mi, (col, label) in enumerate(UNI_MODELS, 1):
+        betas   = compute_betas(panel, col, FWD, OOS_GAP, NW_LAGS)
+        out_dir = OUTPUT / "plots" / label
+        out_dir.mkdir(parents=True, exist_ok=True)
         for run_fn, plot_fn, prefix in uni_strats:
             print(f"\n[{mi}] {label} {prefix}...")
             sim_dict = {}
@@ -617,30 +621,26 @@ def main(t_threshold=None):
             _print_delta_stats(sim_dict, bah_sim)
             plot_fn(
                 pred_label=label, horizon_label="20-day",
-                oos_gap=OOS_GAP, nw_lags=NW_LAGS, color_palette=pal,
+                oos_gap=OOS_GAP, nw_lags=NW_LAGS, color_palette=uni_pal[col],
                 sim_dict=sim_dict, betas_df=betas, bah_sim=bah_sim,
                 out_path=out_dir / f"{prefix}_{label.replace(' ', '_')}.png",
             )
 
-    # ── Bivariate models: (col1, col2, label1, label2, palette, betas) ──
-    biv_models = [
-        ("VP", "vvix_ma5",      "VRP", "VVIX MA5",      pal_biv5,  biv5_betas,  out_biv5),
-        ("VP", "vvix_ma10",     "VRP", "VVIX MA10",     pal_biv10, biv10_betas, out_biv10),
-        ("VP", "term_slope",    "VRP", "Term Slope",    pal_ts,    ts_betas,    out_ts),
-        ("VP", "open_interest", "VRP", "Open Interest", pal_oi,    oi_betas,    out_oi),
-    ]
-    for mi, (c1, c2, l1, l2, pal, betas, out_dir) in enumerate(biv_models, len(uni_models) + 1):
+    for mi, (col2, label2) in enumerate(BIV_MODELS, len(UNI_MODELS) + 1):
+        betas   = compute_betas_bivariate(panel, "VP", col2, FWD, OOS_GAP, NW_LAGS)
+        out_dir = OUTPUT / "plots" / f"VRP + {label2}"
+        out_dir.mkdir(parents=True, exist_ok=True)
         for run_fn, plot_fn, prefix in biv_strats:
-            print(f"\n[{mi}] {l1} + {l2} {prefix}...")
+            print(f"\n[{mi}] VRP + {label2} {prefix}...")
             sim_dict = {}
             for di, delta in enumerate(DELTAS):
-                pos = run_fn(panel, c1, c2, FWD, OOS_GAP, NW_LAGS, delta)
+                pos = run_fn(panel, "VP", col2, FWD, OOS_GAP, NW_LAGS, delta)
                 sim_dict[di] = (delta, simulate_strategy(pos, daily_ret))
             _print_delta_stats(sim_dict, bah_sim)
-            fname = f"{prefix}_{l1.replace(' ', '_')}_+_{l2.replace(' ', '_')}.png"
+            fname = f"{prefix}_VRP_+_{label2.replace(' ', '_')}.png"
             plot_fn(
-                pred1_label=l1, pred2_label=l2, horizon_label="20-day",
-                oos_gap=OOS_GAP, nw_lags=NW_LAGS, color_palette=pal,
+                pred1_label="VRP", pred2_label=label2, horizon_label="20-day",
+                oos_gap=OOS_GAP, nw_lags=NW_LAGS, color_palette=biv_pal[col2],
                 sim_dict=sim_dict, betas_df=betas, bah_sim=bah_sim,
                 out_path=out_dir / fname,
             )
@@ -651,12 +651,5 @@ def main(t_threshold=None):
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(
-        description="Base (unit-position) strategy evaluation for all models.")
-    parser.add_argument(
-        "--t", type=float, default=None, metavar="T",
-        help=f"|t|-stat gate threshold applied to every simulation "
-             f"(default: {T_THRESH:.2f}).")
-    args = parser.parse_args()
-    main(t_threshold=args.t)
+    run_cli(main, "Base (unit-position) strategy evaluation for all models.",
+            T_THRESH)

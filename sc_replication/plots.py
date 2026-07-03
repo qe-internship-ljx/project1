@@ -1,7 +1,7 @@
 """
 P&L visualisations for the Simon & Campasano (2014) replication.
 
-Produces four figures saved to vix_basis/output/:
+Produces four figures saved to sc_replication/output/{paper_period,full_timeframe}/:
   fig1_cumulative_pnl.png   -- cumulative hedged P&L vs VIX level
   fig2_monthly_pnl.png      -- monthly P&L bars (short / long / net)
   fig3_trade_scatter.png    -- per-trade P&L scatter coloured by direction

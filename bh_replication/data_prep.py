@@ -53,6 +53,19 @@ def load_vix() -> pd.Series:
     return vix
 
 
+def load_variance_swap() -> pd.Series:
+    """
+    Load the SPX 1-month variance-swap fair strike (annualised %, implied-vol
+    quote).  Returns a daily series indexed by date (available Nov 2008+).
+    """
+    vs_raw = pd.read_csv(DATA_DIR / "EquityIndexVarianceSwapData.csv",
+                         parse_dates=["DATE"])
+    vs = (vs_raw[(vs_raw["UNDERLYING"] == "SPX") & (vs_raw["TENOR_MONTHS"] == 1.0)]
+          .sort_values("DATE").set_index("DATE")["IMPLIED_VOLATILITY"])
+    vs.index.name = "date"
+    return vs
+
+
 def compute_rv_components(ret: pd.Series, lags: tuple = (1, 5, 22)) -> pd.DataFrame:
     """
     Given daily decimal returns, compute RV proxies at daily/weekly/monthly

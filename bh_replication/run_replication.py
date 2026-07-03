@@ -30,20 +30,16 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from statsmodels.regression.linear_model import OLS
-from statsmodels.tools import add_constant
-from statsmodels.stats.sandwich_covariance import cov_hac
 
 sys.path.insert(0, str(Path(__file__).parent))
-from data_prep import build_panel, load_sp500_returns, load_vix, compute_rv_components
+from data_prep import (build_panel, load_sp500_returns, load_variance_swap,
+                       compute_rv_components)
 from har_model import estimate_har, out_of_sample_forecast, NW_LAGS
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 OUTPUT   = Path(__file__).parent / "output"
 OUTPUT.mkdir(exist_ok=True)
 
-PAPER_START = "1990-01-02"
-PAPER_END   = "2010-10-01"
 PAPER_SPLIT = "2005-07-15"   # 75% split matching B&H
 
 PAPER_COEFS = {
@@ -53,7 +49,6 @@ PAPER_COEFS = {
     "RV5_lag":  0.330,
     "RV1_lag":  0.107,
 }
-PAPER_OOS = {"rmse": 46.077, "mae": 16.856, "mape": 0.347, "mz_r2": 0.555}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -70,14 +65,7 @@ def _build_vs_panel() -> pd.DataFrame:
     rv     = compute_rv_components(sp_ret)
 
     # Variance swap 1m SPX (pure VS, no fallback to VIX)
-    vs_raw = pd.read_csv(DATA_DIR / "EquityIndexVarianceSwapData.csv",
-                         parse_dates=["DATE"])
-    vs = (vs_raw[(vs_raw["UNDERLYING"] == "SPX") & (vs_raw["TENOR_MONTHS"] == 1.0)]
-          .sort_values("DATE")
-          .set_index("DATE")["IMPLIED_VOLATILITY"])
-    vs.index.name = "date"
-
-    vs2 = (vs ** 2 / 12.0).rename("VS2")
+    vs2 = (load_variance_swap() ** 2 / 12.0).rename("VS2")
 
     panel = rv.join(vs2, how="inner").dropna()
     panel["RV22_fwd"] = panel["RV22"].shift(-22)

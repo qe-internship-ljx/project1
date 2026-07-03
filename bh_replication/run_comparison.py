@@ -1,102 +1,50 @@
-"""Full VIX vs VS comparison including DM test and forecast encompassing."""
+"""Full VIX vs VS comparison including DM test and forecast encompassing.
+
+Data loading, RV construction and HAR estimation are shared with the rest of
+the replication: panels come from data_prep, estimators from har_model
+(parameterised by ``xcol`` to switch the implied-variance predictor).
+"""
 import warnings; warnings.filterwarnings('ignore')
+import sys
 import numpy as np, pandas as pd
 from pathlib import Path
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tools import add_constant
-from statsmodels.stats.sandwich_covariance import cov_hac
 
-DATA_DIR = Path(__file__).parent.parent / 'data'
-NW_LAGS  = 44
+sys.path.insert(0, str(Path(__file__).parent))
+from data_prep import load_sp500_returns, load_vix, load_variance_swap, compute_rv_components
+from har_model import estimate_har, out_of_sample_forecast, _nw_se
 
-# ── Load data ─────────────────────────────────────────────────────────────────
-meta = pd.read_parquet(DATA_DIR / 'EquityFuture_security_meta.parquet')
-hist = pd.read_parquet(DATA_DIR / 'EquityFuture_historical.parquet')
-es_tickers = meta[meta['curve_group'] == 'ES']['security'].tolist()
-es = hist[hist['security'].isin(es_tickers)].copy()
-es['date'] = pd.to_datetime(es['date'])
-meta_es = meta[meta['curve_group'] == 'ES'][['security','expiry_yearmonth']].copy()
-meta_es['expiry_date'] = pd.to_datetime(meta_es['expiry_yearmonth'], format='%Y-%m')
-es = es.merge(meta_es[['security','expiry_date']], on='security').sort_values(['date','expiry_date'])
-sp_ret = (es.groupby('date').first().reset_index()[['date','returns']]
-          .dropna().sort_values('date').set_index('date')['returns'])
-
-vix_df = pd.read_csv(DATA_DIR / 'VolatilityIndexData.csv', parse_dates=['DATE'])
-vix = vix_df[vix_df['SECURITY']=='VIX Index'].sort_values('DATE').set_index('DATE')['INDEX_VALUE']
-vix.index.name = 'date'
-
-vs_raw = pd.read_csv(DATA_DIR / 'EquityIndexVarianceSwapData.csv', parse_dates=['DATE'])
-vs = (vs_raw[(vs_raw['UNDERLYING']=='SPX') & (vs_raw['TENOR_MONTHS']==1.0)]
-      .sort_values('DATE').set_index('DATE')['IMPLIED_VOLATILITY'])
-vs.index.name = 'date'
-
-# ── Build unified panel ───────────────────────────────────────────────────────
-rv_daily = (sp_ret * 100)**2
-rv = pd.DataFrame(index=sp_ret.index)
-rv['RV1']  = rv_daily * 22
-rv['RV5']  = rv_daily.rolling(5).mean() * 22
-rv['RV22'] = rv_daily.rolling(22).sum()
-
-panel = rv.join((vs**2/12).rename('VS2'), how='inner')
-panel['VIX2']    = vix**2 / 12
+# ── Build unified panel (VS-restricted sample, both predictors) ───────────────
+sp_ret = load_sp500_returns()
+panel = compute_rv_components(sp_ret).join(
+    (load_variance_swap()**2/12).rename('VS2'), how='inner')
+panel['VIX2']     = load_vix()**2 / 12
 panel['RV22_fwd'] = panel['RV22'].shift(-22)
-panel['VS2_lag']  = panel['VS2'].shift(1)
-panel['VIX2_lag'] = panel['VIX2'].shift(1)
-panel['RV22_lag'] = panel['RV22'].shift(1)
-panel['RV5_lag']  = panel['RV5'].shift(1)
-panel['RV1_lag']  = panel['RV1'].shift(1)
+for c in ['VS2', 'VIX2', 'RV22', 'RV5', 'RV1']:
+    panel[f'{c}_lag'] = panel[c].shift(1)
 panel = panel.dropna()
 
 print(f'Panel: {len(panel):,} obs  {panel.index.min().date()} -> {panel.index.max().date()}')
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def nw_se(res, nlags=NW_LAGS):
-    return np.sqrt(np.diag(cov_hac(res, nlags=nlags)))
-
-def estimate(pnl, xcol):
-    y   = pnl['RV22_fwd']
-    X   = add_constant(pnl[[xcol,'RV22_lag','RV5_lag','RV1_lag']])
-    res = OLS(y, X).fit()
-    ses = nw_se(res)
-    vrs = X.columns.tolist()
-    return dict(n=int(res.nobs), params=dict(zip(vrs,res.params)),
-                nwse=dict(zip(vrs,ses)), tstat=dict(zip(vrs,res.params/ses)),
-                adj_r2=res.rsquared_adj, rmse=float(np.sqrt(res.mse_resid)),
-                fitted=res.fittedvalues)
-
-def oos_forecast(pnl, split, xcol):
-    tr, te = pnl[pnl.index<=split], pnl[pnl.index>split]
-    res    = OLS(tr['RV22_fwd'], add_constant(tr[[xcol,'RV22_lag','RV5_lag','RV1_lag']])).fit()
-    X_te   = add_constant(te[[xcol,'RV22_lag','RV5_lag','RV1_lag']], has_constant='add')
-    y_te   = te['RV22_fwd']
-    y_hat  = res.predict(X_te)
-    mz     = OLS(y_te.values, add_constant(y_hat.values)).fit()
-    err    = y_te - y_hat
-    isr    = estimate(tr, xcol)
-    return dict(n_train=len(tr), n_test=len(te),
-                is_adj_r2=isr['adj_r2'], is_rmse=isr['rmse'],
-                oos_mz_r2=float(mz.rsquared), oos_rmse=float(np.sqrt((err**2).mean())),
-                oos_mae=float(err.abs().mean()), oos_mape=float((err.abs()/y_te).mean()),
-                y_test=y_te, y_hat=y_hat, err=err)
-
 # ── IS estimation ─────────────────────────────────────────────────────────────
-res_vs  = estimate(panel, 'VS2_lag')
-res_vix = estimate(panel, 'VIX2_lag')
+res_vs  = estimate_har(panel, 'VS IS',  xcol='VS2_lag')
+res_vix = estimate_har(panel, 'VIX IS', xcol='VIX2_lag')
 
 # ── OOS ───────────────────────────────────────────────────────────────────────
 split = panel.index[int(0.75*len(panel))]
-oos_vs  = oos_forecast(panel, split, 'VS2_lag')
-oos_vix = oos_forecast(panel, split, 'VIX2_lag')
+oos_vs  = out_of_sample_forecast(panel, split, 'VS OOS',  xcol='VS2_lag')
+oos_vix = out_of_sample_forecast(panel, split, 'VIX OOS', xcol='VIX2_lag')
 
 # ── Diebold-Mariano test ──────────────────────────────────────────────────────
 # H0: equal MSE.  d_t = e_VS_t^2 - e_VIX_t^2.  t = mean(d) / NW-SE(d)
-e_vs  = oos_vs['err']
-e_vix = oos_vix['err']
+e_vs  = oos_vs['y_test'] - oos_vs['y_hat']
+e_vix = oos_vix['y_test'] - oos_vix['y_hat']
 d = e_vs**2 - e_vix**2           # positive = VS worse
 d_mean = d.mean()
 # NW SE of d using regression on constant
 dm_res = OLS(d.values, np.ones(len(d))).fit()
-dm_nw  = float(np.sqrt(cov_hac(dm_res, nlags=NW_LAGS)[0,0]))
+dm_nw  = float(_nw_se(dm_res)[0])
 dm_t   = d_mean / dm_nw
 print(f'\nDiebold-Mariano test (H0: equal MSE):')
 print(f'  mean(d) = {d_mean:.4f}  NW-SE = {dm_nw:.4f}  t = {dm_t:.3f}')
@@ -109,7 +57,7 @@ f_vs    = oos_vs['y_hat']
 f_vix   = oos_vix['y_hat']
 X_enc   = add_constant(pd.DataFrame({'f_VS': f_vs.values, 'f_VIX': f_vix.values}))
 enc_res = OLS(y_te.values, X_enc).fit()
-enc_nw  = nw_se(enc_res)
+enc_nw  = _nw_se(enc_res)
 enc_vars = X_enc.columns.tolist()
 print(f'\nForecast encompassing regression (actual ~ const + f_VS + f_VIX):')
 for v, c, se in zip(enc_vars, enc_res.params, enc_nw):
@@ -120,7 +68,7 @@ print(f'  Adj-R²={enc_res.rsquared_adj:.4f}')
 y_all   = panel['RV22_fwd']
 X_both  = add_constant(panel[['VS2_lag','VIX2_lag','RV22_lag','RV5_lag','RV1_lag']])
 res_both = OLS(y_all, X_both).fit()
-ses_both = nw_se(res_both)
+ses_both = _nw_se(res_both)
 print(f'\nCombined model (both VS2_lag + VIX2_lag):  adj_r2={res_both.rsquared_adj:.4f}  rmse={np.sqrt(res_both.mse_resid):.3f}')
 for v, c, se in zip(X_both.columns, res_both.params, ses_both):
     print(f'  {v:<12}  coef={c:.4f}  t={c/se:.2f}')
@@ -142,7 +90,7 @@ def pred_reg(pnl, sp_returns, horizon, vp_col):
     y   = monthly['ret']
     X   = add_constant(monthly[[vp_col]])
     res = OLS(y,X).fit()
-    nw  = np.sqrt(np.diag(cov_hac(res, nlags=max(3,2*horizon))))
+    nw  = _nw_se(res, nlags=max(3,2*horizon))
     vi  = list(X.columns).index(vp_col)
     return dict(h=horizon, n=len(monthly), coef=round(float(res.params[vp_col]),4),
                 nwse=round(float(nw[vi]),4), tstat=round(float(res.params[vp_col]/nw[vi]),2),
@@ -163,9 +111,9 @@ for col,label in [('VP_vs','VS'),('VP_vix','VIX')]:
 
 print(f'\nIS summary:')
 for xcol,r,label in [('VS2_lag',res_vs,'VS'),('VIX2_lag',res_vix,'VIX')]:
-    print(f'  HAR-RV-{label}: adj_r2={r["adj_r2"]:.4f}  rmse={r["rmse"]:.3f}')
+    print(f'  HAR-RV-{label}: adj_r2={r["adj_r2"]:.4f}  rmse={r["rmse_is"]:.3f}')
     for v in ['const',xcol,'RV22_lag','RV5_lag','RV1_lag']:
-        print(f'    {v:<14} coef={r["params"][v]:>8.4f}  t={r["tstat"][v]:>6.2f}')
+        print(f'    {v:<14} coef={r["params"][v]:>8.4f}  t={r["t_stats"][v]:>6.2f}')
 
 print(f'\nOOS summary (split={split.date()}):')
 for label,o in [('VS',oos_vs),('VIX',oos_vix)]:

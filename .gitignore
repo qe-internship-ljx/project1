@@ -22,8 +22,9 @@ Thumbs.db
 **/output/regression_cache/
 *.parquet
 
-# Markdown docs
+# Markdown docs (keep READMEs tracked)
 *.md
+!README.md
 
 # CSV files
 *.csv

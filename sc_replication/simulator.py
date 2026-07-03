@@ -221,6 +221,55 @@ def run_simulation(
 
 
 # -------------------------------------------------------------------------
+# Randomisation-test null pool
+# -------------------------------------------------------------------------
+
+def build_random_entry_pool(
+    panel: pd.DataFrame,
+    hr_df: pd.DataFrame,
+    direction: str,
+    hold_days: float,
+    start_date: Optional[pd.Timestamp] = None,
+    end_date: Optional[pd.Timestamp] = None,
+) -> np.ndarray:
+    """
+    Hedged P&L of a pseudo-trade entered on EVERY eligible day in the window
+    and held for round(hold_days) business days, with the same accounting as
+    _close_trade (direction sign, hedge ratio locked at entry, full costs).
+
+    This is the null-hypothesis pool for the randomisation test: the
+    distribution of per-trade P&L when entry timing carries no information.
+    Entries whose exit would fall beyond the available data are dropped.
+    """
+    sim = (
+        panel
+        .merge(hr_df[["date", "hr"]], on="date", how="left")
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+    if start_date is not None:
+        sim = sim[sim["date"] >= pd.Timestamp(start_date)]
+    if end_date is not None:
+        sim = sim[sim["date"] <= pd.Timestamp(end_date)]
+    sim = sim.reset_index(drop=True)
+    if sim.empty:
+        return np.array([], dtype=float)
+
+    h = max(1, int(round(hold_days)))
+    vix_in  = sim["trade_price"]
+    es_in   = sim["es_price"]
+    hr_in   = sim["hr"].abs()
+    vix_out = vix_in.shift(-h)
+    es_out  = es_in.shift(-h)
+
+    sign    = -1.0 if direction == "short" else 1.0
+    pnl_vix = sign * (vix_out - vix_in) * VIX_MULTIPLIER - VIX_RT_COST
+    pnl_es  = sign * (es_out - es_in) * ES_MULTIPLIER * hr_in - hr_in * ES_RT_COST
+    pool = (pnl_vix + pnl_es).dropna()
+    return pool.to_numpy(dtype=float)
+
+
+# -------------------------------------------------------------------------
 # Results aggregation
 # -------------------------------------------------------------------------
 

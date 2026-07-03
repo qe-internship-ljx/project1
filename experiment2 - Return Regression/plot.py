@@ -1,10 +1,9 @@
 """
 plot.py
 =======
-Regenerates all non-poor-correlation plots under output/plots/ in one shot.
-
-Poor-correlation baselines (Vol Trend, VIX, Term Slope univariate, Expanding VRP)
-are intentionally excluded.  Run horizon_regression.py directly to regenerate those.
+Regenerates all strategy plots under output/plots/ in one shot
+(base_strategies.main() + leveraged_strategies.main() + the Sharpe table
+and VRP-vs-VVIX scatter defined here).
 
 Generated outputs
 -----------------
@@ -39,7 +38,6 @@ Generated outputs
   output/plots/VRP + VVIX MA10/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_VVIX_MA10.png
   output/plots/VRP + Term Slope/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_Term_Slope.png
   output/plots/VRP + Open Interest/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_Open_Interest.png
-  output/plots/trivariate/leveraged_{symmetric,asymmetric,base_return_shift}_VRP_+_VVIX_MA5_+_Term_Slope.png
   output/plots/comparisons/leveraged_asymmetric_vvix_vs_vrp_vvix.png
 
   === Summary table ===
@@ -110,15 +108,9 @@ def make_sharpe_table():
     Sharpe ratios are annualised against a 3% risk-free rate.  Saved to
     output/plots/sharpe_table_extended.png.
     """
-    from helpers import (
-        load_vrp_series, load_es_front_month, load_vvix, compute_vvix_ma5, compute_vvix_ma10,
-        load_vix_futures_term_structure, load_es_open_interest,
-        compute_buy_and_hold, simulate_strategy,
-        compute_trend_quotient, build_master_panel,
-    )
-    from fh_replication.fh_replication import compute_vix_term_slope
+    from helpers import compute_buy_and_hold, simulate_strategy
     from regressions import (
-        OOS_START, OOS_GAP, NW_LAGS, DELTAS,
+        load_standard_panel, OOS_START, OOS_GAP, NW_LAGS, DELTAS,
     )
     from base_strategies import (
         run_ew, run_ew_bivariate,
@@ -131,19 +123,8 @@ def make_sharpe_table():
     )
 
     print("\nBuilding extended Sharpe table — loading data...")
-    vrp        = load_vrp_series()
-    es         = load_es_front_month()
-    vvix_raw   = load_vvix()
-    vvix_ma5   = compute_vvix_ma5(vvix_raw)
-    vvix_ma10  = compute_vvix_ma10(vvix_raw)
-    term_slope = compute_vix_term_slope(load_vix_futures_term_structure())
-    trend_q    = compute_trend_quotient(es)
-    oi         = load_es_open_interest()
-    panel      = build_master_panel(vrp, es, term_slope, trend_q, vvix_ma5)
-    panel      = panel[panel.index >= "2006-03-06"].copy()
-    panel["open_interest"] = oi.reindex(panel.index)
-    panel["vvix_ma10"]     = vvix_ma10.reindex(panel.index)
-    FWD = "fwd_20d"
+    panel = load_standard_panel()
+    FWD   = "fwd_20d"
 
     daily_ret = panel["daily_ret"].dropna()
     bah_sim   = simulate_strategy(compute_buy_and_hold(daily_ret), daily_ret)

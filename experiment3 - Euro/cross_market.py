@@ -6,7 +6,7 @@ base_strategies.py and leveraged_strategies.py (all in "experiment2 - Return
 Regression") — on an arbitrary market panel.
 
 This module lives in "experiment3 - Euro"; the NASDAQ experiment imports it from
-here (see nasdaq_expanding_window.py).
+here (see "experiment3 - Nasdaq"/nasdaq_experiment.py).
 
 The euro / nasdaq experiment files only build a panel with the standard
 experiment2 column names ("VP", "term_slope", "vvix_ma5", "fwd_20d",
@@ -23,7 +23,10 @@ collide across markets.
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 ROOT = Path(__file__).parent
+DATA = ROOT.parent / "data"
 EXP2 = ROOT.parent / "experiment2 - Return Regression"
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(EXP2))
@@ -36,6 +39,31 @@ import leveraged_strategies as lev
 from helpers import compute_buy_and_hold, simulate_strategy
 
 FWD = "fwd_20d"
+
+
+def load_front_month(curve_group: str) -> pd.DataFrame:
+    """Continuous front-month equity-future series for ``curve_group``
+    ("FX" = Euro Stoxx 50, "NN" = NASDAQ-100 E-mini) with a
+    returns-reconstructed price_level rebased to 1000."""
+    sec_meta = pd.read_parquet(DATA / "EquityFuture_security_meta.parquet")
+    hist     = pd.read_parquet(DATA / "EquityFuture_historical.parquet")
+
+    meta = sec_meta[sec_meta["curve_group"] == curve_group][
+        ["security", "expiry_yearmonth"]].copy()
+    meta["expiry_date"] = pd.to_datetime(meta["expiry_yearmonth"], format="%Y-%m")
+
+    fut = hist[hist["security"].isin(meta["security"].tolist())].copy()
+    fut["date"] = pd.to_datetime(fut["date"])
+    fut = fut.merge(meta[["security", "expiry_date"]], on="security")
+
+    fut = fut.sort_values(["date", "expiry_date"])
+    front = (fut.groupby("date").first().reset_index()
+               [["date", "price", "returns"]].dropna(subset=["returns"]))
+    front = front.sort_values("date").set_index("date")
+
+    ret = front["returns"].dropna()
+    front = front.join(((1 + ret).cumprod() * 1000).rename("price_level"), how="left")
+    return front[["price", "price_level", "returns"]].dropna()
 
 # Base-plot 4-delta palettes (reused from base_strategies.main in this folder).
 PAL = {

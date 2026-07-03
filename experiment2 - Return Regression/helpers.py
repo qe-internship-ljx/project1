@@ -10,7 +10,7 @@ Strategy: Systematic long/short timing of S&P 500 E-mini futures using four sign
   4. VVIX tail-risk indicator                  — 5-day SMA of VVIX index
 
 Implementation follows the plan steps 1–8 strictly. Deviations from the plan are
-flagged with [DEV-N] markers throughout the code and summarised in SUMMARY.md.
+flagged with [DEV-N] markers throughout the code.
 
 Steps
 -----
@@ -34,13 +34,9 @@ Deviations from plan (summary)
 [DEV-5] Random forest exploration (Step 6 optional item) is not implemented; this
          is flagged as out-of-scope for the present experiment.
 
-Outputs (all in ./output/)
---------------------------
-  Plots: signals.png, regression_results.png, cumulative_returns.png,
-         position_history.png, drawdown.png
-  CSVs:  signals.csv, regression_results.csv, strategy_performance.csv,
-         benchmark_comparison.csv
-  MD:    EXPERIMENT_RESULTS.md
+This module is a pure library (no main()): it provides the data loaders, signal
+builders, strategy simulator and performance metrics shared by regressions.py,
+base_strategies.py, leveraged_strategies.py, plot.py and the experiment3 ports.
 """
 
 import warnings
@@ -301,6 +297,14 @@ def build_master_panel(vrp: pd.DataFrame,
 
     Forward return: R_{t+20} = (P_{t+20} - P_t) / P_t (cumulative 20-day,
     computed as the 20-day forward rolling product of 1 + daily_return).
+
+    NOTE: this is the cross-market panel assembler used by the experiment3
+    ports (via cross_market.run_all, which redirects caches per market).
+    The experiment2 modules themselves must all build their panel with
+    regressions.build_panel — the two builders produce different row sets
+    (this one drops rows missing VP/term_slope/vvix_ma5), and the
+    regression_cache is keyed by predictor name only, so mixing builders
+    within one cache directory silently mixes training sets.
     """
     # Cumulative forward 20-day return on ES
     ret = es["returns"]

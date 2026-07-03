@@ -31,6 +31,7 @@ Outputs (all in ./output/)
 import warnings
 warnings.filterwarnings("ignore")
 
+import sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -41,20 +42,16 @@ import matplotlib.dates as mdates
 
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tools import add_constant
-from statsmodels.stats.sandwich_covariance import cov_hac
 
 ROOT   = Path(__file__).parent
+sys.path.insert(0, str(ROOT.parent / "bh_replication"))
+from har_model import _nw_se, NW_LAGS   # shared NW HAC SE helper, 44 lags
+
 OUTPUT = ROOT / "output"
 OUTPUT.mkdir(exist_ok=True)
 DATA   = ROOT.parent / "data"
 
 ROLL_WIN = 500  # rolling window in trading days
-NW_LAGS  = 44   # Newey-West lags (matching vrp_experiment)
-
-
-def _nw_se(res, nlags: int = NW_LAGS) -> np.ndarray:
-    cov = cov_hac(res, nlags=nlags)
-    return np.sqrt(np.diag(cov))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -65,8 +62,10 @@ def load_intraday_rv() -> pd.DataFrame:
     Compute daily realized variance from 5-minute intraday ES futures.
 
     Method: for each date, select the front-month ES contract (nearest expiry),
-    compute log returns across the 79 regular-session bins (08:30–15:00),
-    and sum squared returns to get daily RV.
+    compute log returns across all available 5-minute bins with a CLOSE price
+    (no session-window or bin-count filter is applied), and sum squared returns
+    to get daily RV.  The first bin of each day has no within-day predecessor,
+    so the overnight gap return is excluded from RV.
 
     Output columns (monthly %²-units, same convention as bh_replication):
         RV1   daily RV × 22          (annualised-to-monthly scaling)
@@ -104,7 +103,7 @@ def load_intraday_rv() -> pd.DataFrame:
     es = es.sort_values(["date", "BIN_START_TIME"])
     es["log_ret"] = (np.log(es["CLOSE"]).groupby(es["date"]).diff() * 100)
 
-    # Daily intraday RV = sum of squared demeaned within-day log returns
+    # Daily intraday RV = sum of squared within-day log returns (not demeaned)
     daily_rv = (
         es.dropna(subset=["log_ret"])
         .groupby("date")["log_ret"]

@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from .simulator import Trade
+from .simulator import Trade, build_random_entry_pool, MAX_HOLD_DAYS
 
 
 # ????????????????????????????????????????????????????????????????????????????
@@ -62,11 +62,14 @@ def randomisation_pvalue(
     Parameters
     ----------
     actual_mean   : mean P&L of the actual strategy
-    all_pnls      : 1-D array of per-trade P&Ls from which random draws
-                    are made (entire sample, not just actual trades)
+    all_pnls      : 1-D array of pseudo-trade P&Ls forming the null pool —
+                    one entry per eligible day in the trade window, held for
+                    the strategy's average duration (see
+                    simulator.build_random_entry_pool). Must NOT be the
+                    actual trades' own P&Ls, or the test degenerates to ~0.5.
     n_trades      : number of trades in the actual strategy
-    avg_hold_days : average hold duration (used to select pool; here
-                    we just resample from the empirical distribution)
+    avg_hold_days : average hold duration used to build the pool
+                    (informational here; the pool is built by the caller)
     n_iter        : number of Monte-Carlo replications
     """
     rng = np.random.default_rng(rng_seed)
@@ -145,11 +148,19 @@ _FIELDS = [
 ]
 
 
-def print_exhibit5(trades: List[Trade], label: str = "Full sample") -> None:
-    """Replicate the layout of Exhibit 5 (or Exhibit 8 sub-periods)."""
-    # Build pool of all hedged P&Ls for randomisation test
-    all_hedged = np.array([t.pnl_hedged for t in trades], dtype=float)
+def print_exhibit5(
+    trades: List[Trade],
+    label: str = "Full sample",
+    panel: Optional[pd.DataFrame] = None,
+    hr_df: Optional[pd.DataFrame] = None,
+) -> None:
+    """Replicate the layout of Exhibit 5 (or Exhibit 8 sub-periods).
 
+    If `panel` and `hr_df` are provided, the hedged-P&L randomisation p-value
+    is computed against a null pool of same-direction pseudo-trades entered
+    on every eligible day of the trade window (the paper's randomisation
+    test). Without them the p-value is skipped and printed as --.
+    """
     w = 72
     print("=" * w)
     print(f"EXHIBIT 5 -- Trading strategy P&L summary  [{label}]")
@@ -166,9 +177,25 @@ def print_exhibit5(trades: List[Trade], label: str = "Full sample") -> None:
         print(header)
         print("-" * w)
 
+        # Null pool for the randomisation test: pseudo-trades of the same
+        # direction entered on every eligible day of this trade window.
+        sub = [t for t in trades if t.direction == direction]
+        null_pool = None
+        if panel is not None and hr_df is not None and sub:
+            holds    = [t.hold_days for t in sub if t.hold_days is not None]
+            avg_hold = float(np.mean(holds)) if holds else float(MAX_HOLD_DAYS)
+            w_start  = min(t.entry_date for t in sub)
+            w_end    = max((t.exit_date or t.entry_date) for t in sub)
+            null_pool = build_random_entry_pool(
+                panel, hr_df, direction, avg_hold,
+                start_date=w_start, end_date=w_end,
+            )
+            if len(null_pool) == 0:
+                null_pool = None
+
         rows_data = {}
         for field, col_label in _FIELDS:
-            pool = all_hedged if field == "pnl_hedged" else None
+            pool = null_pool if field == "pnl_hedged" else None
             stats = trade_stats(trades, direction, field, pool)
             rows_data[field] = stats
 

@@ -21,7 +21,8 @@ Modules shared with bh_replication (called directly, not duplicated)
 
 Outputs (all in ./output/)
 --------------------------
-  Plots: vrp_experiment_summary_rolling.png
+  Plots: vrp_experiment_summary_rolling.png, vrp_experiment_summary_expanding.png
+  CSVs:  production_loop_rolling.csv, production_loop_expanding.csv
 """
 
 import warnings
@@ -35,7 +36,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from scipy import stats
 
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tools import add_constant
@@ -43,7 +43,8 @@ from statsmodels.tools import add_constant
 # ── Shared modules from bh_replication ────────────────────────────────────────
 BH_DIR = Path(__file__).parent.parent / "bh_replication"
 sys.path.insert(0, str(BH_DIR))
-from data_prep import load_sp500_returns, load_vix, compute_rv_components
+from data_prep import (load_sp500_returns, load_vix, load_variance_swap,
+                       compute_rv_components)
 from har_model import estimate_har, out_of_sample_forecast, NW_LAGS, _nw_se
 
 ROOT   = Path(__file__).parent
@@ -61,10 +62,6 @@ EXP_OOS_START    = "2006-01-01"  # first OOS prediction (after 1990-2005 initial
 # ── Paper benchmarks (Table 3, Model 8) ──────────────────────────────────────
 PAPER_COEFS = {"const": 3.730, "VIX2_lag": 0.108, "RV22_lag": 0.199,
                "RV5_lag": 0.330, "RV1_lag": 0.107}
-PAPER_NW_SE = {"const": 1.903, "VIX2_lag": 0.072, "RV22_lag": 0.096,
-               "RV5_lag": 0.117, "RV1_lag": 0.026}
-PAPER_OOS   = {"rmse": 46.077, "mae": 16.856, "mape": 0.347, "mz_r2": 0.555}
-PAPER_IS_RMSE = 10.508   # from paper Table 3
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -86,12 +83,7 @@ def load_implied_variance_vs() -> pd.Series:
     Implied variance from SPX 1-month variance swap: IVar = VS²/12  (monthly %²-units).
     Pure VS series — no VIX fallback. Available from November 2008 onwards only.
     """
-    swap  = pd.read_csv(DATA / "EquityIndexVarianceSwapData.csv", parse_dates=["DATE"])
-    spx1m = (swap[(swap["UNDERLYING"] == "SPX") & (swap["TENOR_MONTHS"] == 1.0)]
-             .sort_values("DATE")
-             .set_index("DATE")["IMPLIED_VOLATILITY"])
-    spx1m.index.name = "date"
-    ivar = spx1m ** 2 / 12.0
+    ivar = load_variance_swap() ** 2 / 12.0
     ivar.name = "IVar"
     return ivar
 
@@ -216,7 +208,7 @@ def production_loop_expanding(panel: pd.DataFrame,
     """
     Expanding-window production loop.
     The training window is anchored at train_start and grows by one day each step.
-    Predictions begin only from oos_start (after the 2006-2012 initial training period).
+    Predictions begin only from oos_start (after the 1990-2005 initial training period).
     A strict 22-day gap between the last training label and the prediction row is maintained
     (matching the rolling-window design: train slice uses panel.iloc[anchor : i-22]).
 
@@ -340,241 +332,6 @@ def _label_crises(ax, start, end):
             continue
         ax.axvspan(max(s, start), min(e, end), alpha=0.10,
                    color="grey", linewidth=0)
-
-
-def plot_vp_cv(panel, tag, title_extra=""):
-    fig, axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
-    s, e = panel.index[0], panel.index[-1]
-
-    ax = axes[0]
-    _label_crises(ax, s, e)
-    ax.fill_between(panel.index, panel["VP"], 0,
-                    where=(panel["VP"] >= 0), color="steelblue",
-                    alpha=0.55, label="VP > 0")
-    ax.fill_between(panel.index, panel["VP"], 0,
-                    where=(panel["VP"] < 0), color="salmon",
-                    alpha=0.55, label="VP < 0")
-    ax.axhline(0, color="black", linewidth=0.6)
-    ax.set_ylabel("VP = IVar − CV  (%² monthly)")
-    ax.set_title(f"Variance Risk Premium (VP) {title_extra}")
-    ax.legend(fontsize=8); ax.set_ylim(-200, 350)
-
-    ax = axes[1]
-    _label_crises(ax, s, e)
-    ax.plot(panel.index, panel["CV"],   color="darkorange",
-            linewidth=0.7, label="CV — HAR fitted")
-    ax.plot(panel.index, panel["IVar"], color="steelblue",
-            linewidth=0.5, alpha=0.5, label="Implied Var (VIX²/12)")
-    ax.set_ylabel("Variance (%² monthly)")
-    ax.set_title("Conditional Variance (CV) vs Implied Variance")
-    ax.legend(fontsize=8)
-    ax.xaxis.set_major_locator(mdates.YearLocator(5 if (e-s).days > 5000 else 2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    ax.set_ylim(-20, 600)
-
-    plt.tight_layout()
-    path = OUTPUT / f"vp_cv_{tag}.png"
-    plt.savefig(path, dpi=150); plt.close()
-    return path
-
-
-def plot_oos_forecast(y_te, y_hat, oos_metrics, mart_hat, mart_metrics, tag):
-    fig, axes = plt.subplots(3, 1, figsize=(15, 11), sharex=False)
-
-    ax = axes[0]
-    ax.plot(y_te.index,  y_te.values,   color="steelblue",  lw=0.8,
-            alpha=0.8, label="Actual RV")
-    ax.plot(y_hat.index, y_hat.values,  color="darkorange", lw=0.8,
-            alpha=0.9, label=f"HAR-VIX  MZ-R²={oos_metrics['mz_r2']:.3f}")
-    if mart_hat is not None:
-        ax.plot(mart_hat.index, mart_hat.values, color="green", lw=0.7,
-                alpha=0.7, linestyle="--",
-                label=f"Martingale  MZ-R²={mart_metrics['mz_r2']:.3f}")
-    ax.set_ylabel("Monthly RV (%²)"); ax.set_title(f"OOS Forecast — {tag}")
-    ax.legend(fontsize=8); ax.set_ylim(-20, 600)
-    ax.xaxis.set_major_locator(mdates.YearLocator(2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-
-    ax = axes[1]
-    err_har = y_te - y_hat
-    ax.bar(err_har.index, err_har.values, width=1, color="steelblue",
-           alpha=0.5, label="HAR error")
-    if mart_hat is not None:
-        err_m = y_te - mart_hat.reindex(y_te.index)
-        ax.bar(err_m.index, err_m.values, width=1, color="green",
-               alpha=0.3, label="Martingale error")
-    ax.axhline(0, color="black", lw=0.5)
-    ax.set_ylabel("Forecast error"); ax.set_title("Forecast Errors")
-    ax.legend(fontsize=8)
-    ax.xaxis.set_major_locator(mdates.YearLocator(2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-
-    ax = axes[2]
-    cap  = np.percentile(y_te.dropna(), 98)
-    mask = (y_te <= cap) & (y_hat <= cap) & (~np.isnan(y_te)) & (~np.isnan(y_hat))
-    ax.scatter(y_hat[mask], y_te[mask], alpha=0.25, s=3, color="steelblue")
-    m = max(float(y_hat[mask].max()), float(y_te[mask].max()))
-    ax.plot([0, m], [0, m], "r--", lw=1)
-    ax.set_xlabel("HAR Forecast"); ax.set_ylabel("Actual RV")
-    ax.set_title(f"Forecast vs Actual  RMSE={oos_metrics['rmse']:.1f}  "
-                 f"MAE={oos_metrics['mae']:.1f}  MAPE={oos_metrics['mape']:.3f}  "
-                 f"[Paper: RMSE=46.1 MAPE=0.347]")
-
-    plt.tight_layout()
-    path = OUTPUT / f"oos_forecast_{tag}.png"
-    plt.savefig(path, dpi=150); plt.close()
-    return path
-
-
-def plot_production_loop(prod_df: pd.DataFrame, tag: str):
-    fig, axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
-    s, e = prod_df.index[0], prod_df.index[-1]
-
-    ax = axes[0]
-    _label_crises(ax, s, e)
-    ax.plot(prod_df.index, prod_df["y_actual"], color="steelblue",
-            lw=0.7, alpha=0.8, label="Actual RV")
-    ax.plot(prod_df.index, prod_df["y_hat"],    color="darkorange",
-            lw=0.7, alpha=0.9, label="Prod-loop HAR forecast")
-    ax.set_ylabel("Monthly RV (%²)")
-    ax.set_title(f"Production Loop ({ROLL_WIN}-day rolling OLS) — {tag}")
-    ax.legend(fontsize=8)
-
-    ax = axes[1]
-    ax.plot(prod_df.index, prod_df["VP"], color="steelblue",
-            lw=0.7, label="VP (production)")
-    ax.plot(prod_df.index, prod_df["CV"], color="darkorange",
-            lw=0.7, label="CV (production)")
-    ax.axhline(0, color="black", lw=0.5)
-    ax.set_ylabel("Variance (%² monthly)")
-    ax.set_title("Real-time VP and CV from Production Loop")
-    ax.legend(fontsize=8)
-
-    ax.xaxis.set_major_locator(mdates.YearLocator(2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    plt.tight_layout()
-    path = OUTPUT / f"production_loop_{tag}.png"
-    plt.savefig(path, dpi=150); plt.close()
-    return path
-
-
-def plot_return_pred(results: dict, tag: str):
-    horizons = sorted(results.keys())
-    vp_coefs = [results[h]["univariate"]["params"].get("VP", np.nan)
-                for h in horizons]
-    vp_tstat = [results[h]["univariate"]["t_stat"].get("VP", np.nan)
-                for h in horizons]
-    vp_r2    = [results[h]["univariate"]["adj_r2"] for h in horizons]
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    xlbl = [f"{h}m" for h in horizons]
-
-    axes[0].bar(xlbl, vp_coefs, color="steelblue", alpha=0.7)
-    axes[0].axhline(0, color="black", lw=0.5)
-    axes[0].set_title("VP Coefficient (univariate)")
-    axes[0].set_ylabel("Coefficient")
-
-    axes[1].bar(xlbl, vp_tstat,
-                color=["red" if abs(t) < 1.96 else "steelblue" for t in vp_tstat],
-                alpha=0.7)
-    axes[1].axhline( 1.96, color="grey", ls="--", lw=0.8)
-    axes[1].axhline(-1.96, color="grey", ls="--", lw=0.8)
-    axes[1].set_title("VP t-statistic")
-    axes[1].set_ylabel("t-stat")
-
-    axes[2].bar(xlbl, [max(0, r) for r in vp_r2], color="steelblue", alpha=0.7)
-    axes[2].set_title("Adj. R² (VP predicting excess returns)")
-    axes[2].set_ylabel("Adj. R²")
-
-    plt.suptitle(f"Return Predictability — VP univariate ({tag})")
-    plt.tight_layout()
-    path = OUTPUT / f"return_pred_{tag}.png"
-    plt.savefig(path, dpi=150); plt.close()
-    return path
-
-
-def plot_vrp_comparison(prod_vix: pd.DataFrame, prod_vs: pd.DataFrame,
-                        diag_vix: pd.DataFrame, diag_vs: pd.DataFrame):
-    """
-    Three-panel comparison of VIX-based vs VS-based VRP over the overlap period.
-      Row 1: VP time series (VIX vs VS)
-      Row 2: IVar time series (VIX²/12 vs VS²/12)
-      Row 3: Monthly MZ-R² from each production loop
-    """
-    overlap_start = prod_vs.index.min()
-    overlap_end   = min(prod_vix.index.max(), prod_vs.index.max())
-
-    vix_ol = prod_vix.loc[overlap_start:overlap_end]
-    vs_ol  = prod_vs.loc[overlap_start:overlap_end]
-
-    fig, axes = plt.subplots(3, 1, figsize=(15, 12), sharex=False)
-    s, e = overlap_start, overlap_end
-
-    # ── Row 1: VP time series ─────────────────────────────────────────────────
-    ax = axes[0]
-    _label_crises(ax, s, e)
-    ax.plot(vix_ol.index, vix_ol["VP"], color="steelblue",
-            lw=0.7, alpha=0.85, label="VRP (VIX²/12)")
-    ax.plot(vs_ol.index,  vs_ol["VP"],  color="darkorange",
-            lw=0.7, alpha=0.85, label="VRP (VS²/12)")
-    ax.axhline(0, color="black", lw=0.5)
-    ax.set_ylabel("VP = IVar - CV  (%² monthly)")
-    ax.set_title(
-        f"Variance Risk Premium: VIX²/12 vs VS²/12  "
-        f"[{overlap_start.date()} – {overlap_end.date()}]\n"
-        f"VIX mean={vix_ol['VP'].mean():.2f}  VS mean={vs_ol['VP'].mean():.2f}  "
-        f"Corr={vix_ol['VP'].corr(vs_ol['VP'].reindex(vix_ol.index)):.3f}"
-    )
-    ax.legend(fontsize=9)
-    ax.set_ylim(-250, 400)
-    ax.xaxis.set_major_locator(mdates.YearLocator(2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-
-    # ── Row 2: IVar time series ───────────────────────────────────────────────
-    ax = axes[1]
-    _label_crises(ax, s, e)
-    ax.plot(vix_ol.index, vix_ol["IVar"], color="steelblue",
-            lw=0.7, alpha=0.85, label="IVar (VIX²/12)")
-    ax.plot(vs_ol.index,  vs_ol["IVar"],  color="darkorange",
-            lw=0.7, alpha=0.85, label="IVar (VS²/12)")
-    ax.set_ylabel("Implied Variance (%² monthly)")
-    ax.set_title(
-        f"Implied Variance: VIX²/12 vs VS²/12  "
-        f"[VIX mean={vix_ol['IVar'].mean():.2f}  VS mean={vs_ol['IVar'].mean():.2f}  "
-        f"Ratio={vix_ol['IVar'].mean()/vs_ol['IVar'].mean():.3f}]"
-    )
-    ax.legend(fontsize=9)
-    ax.set_ylim(-10, 600)
-    ax.xaxis.set_major_locator(mdates.YearLocator(2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-
-    # ── Row 3: Monthly MZ-R² from each production loop ───────────────────────
-    ax = axes[2]
-    diag_vix_ol = diag_vix[diag_vix.index >= overlap_start]
-    diag_vs_ol  = diag_vs[diag_vs.index  >= overlap_start]
-
-    ax.plot(diag_vix_ol.index, diag_vix_ol["mz_r2"], color="steelblue",
-            lw=1.2, marker="o", markersize=2, label="MZ-R² (VIX-based HAR)")
-    ax.plot(diag_vs_ol.index,  diag_vs_ol["mz_r2"],  color="darkorange",
-            lw=1.2, marker="o", markersize=2, label="MZ-R² (VS-based HAR)")
-    ax.axhline(PAPER_OOS["mz_r2"], color="firebrick", lw=1, ls="--",
-               label=f"Paper OOS R²={PAPER_OOS['mz_r2']:.3f}")
-    ax.axhline(0, color="black", lw=0.4)
-    ax.set_ylabel("Monthly MZ-R²  (12-month trailing window)")
-    ax.set_title(
-        f"Forecast R² over time: VIX-based HAR vs VS-based HAR  "
-        f"[mean VIX={diag_vix_ol['mz_r2'].mean():.3f}  "
-        f"mean VS={diag_vs_ol['mz_r2'].mean():.3f}]"
-    )
-    ax.legend(fontsize=9)
-    ax.xaxis.set_major_locator(mdates.YearLocator(2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-
-    plt.tight_layout()
-    path = OUTPUT / "vrp_comparison_vix_vs.png"
-    plt.savefig(path, dpi=150)
-    plt.close()
-    return path
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -728,7 +485,6 @@ def main():
     # ── Load & build panel ────────────────────────────────────────────────────
     print("\n[1-2] Building daily panel (returns + implied variance + RV)…")
     panel_full = build_full_panel()
-    sp_ret     = load_sp500_returns()
 
     panel_paper = panel_full[
         (panel_full.index >= PAPER_START) &
@@ -773,8 +529,6 @@ def main():
 
     # ── STEP 5: Production loop ───────────────────────────────────────────────
     print("\n[5] Production loop (1000-day rolling OLS)…")
-    print("  Paper sample:")
-    prod_paper = production_loop(panel_paper, ROLL_WIN)
     print("  Full sample (with IS stats for summary plot):")
     prod_rolling, stats_rolling = production_loop(panel_full, ROLL_WIN, return_stats=True)
 
@@ -811,7 +565,7 @@ def main():
                               window_label="1000-day Rolling OLS")
     prod_rolling.to_csv(OUTPUT / "production_loop_rolling.csv")
 
-    # ── Expanding-window production loop (initial train 2006-2012) ──────────
+    # ── Expanding-window production loop (initial train 1990-2005) ──────────
     print(f"\n[EW] Expanding-window production loop "
           f"(anchor={EXP_TRAIN_START}, OOS from {EXP_OOS_START})…")
     prod_ew, stats_ew = production_loop_expanding(

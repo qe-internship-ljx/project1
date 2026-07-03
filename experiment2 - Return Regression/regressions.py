@@ -59,6 +59,14 @@ RW         = 500          # rolling window for mu (base-return-shift / asymmetri
 THRESHOLDS = [0.010, 0.0075, 0.005, 0.002]   # unbound thresholds (descending)
 LEVELS     = [4, 3, 2, 1]                     # matching position multipliers
 
+# Canonical experiment2 model set, shared by base_strategies.main and
+# leveraged_strategies.main so the two evaluation scripts can never drift apart:
+# (panel column, display label). Every bivariate model is VP + second predictor;
+# the display folder/file label is "VRP + <label>".
+UNI_MODELS = [("VP", "VRP"), ("vvix_ma5", "VVIX MA5"), ("vvix_ma10", "VVIX MA10")]
+BIV_MODELS = [("vvix_ma5", "VVIX MA5"), ("vvix_ma10", "VVIX MA10"),
+              ("term_slope", "Term Slope"), ("open_interest", "Open Interest")]
+
 
 # ─── Shared plot helpers (imported by base_strategies.py + leveraged_strategies.py) ─
 
@@ -120,6 +128,26 @@ def window_stats(sim, label, ref_index, start=None):
 
 # ─── Data ─────────────────────────────────────────────────────────────────────
 
+def load_standard_panel():
+    """Load every experiment2 input series and build the standard panel.
+
+    The one shared loader for base_strategies, leveraged_strategies, plot.py and
+    this module's main(), so every script trains on identical rows and the shared
+    regression_cache entries stay consistent."""
+    vrp        = load_vrp_series()
+    es         = load_es_front_month()
+    vvix_raw   = load_vvix()
+    vvix_ma5   = compute_vvix_ma5(vvix_raw)
+    vvix_ma10  = compute_vvix_ma10(vvix_raw)
+    vix_spot   = load_vix_spot()
+    vix_basis  = load_vix_basis()
+    term_slope = compute_vix_term_slope(load_vix_futures_term_structure())
+    oi         = load_es_open_interest()
+    trend_q    = compute_trend_quotient(es)
+    return build_panel(vrp, es, vvix_ma5, vvix_ma10, vix_spot,
+                       vix_basis, term_slope, oi, trend_q)
+
+
 def build_panel(vrp, es, vvix_ma5, vvix_ma10, vix_spot, vix_basis,
                 term_slope, oi, trend_q):
     ret   = es["returns"]
@@ -139,8 +167,6 @@ def build_panel(vrp, es, vvix_ma5, vvix_ma10, vix_spot, vix_basis,
         "daily_ret":     ret,
     })
     panel["fwd_20d"]     = (ret + 1).rolling(20).apply(np.prod, raw=True).shift(-20) - 1
-    panel["vrp_monthly"] = (panel["VP"].resample("ME").last()
-                            .reindex(panel.index).ffill())
     return panel[panel.index >= "2006-03-06"]
 
 
@@ -349,19 +375,7 @@ def main():
     print("=" * 72)
 
     print("\n[1] Loading data...")
-    vrp        = load_vrp_series()
-    es         = load_es_front_month()
-    vvix_raw   = load_vvix()
-    vvix_ma5   = compute_vvix_ma5(vvix_raw)
-    vvix_ma10  = compute_vvix_ma10(vvix_raw)
-    vix_spot   = load_vix_spot()
-    vix_basis  = load_vix_basis()
-    term_slope = compute_vix_term_slope(load_vix_futures_term_structure())
-    oi         = load_es_open_interest()
-    trend_q    = compute_trend_quotient(es)
-
-    panel = build_panel(vrp, es, vvix_ma5, vvix_ma10, vix_spot,
-                        vix_basis, term_slope, oi, trend_q)
+    panel = load_standard_panel()
     print(f"    {len(panel):,} obs  "
           f"[{panel.index.min().date()} - {panel.index.max().date()}]")
 
@@ -383,13 +397,7 @@ def main():
         print(f"    IS R²={is_r2:+.4f}  cumulative OOS R²={oos_r2:+.4f}")
 
     print("\n[3] Bivariate models...")
-    bivar_pairs = [
-        ("VP", "vvix_ma5"),
-        ("VP", "vvix_ma10"),
-        ("VP", "term_slope"),
-        ("VP", "open_interest"),
-    ]
-    for pred1, pred2 in bivar_pairs:
+    for pred1, pred2 in [("VP", col) for col, _ in BIV_MODELS]:
         print(f"  {pred1} + {pred2}")
         df  = compute_betas_bivariate(panel, pred1, pred2, FWD, OOS_GAP, NW_LAGS)
         row = df.iloc[-1]

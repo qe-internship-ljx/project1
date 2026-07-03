@@ -214,7 +214,8 @@ def run_full_timeframe(
     long_n  = sum(1 for t in trades_ext if t.direction == "long")
     print(f"done. {short_n} short + {long_n} long trades.")
 
-    print_exhibit5(trades_ext, label=f"Full timeframe {sim_start[:4]}-{sim_end[:4]}")
+    print_exhibit5(trades_ext, label=f"Full timeframe {sim_start[:4]}-{sim_end[:4]}",
+                   panel=panel_full, hr_df=hr_ext)
     print_exhibit7(trades_ext)
 
     # ---- Year-by-year breakdown -----------------------------------------
@@ -356,180 +357,6 @@ def run_full_timeframe(
     return hr_ext
 
 
-def _DEAD_run_constrained_comparison(
-    panel_full: pd.DataFrame,
-    hr_ext: pd.DataFrame,
-    sim_start: str = "2005-01-01",
-    sim_end:   str = "2026-03-31",
-) -> None:
-    """
-    Run the simulation twice on the full timeframe:
-      Baseline     -- original paper rules only
-      Constrained  -- adds immediate exit when spot VIX crosses the
-                      252-day rolling mean +/- 3 std-dev band.
-
-    SHORT trade exits if vix_spot > mean + 3*std  (spike regime)
-    LONG  trade exits if vix_spot < mean - 3*std  (collapse regime)
-    """
-    from .metrics import sortino_ratio as _sortino
-
-    print("\n" + "#" * 72)
-    print("  PART C -- VIX Band Constraint (rolling mean +/- 3 std-dev)")
-    print("  Window: 21 trading days (1 month).  Exit SHORT when VIX > mean+3s,")
-    print("  exit LONG when VIX < mean-3s.  Full timeframe 2005-2026.")
-    print("#" * 72 + "\n")
-
-    print("Running baseline simulation ...",    end=" ", flush=True)
-    trades_base = run_simulation(panel_full, hr_ext,
-                                 start_date=sim_start, end_date=sim_end,
-                                 use_vix_band_exit=False)
-    print(f"done. {len(trades_base)} trades.")
-
-    print("Running constrained simulation ...", end=" ", flush=True)
-    trades_con = run_simulation(panel_full, hr_ext,
-                                start_date=sim_start, end_date=sim_end,
-                                use_vix_band_exit=True)
-    print(f"done. {len(trades_con)} trades.")
-
-    # --- helper -----------------------------------------------------------
-    def _grp(tlist, direction):
-        sub  = [t for t in tlist if t.direction == direction]
-        vals = np.array([t.pnl_hedged for t in sub], dtype=float)
-        if len(vals) == 0:
-            return dict(n=0, mean=np.nan, sortino=np.nan,
-                        win_rate=np.nan, cum=np.nan)
-        return dict(n=len(vals), mean=float(np.mean(vals)),
-                    sortino=_sortino(vals),
-                    win_rate=float(np.mean(vals > 0)),
-                    cum=float(np.sum(vals)))
-
-    def _pnl(v): return f"{v:>+12,.0f}"   if not np.isnan(v) else "          --"
-    def _dec(v): return f"{v:>12.2f}"     if not np.isnan(v) else "          --"
-    def _pct(v): return f"{100*v:>11.1f}%" if not np.isnan(v) else "          --"
-    def _int(v): return f"{int(v):>12}"   if not np.isnan(v) else "          --"
-
-    w = 76
-
-    # --- side-by-side stats -----------------------------------------------
-    for direction in ("short", "long"):
-        sb = _grp(trades_base, direction)
-        sc = _grp(trades_con,  direction)
-        header = "SHORT" if direction == "short" else "LONG"
-        print("=" * w)
-        print(f"{header} VIX FUTURES -- Baseline vs Constrained (hedged P&L)")
-        print("=" * w)
-        print(f"  {'Metric':<30} {'Baseline':>12} {'Constrained':>12} {'Delta':>12}")
-        print("  " + "-" * (w - 2))
-        for row_label, key, fmt in [
-            ("N trades",       "n",        _int),
-            ("Mean P&L",       "mean",     _pnl),
-            ("Sortino ratio",  "sortino",  _dec),
-            ("Win rate",       "win_rate", _pct),
-            ("Cumulative P&L", "cum",      _pnl),
-        ]:
-            vb, vc = sb.get(key, np.nan), sc.get(key, np.nan)
-            if key == "n":
-                d_str = f"{int(vc - vb):>+12}" if not np.isnan(vc) else "          --"
-                print(f"  {row_label:<30} {_int(vb)} {_int(vc)} {d_str}")
-            elif key == "win_rate":
-                delta = (vc - vb) * 100 if not (np.isnan(vb) or np.isnan(vc)) else np.nan
-                d_str = f"{delta:>+11.1f}pp" if not np.isnan(delta) else "          --"
-                print(f"  {row_label:<30} {_pct(vb)} {_pct(vc)} {d_str}")
-            else:
-                delta = vc - vb if not (np.isnan(vb) or np.isnan(vc)) else np.nan
-                d_str = _pnl(delta) if key in ("mean", "cum") else _dec(delta)
-                print(f"  {row_label:<30} {fmt(vb)} {fmt(vc)} {d_str}")
-        print()
-
-    # --- exit-reason breakdown --------------------------------------------
-    df_con  = trades_to_dataframe(trades_con)
-    df_base = trades_to_dataframe(trades_base)
-
-    print("=" * w)
-    print("EXIT REASON BREAKDOWN -- Constrained simulation")
-    print("=" * w)
-    print(f"  {'Exit reason':<16} {'Dir':<7} {'N':>5} {'Mean P&L':>12}"
-          f" {'Win rate':>10} {'Cum P&L':>12}")
-    print("  " + "-" * (w - 2))
-    for reason in ["roll", "max_days", "vix_band", "window_end"]:
-        for direction in ["short", "long"]:
-            sub = df_con[(df_con["exit_reason"] == reason) &
-                         (df_con["direction"]   == direction)]
-            if len(sub) == 0:
-                continue
-            vals = sub["pnl_hedged"].values.astype(float)
-            print(f"  {reason:<16} {direction:<7} {len(sub):>5}"
-                  f" {np.mean(vals):>+12,.0f}"
-                  f" {100*np.mean(vals > 0):>9.1f}%"
-                  f" {np.sum(vals):>+12,.0f}")
-    print()
-
-    # --- year-by-year comparison ------------------------------------------
-    df_con["year"]  = df_con["entry_date"].dt.year
-    df_base["year"] = df_base["entry_date"].dt.year
-
-    print("=" * w)
-    print("YEAR-BY-YEAR P&L -- Constrained vs Baseline (hedged)")
-    print("=" * w)
-    print(f"  {'Year':<6} {'Base N':>6} {'Base P&L':>10}"
-          f"  {'Con N':>5} {'Con P&L':>10} {'Delta':>10}  Band exits")
-    print("  " + "-" * (w - 2))
-    all_years = sorted(set(df_base["year"]) | set(df_con["year"]))
-    cum_b = cum_c = 0.0
-    for yr in all_years:
-        gb = df_base[df_base["year"] == yr]
-        gc = df_con[df_con["year"] == yr]
-        pnl_b = gb["pnl_hedged"].sum()
-        pnl_c = gc["pnl_hedged"].sum()
-        cum_b += pnl_b
-        cum_c += pnl_c
-        n_band = (gc["exit_reason"] == "vix_band").sum()
-        print(f"  {yr:<6} {len(gb):>6} {pnl_b:>+10,.0f}"
-              f"  {len(gc):>5} {pnl_c:>+10,.0f} {pnl_c - pnl_b:>+10,.0f}  {n_band}")
-    print(f"  {'TOTAL':<6} {len(df_base):>6} {cum_b:>+10,.0f}"
-          f"  {len(df_con):>5} {cum_c:>+10,.0f} {cum_c - cum_b:>+10,.0f}")
-    print()
-
-    # --- band-exit trade detail -------------------------------------------
-    band_exits = df_con[df_con["exit_reason"] == "vix_band"].copy()
-    n_band_total = len(band_exits)
-    print("=" * w)
-    print(f"VIX BAND EXIT DETAIL  (total: {n_band_total})")
-    print("=" * w)
-    if n_band_total == 0:
-        print("  No band exits triggered.")
-    else:
-        n_short = (band_exits["direction"] == "short").sum()
-        n_long  = (band_exits["direction"] == "long").sum()
-        print(f"  {n_short} short exits (VIX > mean+3s),"
-              f"  {n_long} long exits (VIX < mean-3s)")
-        print(f"  Mean P&L on band-exit trades : "
-              f"{band_exits['pnl_hedged'].mean():>+,.0f}")
-        print(f"  Mean P&L on all other trades : "
-              f"{df_con[df_con['exit_reason'] != 'vix_band']['pnl_hedged'].mean():>+,.0f}")
-        print()
-        cols = ["entry_date", "exit_date", "direction",
-                "entry_vix_spot", "pnl_hedged", "pnl_roll"]
-        hdr = (f"  {'Entry':<12} {'Exit':<12} {'Dir':<7} "
-               f"{'VIX@entry':>10} {'Hedged P&L':>12} {'Roll P&L':>10}")
-        sep = "  " + "-" * 62
-        for subset_label, rows_df in [
-            (f"Worst {min(5, n_band_total)}",
-             band_exits.nsmallest(min(5, n_band_total), "pnl_hedged")[cols]),
-            (f"Best {min(5, n_band_total)} (exit locked in a gain)",
-             band_exits.nlargest(min(5, n_band_total), "pnl_hedged")[cols]),
-        ]:
-            print(f"  {subset_label}:")
-            print(hdr); print(sep)
-            for _, r in rows_df.iterrows():
-                print(f"  {str(r.entry_date.date()):<12}"
-                      f" {str(r.exit_date.date()):<12}"
-                      f" {r.direction:<7}"
-                      f" {r.entry_vix_spot:>10.1f}"
-                      f" {r.pnl_hedged:>+12,.0f}"
-                      f" {r.pnl_roll:>+10,.0f}")
-            print()
-
 
 def main() -> None:
     print("\n" + "#" * 72)
@@ -595,13 +422,16 @@ def main() -> None:
     short_n = sum(1 for t in trades_full if t.direction == "short")
     long_n  = sum(1 for t in trades_full if t.direction == "long")
     print(f"done. {short_n} short + {long_n} long  (paper: 62 + 40)")
-    print_exhibit5(trades_full, label="Full sample 2007-2011")
+    print_exhibit5(trades_full, label="Full sample 2007-2011",
+                   panel=panel_full, hr_df=hr_df)
     print_exhibit7(trades_full)
 
     trades_h1 = [t for t in trades_full if t.entry_date <= pd.Timestamp("2009-06-30")]
     trades_h2 = [t for t in trades_full if t.entry_date >  pd.Timestamp("2009-06-30")]
-    print_exhibit5(trades_h1, label="Sub-period 1: Jan 2007 - Jun 2009")
-    print_exhibit5(trades_h2, label="Sub-period 2: Jul 2009 - Dec 2011")
+    print_exhibit5(trades_h1, label="Sub-period 1: Jan 2007 - Jun 2009",
+                   panel=panel_full, hr_df=hr_df)
+    print_exhibit5(trades_h2, label="Sub-period 2: Jul 2009 - Dec 2011",
+                   panel=panel_full, hr_df=hr_df)
 
     # Key numbers
     short_stats   = trade_stats(trades_full, "short", "pnl_hedged")

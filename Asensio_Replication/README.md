@@ -59,7 +59,7 @@ No CLI arguments (behaviour is set by the module constants). Paths are
 anchored to the script location, so any working directory works. Reads
 `data/VolatilityIndexFuture_security_meta.parquet`,
 `data/VolatilityIndexFuture_historical.parquet`,
-`data/VolatilityIndexData.csv`. Requires the sibling `bh_replication`
+`data/VolatilityIndexData.csv`. Requires the sibling `Bekaert_Hoerova_Replication`
 directory on disk (`ols_nw` delegates to its shared `_nw_se` HAC helper).
 
 Dependencies: `numpy`, `pandas`, `matplotlib`, `statsmodels`, `pyarrow`.

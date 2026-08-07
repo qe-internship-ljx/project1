@@ -67,7 +67,7 @@ from statsmodels.regression.linear_model import OLS
 from statsmodels.tools import add_constant
 
 ROOT   = Path(__file__).parent
-sys.path.insert(0, str(ROOT.parent / "bh_replication"))
+sys.path.insert(0, str(ROOT.parent / "Bekaert_Hoerova_Replication"))
 from har_model import _nw_se   # shared Newey-West HAC SE helper
 
 DATA   = ROOT.parent / "data"

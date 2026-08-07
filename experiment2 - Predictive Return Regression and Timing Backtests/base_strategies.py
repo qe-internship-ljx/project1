@@ -1,0 +1,655 @@
+"""
+base_strategies.py
+==================
+Base (unit-position) strategy evaluation and plotting for all models.
+
+Strategies:
+  symmetric       — ±1 when |ŷ| > delta (×4 deltas) and t-stat gate passes
+  asymmetric      — Long if ŷ > µ₅₀₀, Short if ŷ < 0
+  base-return-shift — Long if ŷ > µ₅₀₀, Short if ŷ < µ₅₀₀
+
+Models (ignoring poor-correlation baselines):
+  Univariate:  VRP · VVIX MA5 · VVIX MA10
+  Bivariate:   VRP+VVIX MA5 · VRP+VVIX MA10 · VRP+Term Slope · VRP+Open Interest
+
+Running main() regenerates all 21 output PNGs.
+"""
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import sys
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
+ROOT      = Path(__file__).parent
+OUTPUT    = ROOT / "output"
+CACHE_DIR = OUTPUT / "regression_cache"
+
+sys.path.insert(0, str(ROOT.parent / "Bekaert_Hoerova_Replication"))
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT.parent))
+
+from helpers import (
+    compute_buy_and_hold, simulate_strategy, compute_performance_stats,
+)
+from regressions import (
+    load_standard_panel,
+    compute_betas, compute_betas_bivariate,
+    _yhat_univariate, _yhat_bivariate, _rolling_mu,
+    _shade, oos_cumret, stat_start, window_stats,
+    OOS_START, DELTAS, DELTA_LBL, OOS_GAP, NW_LAGS,
+    UNI_MODELS, BIV_MODELS,
+)
+
+# |t|-stat gate threshold. Lives here (and in leveraged_strategies.py) — not in
+# regressions.py — so the --t-threshold flag can rebind it and have every plot
+# title and the t-stat gate band reflect the chosen value.
+T_THRESH = 1.65
+
+BAH_COLOR = "#d62728"
+
+
+def _resolve_t(t_thresh):
+    """Default to the module-level T_THRESH at call time (rebound by --t)."""
+    return T_THRESH if t_thresh is None else t_thresh
+
+
+def run_cli(main_fn, description, default_t):
+    """Shared --t argparse entry point for this module and leveraged_strategies."""
+    import argparse
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument(
+        "--t", type=float, default=None, metavar="T",
+        help=f"|t|-stat gate threshold applied to every simulation "
+             f"(default: {default_t:.2f}).")
+    main_fn(t_threshold=parser.parse_args().t)
+
+
+# ─── Shared plotting helpers (also imported by leveraged_strategies.py) ───────
+
+def perf_label(st, extra=""):
+    """Legend suffix `[SR=…  ret=…  DD=…  <extra>]` from compute_performance_stats
+    output, so every curve across both strategy modules is labelled identically."""
+    core = (f"SR={st['sharpe']:+.2f}  "
+            f"ret={st['ann_ret']*100:+.1f}%  "
+            f"DD={st['max_dd']*100:.1f}%")
+    return f"[{core}  {extra}]" if extra else f"[{core}]"
+
+
+def _style_cumret_axis(ax):
+    """Log-scale cumulative-return panel styling shared by every strategy figure."""
+    ax.axhline(1, color="black", lw=0.4, ls=":")
+    ax.set_yscale("log")
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}x"))
+    ax.set_ylabel("Cumulative Net Return (log)", fontsize=9)
+    ax.legend(fontsize=8, loc="upper left", framealpha=0.92)
+    ax.grid(axis="y", alpha=0.2, lw=0.6)
+    ax.spines[["top", "right"]].set_visible(False)
+
+
+def _annotate_position_panel(ax, sim, color, pL, pS, pF, avg_pos, oos_start=OOS_START):
+    """Long/Short/Flat mix + directional-accuracy text on a position panel.
+    Accuracy is the share of profitable days per prior-day position side over
+    the OOS window; the mix percentages are the caller's (their window and
+    position convention differ between the unit and leveraged panels)."""
+    sim_oos    = sim[sim.index >= oos_start]
+    prev_pos   = sim_oos["position"].shift(1)
+    long_mask  = prev_pos > 0
+    short_mask = prev_pos < 0
+    long_acc   = float((sim_oos.loc[long_mask,  "gross_pnl"] > 0).mean()) if long_mask.any()  else float("nan")
+    short_acc  = float((sim_oos.loc[short_mask, "gross_pnl"] > 0).mean()) if short_mask.any() else float("nan")
+    long_acc_str  = f"{long_acc  * 100:.1f}%" if not np.isnan(long_acc)  else "N/A"
+    short_acc_str = f"{short_acc * 100:.1f}%" if not np.isnan(short_acc) else "N/A"
+    ax.text(0.01, 0.97,
+            f"Long {pL:.1f}%  Short {pS:.1f}%  Flat {pF:.1f}%  AvgPos={avg_pos:+.3f}",
+            transform=ax.transAxes, fontsize=7.5, va="top", color=color)
+    ax.text(0.01, 0.83,
+            f"Long accuracy={long_acc_str}  Short accuracy={short_acc_str}",
+            transform=ax.transAxes, fontsize=7.5, va="top", color=color)
+
+
+def _draw_bah(ax, bah_sim, stat_start_dt, stat_lbl, rebase_start, oos_start=OOS_START):
+    """Panel-1 Buy-and-Hold curve(s), shared by base_strategies.py and
+    leveraged_strategies.py.
+
+    Draws the full-OOS line (stats over the window from `stat_start_dt`), plus a
+    second line rebased to `rebase_start` when a strategy only activated post-2020
+    (`rebase_start` is None otherwise). `stat_lbl` is the caller's legend suffix.
+    """
+    bah_st  = compute_performance_stats(bah_sim[bah_sim.index >= stat_start_dt], "BaH")
+    bah_oos = oos_cumret(bah_sim, start=oos_start)
+    ax.plot(bah_oos.index, bah_oos.values,
+            color=BAH_COLOR, lw=1.5, ls="-.", alpha=0.6,
+            label=f"Buy-and-Hold{stat_lbl}  {perf_label(bah_st)}")
+
+    if rebase_start is not None:
+        bah_from   = bah_sim["net_pnl"][bah_sim.index >= rebase_start]
+        bah_act    = (1 + bah_from).cumprod()
+        bah_act_st = compute_performance_stats(
+            bah_sim[bah_sim.index >= rebase_start], "BaH_act")
+        ax.plot(bah_act.index, bah_act.values,
+                color=BAH_COLOR, lw=1.2, ls=":", alpha=0.85,
+                label=(f"Buy-and-Hold from {rebase_start.strftime('%Y-%m-%d')}  "
+                       f"{perf_label(bah_act_st)}"))
+
+
+def _align_zero(ax_left, ax_right):
+    """Force both twin axes to share y=0 by making each range symmetric."""
+    lo1, hi1 = ax_left.get_ylim()
+    lo2, hi2 = ax_right.get_ylim()
+    half1 = max(abs(lo1), abs(hi1)) or 1.0
+    half2 = max(abs(lo2), abs(hi2)) or 1.0
+    ax_left.set_ylim(-half1, half1)
+    ax_right.set_ylim(-half2, half2)
+
+
+def draw_tstat_beta_panel(ax, betas_df, labels, tstat_colors, nw_lags, t_thresh=None):
+    """Canonical t-stat + beta twin-axis panel, shared by base_strategies.py and
+    leveraged_strategies.py so the panel is identical across every strategy.
+
+    Draws, for 1-3 predictors:
+      • NW t-stat per predictor on the left axis (one per `tstat_colors`), with
+        the |t| = `t_thresh` gate band (defaults to this module's T_THRESH, so it
+        tracks the --t-threshold flag; callers in leveraged_strategies.py pass
+        their own threshold explicitly).
+      • Each predictor's expanding-window beta on a grey twin axis, NORMALISED by
+        its own peak |beta| so predictors on wildly different scales (e.g. VRP
+        ~1e-4 vs VVIX ~1e-3) are both legible and their SIGN is unambiguous.
+        `_align_zero` then pins y=0 of both axes together.
+
+    Normalising + zero-aligning is what keeps a small-but-positive beta (VRP in
+    the bivariate models) from visually sinking to the bottom of a raw beta axis
+    and reading as negative against the t-stat scale.
+
+    `labels` / `tstat_colors` are parallel lists of equal length (1, 2, or 3);
+    column names are taken from `betas_df` (`beta`/`t_stat` for one predictor,
+    `beta_i`/`t_stat_i` otherwise).
+    """
+    if t_thresh is None:
+        t_thresh = T_THRESH
+    n = len(labels)
+    if n != len(tstat_colors):
+        raise ValueError("labels and tstat_colors must be the same length")
+    if not 1 <= n <= 3:
+        raise ValueError(f"draw_tstat_beta_panel supports 1-3 predictors, got {n}")
+
+    t_cols = ["t_stat"] if n == 1 else [f"t_stat_{i+1}" for i in range(n)]
+    b_cols = ["beta"]   if n == 1 else [f"beta_{i+1}"   for i in range(n)]
+    t_styles = ["-", "--", "-."]
+    b_styles = ["--"] if n == 1 else ["-", ":", "-."]
+
+    # ── t-stat lines (left axis) ──────────────────────────────────────────────
+    for i in range(n):
+        s = betas_df[t_cols[i]]
+        ax.plot(s.index, s.values, color=tstat_colors[i], lw=1.0, alpha=0.85,
+                ls=t_styles[i],
+                label=f"NW t-stat: {labels[i]} ({nw_lags}-lag HAC)")
+    ax.fill_between(betas_df.index, -t_thresh, t_thresh,
+                    color="firebrick", alpha=0.05, label="Below gate (flat zone)")
+    ax.axhline( t_thresh, color="firebrick", lw=1.2, ls="--",
+               label=f"|t| = {t_thresh:.2f} gate")
+    ax.axhline(-t_thresh, color="firebrick", lw=1.2, ls="--")
+    ax.axhline(0, color="black", lw=0.5, ls=":")
+    ax.set_ylabel("NW t-stat" if n > 1 else f"NW t-stat ({labels[0]})", fontsize=9)
+    ax.grid(axis="y", alpha=0.2, lw=0.6)
+    ax.spines["top"].set_visible(False)
+
+    # ── beta lines (grey twin axis, normalised by own peak) ───────────────────
+    ax2 = ax.twinx()
+    for i in range(n):
+        b    = betas_df[b_cols[i]]
+        peak = b.abs().max() or 1.0
+        lbl  = (f"Beta ({labels[i]})" if n == 1
+                else f"Beta: {labels[i]} (peak={peak:.3g})")
+        ax2.plot(b.index, b.values / peak, color="dimgrey", lw=1.0,
+                 ls=b_styles[i], alpha=0.60, label=lbl)
+    ax2.axhline(0, color="dimgrey", lw=0.4, ls=":")
+    ax2.set_ylabel("Beta (normalised)" if n > 1 else f"Beta ({labels[0]})",
+                   fontsize=8, color="dimgrey")
+    ax2.tick_params(axis="y", labelcolor="dimgrey", labelsize=7)
+    ax2.spines["top"].set_visible(False)
+    _align_zero(ax, ax2)
+
+    l1, lb1 = ax.get_legend_handles_labels()
+    l2, lb2 = ax2.get_legend_handles_labels()
+    ax.legend(l1 + l2, lb1 + lb2, fontsize=8, loc="upper left")
+    return ax2
+
+
+def _finalize(fig, axes, out_path):
+    import matplotlib.dates as mdates
+    for ax in axes:
+        ax.xaxis.set_major_locator(mdates.YearLocator(2))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+        ax.tick_params(axis="x", which="major", labelbottom=True, labelsize=7, pad=2)
+    fig.savefig(out_path, dpi=155, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out_path.name}")
+
+
+# ─── Plotting helpers ─────────────────────────────────────────────────────────
+
+def _stat_window(sim_dict_or_sim, bah_sim):
+    """Plot legend window via the shared stat_start rule.
+
+    Returns (rebase_start, stat_start, stat_lbl); rebase_start is None when the
+    window is the full OOS span (no post-2020 activation rebase)."""
+    sims = ([sim for _, sim in sim_dict_or_sim.values()]
+            if isinstance(sim_dict_or_sim, dict) else sim_dict_or_sim)
+    start        = stat_start(sims, bah_sim.index)
+    rebase_start = start if start > pd.Timestamp(OOS_START) else None
+    stat_lbl     = (f" · stats from {start.strftime('%Y-%m-%d')}"
+                    if rebase_start is not None else "")
+    return rebase_start, start, stat_lbl
+
+
+def _print_delta_stats(sim_dict, bah_sim):
+    """Print per-delta SR/return/drawdown over the same window the plot legend uses
+    (shared stat_start across the delta grid)."""
+    sims  = [sim for _, sim in sim_dict.values()]
+    start = stat_start(sims, bah_sim.index)
+    if start > pd.Timestamp(OOS_START):
+        print(f"    stats from {start.strftime('%Y-%m-%d')} (first activation)")
+    for di in sorted(sim_dict):
+        _, sim = sim_dict[di]
+        st = window_stats(sim, f"d{di}", bah_sim.index, start=start)
+        print(f"    delta={DELTA_LBL[di]}  SR={st['sharpe']:+.2f}  "
+              f"ret={st['ann_ret']*100:+.1f}%  DD={st['max_dd']*100:.1f}%")
+
+
+# ─── Shared per-delta figure (symmetric / asymmetric / base-return-shift) ─────
+
+# Per-mode title fragments: (suffix after "OOS from {date}", description prefix).
+# A None description falls back to the symmetric "training grows daily" line.
+_MODE_TITLE = {
+    "sym":   ("", None),
+    "asym":  (", Asymmetric Threshold",
+              "Long: (ŷ-µ₅₀₀) > delta  |  Short: (-ŷ) > delta  |  "),
+    "rolmu": (", Base-Return-Shift",
+              "Long: (ŷ-µ₅₀₀) > delta  |  Short: (µ₅₀₀-ŷ) > delta  |  "),
+}
+
+
+def _plot_delta_grid(labels, mode, horizon_label, oos_gap, nw_lags,
+                     color_palette, sim_dict, betas_df, bah_sim, out_path,
+                     r2_oos=None, oos_start=None, extra_title=""):
+    """Cumulative-return + t-stat + per-delta-position figure shared by every base
+    (unit-position) strategy.
+
+    `labels` is the 1-2 predictor names (joined for the title and fed to the
+    shared t-stat panel). `mode` (sym / asym / rolmu) only selects the title text
+    — the panels themselves are identical across all three thresholds.
+    """
+    _oos_start = oos_start if oos_start is not None else OOS_START
+    oos_dt   = pd.Timestamp(_oos_start)
+    e_dt     = betas_df.index[-1]
+    xlim     = (oos_dt, e_dt)
+    n_deltas = len(DELTAS)
+
+    _rebase_start, _stat_start, _stat_lbl = _stat_window(sim_dict, bah_sim)
+
+    r2_str = f"  R²_OOS = {r2_oos:+.4f}" if r2_oos is not None else ""
+
+    mode_tag, desc = _MODE_TITLE[mode]
+    if desc is None:
+        desc = f"Training grows daily; OOS gap = {oos_gap} days; "
+    gate_clause = (f"|t| > {T_THRESH:.2f} gate"
+                   + (" (both betas)" if len(labels) > 1 else ""))
+
+    h_ratios = [2.5, 1.2] + [1.0] * n_deltas
+    fig, axes = plt.subplots(
+        2 + n_deltas, 1, figsize=(14, 11 + 2.2 * n_deltas), sharex=True,
+        gridspec_kw={"height_ratios": h_ratios, "hspace": 0.35},
+    )
+    ax_ret = axes[0]
+    ax_t   = axes[1]
+    ax_pos = axes[2:]
+
+    fig.suptitle(
+        f"{' + '.join(labels)} -> {horizon_label} Forward Return  "
+        f"(Expanding Window, OOS from {_oos_start}{mode_tag}){r2_str}"
+        f"{extra_title}\n"
+        f"{desc}"
+        f"NW-HAC {nw_lags} lags; {gate_clause}; 0.05% slippage",
+        fontsize=10, y=0.998,
+    )
+    fig.subplots_adjust(top=0.955, bottom=0.03, left=0.10, right=0.93)
+
+    ax_ret.set_xlim(*xlim)
+    _shade(ax_ret, oos_dt, e_dt)
+
+    _draw_bah(ax_ret, bah_sim, _stat_start, _stat_lbl, _rebase_start,
+              oos_start=_oos_start)
+
+    for di, (delta, lbl) in enumerate(zip(DELTAS, DELTA_LBL)):
+        _, sim = sim_dict[di]
+        cum     = oos_cumret(sim, start=_oos_start)
+        st_plot = compute_performance_stats(
+            sim[sim.index >= _stat_start], f"EW_{mode}_{di}")
+        pos_stat = sim["position"][sim.index >= _stat_start]
+        pL = float((pos_stat == 1).mean() * 100)
+        pS = float((pos_stat == -1).mean() * 100)
+        ax_ret.plot(cum.index, cum.values,
+                    color=color_palette[di], lw=1.8, alpha=0.9,
+                    label=f"{lbl}  {perf_label(st_plot, f'L{pL:.0f}%/S{pS:.0f}%')}")
+
+    _style_cumret_axis(ax_ret)
+
+    ax_t.set_xlim(*xlim)
+    _shade(ax_t, oos_dt, e_dt)
+
+    draw_tstat_beta_panel(ax_t, betas_df, labels,
+                          [color_palette[0]] * len(labels), nw_lags)
+
+    for di, (delta, lbl, ax_p) in enumerate(zip(DELTAS, DELTA_LBL, ax_pos)):
+        _, sim = sim_dict[di]
+        pos = sim["position"][sim.index >= _oos_start]
+        ax_p.set_xlim(*xlim)
+        _shade(ax_p, oos_dt, e_dt)
+        ax_p.fill_between(pos.index, pos.where(pos ==  1, 0), 0,
+                          color=color_palette[di], alpha=0.75, label="Long")
+        ax_p.fill_between(pos.index, pos.where(pos == -1, 0), 0,
+                          color=color_palette[di], alpha=0.30, hatch="///", label="Short")
+        ax_p.axhline(0, color="black", lw=0.4)
+        ax_p.set_ylim(-1.5, 1.5)
+        ax_p.set_yticks([-1, 0, 1])
+        ax_p.set_yticklabels(["Short", "Flat", "Long"], fontsize=8)
+        ax_p.set_ylabel(lbl, fontsize=9, rotation=0,
+                        ha="right", va="center", labelpad=56, color=color_palette[di])
+        pL = float((pos == 1).mean() * 100)
+        pS = float((pos == -1).mean() * 100)
+        pF = float((pos == 0).mean() * 100)
+        _annotate_position_panel(ax_p, sim, color_palette[di], pL, pS, pF,
+                                 float(pos.mean()), oos_start=_oos_start)
+        ax_p.spines[["top", "right"]].set_visible(False)
+
+    _finalize(fig, [ax_ret, ax_t] + list(ax_pos), out_path)
+
+
+# Thin wrappers preserving the per-strategy public API (used by main() and
+# cross_market.py); all delegate to _plot_delta_grid.
+
+def plot_2panel(pred_label, horizon_label, oos_gap, nw_lags,
+                color_palette, sim_dict, betas_df, bah_sim, out_path,
+                r2_oos=None, oos_start=None):
+    _plot_delta_grid([pred_label], "sym", horizon_label, oos_gap, nw_lags,
+                     color_palette, sim_dict, betas_df, bah_sim, out_path,
+                     r2_oos=r2_oos, oos_start=oos_start)
+
+
+def plot_2panel_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_lags,
+                          color_palette, sim_dict, betas_df, bah_sim, out_path,
+                          r2_oos=None, oos_start=None):
+    _plot_delta_grid([pred1_label, pred2_label], "sym", horizon_label, oos_gap,
+                     nw_lags, color_palette, sim_dict, betas_df, bah_sim, out_path,
+                     r2_oos=r2_oos, oos_start=oos_start)
+
+
+def plot_asym(pred_label, horizon_label, oos_gap, nw_lags,
+              color_palette, sim_dict, betas_df, bah_sim, out_path,
+              r2_oos=None, oos_start=None, extra_title=""):
+    _plot_delta_grid([pred_label], "asym", horizon_label, oos_gap, nw_lags,
+                     color_palette, sim_dict, betas_df, bah_sim, out_path,
+                     r2_oos=r2_oos, oos_start=oos_start, extra_title=extra_title)
+
+
+def plot_asym_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_lags,
+                        color_palette, sim_dict, betas_df, bah_sim, out_path,
+                        r2_oos=None, oos_start=None, extra_title=""):
+    _plot_delta_grid([pred1_label, pred2_label], "asym", horizon_label, oos_gap,
+                     nw_lags, color_palette, sim_dict, betas_df, bah_sim, out_path,
+                     r2_oos=r2_oos, oos_start=oos_start, extra_title=extra_title)
+
+
+def plot_rolmu(pred_label, horizon_label, oos_gap, nw_lags,
+               color_palette, sim_dict, betas_df, bah_sim, out_path,
+               r2_oos=None, oos_start=None, extra_title=""):
+    _plot_delta_grid([pred_label], "rolmu", horizon_label, oos_gap, nw_lags,
+                     color_palette, sim_dict, betas_df, bah_sim, out_path,
+                     r2_oos=r2_oos, oos_start=oos_start, extra_title=extra_title)
+
+
+def plot_rolmu_bivariate(pred1_label, pred2_label, horizon_label, oos_gap, nw_lags,
+                         color_palette, sim_dict, betas_df, bah_sim, out_path,
+                         r2_oos=None, oos_start=None, extra_title=""):
+    _plot_delta_grid([pred1_label, pred2_label], "rolmu", horizon_label, oos_gap,
+                     nw_lags, color_palette, sim_dict, betas_df, bah_sim, out_path,
+                     r2_oos=r2_oos, oos_start=oos_start, extra_title=extra_title)
+
+
+# ─── Position builders ────────────────────────────────────────────────────────
+# Every position strategy — the six unit-position builders below AND the six
+# leveraged builders in leveraged_strategies.py — shares one skeleton:
+# load-from-cache → expanding-window betas + ŷ + |t|-gate → strategy-specific
+# position assignment → cache. The wrappers differ only in the cache key, the
+# stored series name, and the assignment rule. Cache keys are kept byte-identical
+# to the originals so existing regression_cache/ files hit.
+
+def _run_gated(panel, preds, fwd_col, oos_gap, nw_lags, t_thresh,
+               cache, pos_name, assign, use_mu, rolling_window=None):
+    """Shared cached backtest skeleton. `preds` is the 1-2 predictor columns;
+    `assign(pos, idx, yh, mu)` mutates the zero-initialised `pos` series in place
+    for the gate-passing dates `idx` (`mu` is the oos-gap-lagged rolling mean
+    reindexed to `idx`, None unless `use_mu`). `cache` is the full parquet path —
+    callers build it from their own module's CACHE_DIR so the cross-market cache
+    redirect (see experiment3/cross_market.py) keeps working per module.
+    """
+    if cache.exists():
+        return pd.read_parquet(cache).squeeze().rename(pos_name)
+
+    sub = panel.dropna(subset=[*preds, fwd_col]).copy()
+    if len(preds) == 1:
+        betas_df = compute_betas(panel, preds[0], fwd_col, oos_gap, nw_lags)
+        y_hat    = _yhat_univariate(panel, preds[0], fwd_col, betas_df)
+        fire     = betas_df["t_stat"].abs() > t_thresh
+    else:
+        betas_df = compute_betas_bivariate(panel, preds[0], preds[1], fwd_col, oos_gap, nw_lags)
+        y_hat    = _yhat_bivariate(panel, preds[0], preds[1], fwd_col, betas_df)
+        fire     = ((betas_df["t_stat_1"].abs() > t_thresh)
+                    & (betas_df["t_stat_2"].abs() > t_thresh))
+
+    pos = pd.Series(0.0, index=sub.index, name=pos_name)
+    idx = y_hat.index[fire.reindex(y_hat.index, fill_value=False)]
+    yh  = y_hat.loc[idx]
+
+    mu = None
+    if use_mu:
+        mu_kw = {} if rolling_window is None else {"rolling_window": rolling_window}
+        mu = _rolling_mu(panel, fwd_col, oos_gap,
+                         predictor=(preds[0] if len(preds) == 1 else list(preds)),
+                         **mu_kw).reindex(idx)
+
+    assign(pos, idx, yh, mu)
+    pos.to_frame().to_parquet(cache)
+    return pos
+
+
+def _run_unit(panel, preds, fwd_col, oos_gap, nw_lags, mode, delta, t_thresh,
+              cache_tag, pos_name):
+    """Unit-position (±1) assignment on the shared skeleton. `mode` selects:
+        sym   — long ŷ > delta, short ŷ < -delta
+        asym  — long (ŷ-µ) > delta, short (-ŷ) > delta   (long wins ties)
+        rolmu — long (ŷ-µ) > delta, short (µ-ŷ) > delta   (long wins ties)
+    """
+    def assign(pos, idx, yh, mu):
+        if mode == "sym":
+            pos.loc[idx[yh >  delta]] =  1.0
+            pos.loc[idx[yh < -delta]] = -1.0
+        else:
+            excess     = yh - mu
+            long_mask  = excess > delta
+            short_mask = (-yh > delta) if mode == "asym" else (-excess > delta)
+            pos.loc[idx[long_mask]]               =  1.0
+            pos.loc[idx[short_mask & ~long_mask]] = -1.0
+
+    return _run_gated(panel, preds, fwd_col, oos_gap, nw_lags, t_thresh,
+                      CACHE_DIR / cache_tag, pos_name, assign,
+                      use_mu=(mode != "sym"))
+
+
+def run_ew(panel, predictor, fwd_col, oos_gap, nw_lags, delta, t_thresh=None):
+    """±1 when |ŷ| > delta and t-stat gate passes."""
+    t_thresh = _resolve_t(t_thresh)
+    tag = (f"pos_EW_{predictor}_{fwd_col}_d{int(delta*10000)}bps"
+           f"_t{int(t_thresh*100)}_oos{OOS_START}.parquet")
+    return _run_unit(panel, [predictor], fwd_col, oos_gap, nw_lags, "sym",
+                     delta, t_thresh, tag, f"pos_{predictor}_{delta}")
+
+
+def run_ew_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, delta, t_thresh=None):
+    """Both betas must pass the |t| > t_thresh gate."""
+    t_thresh = _resolve_t(t_thresh)
+    tag = (f"pos_EWbiv_{pred1}_{pred2}_{fwd_col}_d{int(delta*10000)}bps"
+           f"_t{int(t_thresh*100)}_oos{OOS_START}.parquet")
+    return _run_unit(panel, [pred1, pred2], fwd_col, oos_gap, nw_lags, "sym",
+                     delta, t_thresh, tag, f"pos_{pred1}_{pred2}_{delta}")
+
+
+def run_ew_asym(panel, predictor, fwd_col, oos_gap, nw_lags, delta=0.0, t_thresh=None):
+    """Long if (ŷ-µ₅₀₀) > delta, short if -ŷ > delta."""
+    t_thresh = _resolve_t(t_thresh)
+    d_sfx = f"_d{int(round(delta * 10000))}" if delta > 0 else ""
+    tag = (f"pos_EWasym_{predictor}_{fwd_col}"
+           f"_t{int(t_thresh*100)}{d_sfx}_oos{OOS_START}.parquet")
+    return _run_unit(panel, [predictor], fwd_col, oos_gap, nw_lags, "asym",
+                     delta, t_thresh, tag, f"pos_asym_{predictor}")
+
+
+def run_ew_asym_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, delta=0.0, t_thresh=None):
+    """Both betas must pass gate. Long if (ŷ-µ₅₀₀) > delta, short if -ŷ > delta."""
+    t_thresh = _resolve_t(t_thresh)
+    d_sfx = f"_d{int(round(delta * 10000))}" if delta > 0 else ""
+    tag = (f"pos_EWasym_{pred1}_{pred2}_{fwd_col}"
+           f"_t{int(t_thresh*100)}{d_sfx}_oos{OOS_START}.parquet")
+    return _run_unit(panel, [pred1, pred2], fwd_col, oos_gap, nw_lags, "asym",
+                     delta, t_thresh, tag, f"pos_asym_{pred1}_{pred2}")
+
+
+def run_ew_rolmu(panel, predictor, fwd_col, oos_gap, nw_lags, delta=0.0, t_thresh=None):
+    """Long if (ŷ-µ₅₀₀) > delta, short if (µ₅₀₀-ŷ) > delta."""
+    t_thresh = _resolve_t(t_thresh)
+    d_sfx = f"_d{int(round(delta * 10000))}" if delta > 0 else ""
+    tag = (f"pos_EWrolmu_{predictor}_{fwd_col}"
+           f"_t{int(t_thresh*100)}{d_sfx}_oos{OOS_START}.parquet")
+    return _run_unit(panel, [predictor], fwd_col, oos_gap, nw_lags, "rolmu",
+                     delta, t_thresh, tag, f"pos_rolmu_{predictor}")
+
+
+def run_ew_rolmu_bivariate(panel, pred1, pred2, fwd_col, oos_gap, nw_lags, delta=0.0, t_thresh=None):
+    """Both betas must pass gate. Long if (ŷ-µ₅₀₀) > delta, short if (µ₅₀₀-ŷ) > delta."""
+    t_thresh = _resolve_t(t_thresh)
+    d_sfx = f"_d{int(round(delta * 10000))}" if delta > 0 else ""
+    tag = (f"pos_EWrolmu_{pred1}_{pred2}_{fwd_col}"
+           f"_t{int(t_thresh*100)}{d_sfx}_oos{OOS_START}.parquet")
+    return _run_unit(panel, [pred1, pred2], fwd_col, oos_gap, nw_lags, "rolmu",
+                     delta, t_thresh, tag, f"pos_rolmu_{pred1}_{pred2}")
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def main(t_threshold=None):
+    """Run all 21 base-strategy simulations/plots.
+
+    `t_threshold` overrides the |t|-stat gate used by every simulation (default
+    T_THRESH = 1.65). It rebinds the module-level T_THRESH so plot titles and the
+    per-strategy cache keys reflect the chosen value; cache files encode the
+    threshold, so different thresholds never collide.
+    """
+    if t_threshold is not None:
+        global T_THRESH
+        T_THRESH = t_threshold
+
+    print("=" * 72)
+    print("  base_strategies.py — base (unit-position) strategy evaluation")
+    print("  7 models × 3 strategies = 21 plots")
+    print(f"  |t| gate threshold = {T_THRESH:.2f}")
+    print("=" * 72)
+
+    print("\n[1] Loading data...")
+    panel = load_standard_panel()
+    print(f"    {len(panel):,} obs  "
+          f"[{panel.index.min().date()} - {panel.index.max().date()}]")
+
+    daily_ret = panel["daily_ret"].dropna()
+    bah_sim   = simulate_strategy(compute_buy_and_hold(daily_ret), daily_ret)
+    FWD       = "fwd_20d"
+
+    # ── 4-delta palettes per model (uni keyed by predictor, biv by 2nd predictor) ──
+    uni_pal = {
+        "VP":        ["#08306b", "#2171b5", "#4292c6", "#6baed6"],
+        "vvix_ma5":  ["#3f007d", "#6a51a3", "#807dba", "#9e9ac8"],
+        "vvix_ma10": ["#7a0177", "#c51b8a", "#f768a1", "#fbb4b9"],
+    }
+    biv_pal = {
+        "vvix_ma5":      ["#3f007d", "#6a51a3", "#9e9ac8", "#dadaeb"],
+        "vvix_ma10":     ["#ae017e", "#dd3497", "#f768a1", "#fbb4b9"],
+        "term_slope":    ["#00441b", "#006d2c", "#31a354", "#74c476"],
+        "open_interest": ["#54278f", "#756bb1", "#9e9ac8", "#cbc9e2"],
+    }
+
+    # ── Strategy specs: (run_fn, plot_fn, filename prefix) ──
+    # run_fn(panel, *preds, FWD, OOS_GAP, NW_LAGS, delta) → position series.
+    # plot_fn(... pred labels ..., out_path=...) → figure. All three thresholds
+    # share one skeleton: loop DELTAS → simulate → print stats → plot.
+    uni_strats = [
+        (run_ew,       plot_2panel, "symmetric"),
+        (run_ew_asym,  plot_asym,   "asymmetric"),
+        (run_ew_rolmu, plot_rolmu,  "base_return_shift"),
+    ]
+    biv_strats = [
+        (run_ew_bivariate,       plot_2panel_bivariate, "symmetric"),
+        (run_ew_asym_bivariate,  plot_asym_bivariate,   "asymmetric"),
+        (run_ew_rolmu_bivariate, plot_rolmu_bivariate,  "base_return_shift"),
+    ]
+
+    for mi, (col, label) in enumerate(UNI_MODELS, 1):
+        betas   = compute_betas(panel, col, FWD, OOS_GAP, NW_LAGS)
+        out_dir = OUTPUT / "plots" / label
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for run_fn, plot_fn, prefix in uni_strats:
+            print(f"\n[{mi}] {label} {prefix}...")
+            sim_dict = {}
+            for di, delta in enumerate(DELTAS):
+                pos = run_fn(panel, col, FWD, OOS_GAP, NW_LAGS, delta)
+                sim_dict[di] = (delta, simulate_strategy(pos, daily_ret))
+            _print_delta_stats(sim_dict, bah_sim)
+            plot_fn(
+                pred_label=label, horizon_label="20-day",
+                oos_gap=OOS_GAP, nw_lags=NW_LAGS, color_palette=uni_pal[col],
+                sim_dict=sim_dict, betas_df=betas, bah_sim=bah_sim,
+                out_path=out_dir / f"{prefix}_{label.replace(' ', '_')}.png",
+            )
+
+    for mi, (col2, label2) in enumerate(BIV_MODELS, len(UNI_MODELS) + 1):
+        betas   = compute_betas_bivariate(panel, "VP", col2, FWD, OOS_GAP, NW_LAGS)
+        out_dir = OUTPUT / "plots" / f"VRP + {label2}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for run_fn, plot_fn, prefix in biv_strats:
+            print(f"\n[{mi}] VRP + {label2} {prefix}...")
+            sim_dict = {}
+            for di, delta in enumerate(DELTAS):
+                pos = run_fn(panel, "VP", col2, FWD, OOS_GAP, NW_LAGS, delta)
+                sim_dict[di] = (delta, simulate_strategy(pos, daily_ret))
+            _print_delta_stats(sim_dict, bah_sim)
+            fname = f"{prefix}_VRP_+_{label2.replace(' ', '_')}.png"
+            plot_fn(
+                pred1_label="VRP", pred2_label=label2, horizon_label="20-day",
+                oos_gap=OOS_GAP, nw_lags=NW_LAGS, color_palette=biv_pal[col2],
+                sim_dict=sim_dict, betas_df=betas, bah_sim=bah_sim,
+                out_path=out_dir / fname,
+            )
+
+    print("\n" + "=" * 72)
+    print("  Done — 21 base strategy plots saved.")
+    print("=" * 72)
+
+
+if __name__ == "__main__":
+    run_cli(main, "Base (unit-position) strategy evaluation for all models.",
+            T_THRESH)
